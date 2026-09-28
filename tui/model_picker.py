@@ -42,7 +42,7 @@ class ModelPicker(ModalScreen[str]):
         width: 60;
         height: auto;
         padding: 1 2;
-        background: #0f172a;
+        background: #1a1a1a;
         border: round #00b8ff;
         color: #e2e8f0;
     }
