@@ -1224,6 +1224,587 @@ def test_tui_boots_and_streams_events():
         sys.modules.update(saved)
 
 
+# ---------- agent -> UI event stream (bridge) ----------
+
+def test_run_turn_emits_a_complete_event_stream():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 prompt_tokens=5, completion_tokens=1),
+        response("all done", model="fake/x"),
+    ]))
+
+    events = []
+
+    def collect(name, **fields):
+        events.append((name, fields))
+
+    assert agent.run_turn("look around", 25, agent.new_stats(),
+                          on_event=collect) == "done"
+
+    names = [name for name, _ in events]
+
+    assert names[0] == "turn_start"      # the view opens a turn on this
+    assert names[-1] == "turn_end"       # ...and only this re-enables input
+    assert "tool_start" in names
+    assert "tool_end" in names
+    assert "message" in names
+
+    starts = [f for n, f in events if n == "tool_start"]
+    ends = [f for n, f in events if n == "tool_end"]
+
+    assert starts[0]["tool_name"] == "list_directory"
+    assert starts[0]["tool_call_id"] == "c1"
+    assert ends[0]["tool_call_id"] == "c1"
+    assert ends[0]["success"] is True
+    assert isinstance(ends[0]["duration_sec"], float)
+
+    message = [f for n, f in events if n == "message"][0]
+    assert message["content"] == "all done"
+
+    end = [f for n, f in events if n == "turn_end"][-1]
+    assert end["prompt_tokens"] == 5      # usage is carried through
+
+
+def test_run_turn_reports_a_failed_tool_as_unsuccessful():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "read_file",
+                                  '{"file_path": "definitely_missing.txt"}')]),
+        response("handled"),
+    ]))
+
+    events = []
+    agent.run_turn("read it", 25, agent.new_stats(),
+                   on_event=lambda n, **f: events.append((n, f)))
+
+    failed = [f for n, f in events if n == "tool_end"][0]
+
+    assert failed["success"] is False
+    assert failed["result"].startswith("Error:")
+
+
+def test_run_turn_without_a_listener_is_unchanged():
+    reset(FakeClient([response("answered")]))
+
+    # the CLI passes no callback: same return value, no listener required
+    assert agent.run_turn("hi", 25, agent.new_stats()) == "done"
+    assert agent.history[-1]["content"] == "answered"
+
+
+def test_run_task_forwards_events_through():
+    reset(FakeClient([response("done", prompt_tokens=2, completion_tokens=1)]))
+
+    seen = []
+
+    assert agent.run_task("go", 25,
+                          on_event=lambda n, **f: seen.append(n)) == 0
+    assert seen[0] == "turn_start"
+    assert seen[-1] == "turn_end"
+
+
+def test_tui_flag_parses():
+    assert agent.parse_args(["--tui"]).tui is True
+    assert agent.parse_args([]).tui is False
+
+
+def test_bridge_translator_maps_milestones_to_events():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import (MessageDelta, StatusUpdate, ToolEnd, ToolStart,
+                            TurnEnd, TurnStart)
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "sess123")
+
+    emit("turn_start", user_prompt="hi")
+    emit("status", message="thinking…", is_busy=True)
+    emit("message", content="hello", model="m")
+    emit("tool_start", tool_call_id="t1", tool_name="read_file",
+         arguments='{"file_path": "a.py"}')
+    emit("tool_end", tool_call_id="t1", result="ok", success=True,
+         duration_sec=1.25)
+    emit("turn_end", prompt_tokens=10, completion_tokens=2,
+         total_duration_sec=3.0)
+
+    got = [out.get_nowait() for _ in range(6)]
+
+    assert isinstance(got[0], TurnStart)
+    assert got[0].session_id == "sess123" and got[0].user_prompt == "hi"
+
+    assert isinstance(got[1], StatusUpdate) and got[1].is_busy is True
+
+    assert isinstance(got[2], MessageDelta)
+    assert got[2].content == "hello" and got[2].model == "m"
+
+    assert isinstance(got[3], ToolStart)
+    assert got[3].tool_name == "read_file" and got[3].tool_call_id == "t1"
+
+    assert isinstance(got[4], ToolEnd)
+    assert got[4].success is True and got[4].duration_sec == 1.25
+
+    assert isinstance(got[5], TurnEnd) and got[5].prompt_tokens == 10
+
+
+def test_bridge_translator_tolerates_missing_optional_fields():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import ToolEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("tool_end", tool_call_id="c", result="Error: boom", success=False)
+
+    event = out.get_nowait()
+
+    assert isinstance(event, ToolEnd)
+    assert event.success is False
+    assert event.duration_sec == 0.0  # defaulted, not None
+
+
+def test_main_routes_tui_mode():
+    reset(FakeClient([]))
+
+    import tui.bridge as bridge
+
+    called = {}
+    original_run = bridge.run_tui
+    missing = object()
+    saved_company = getattr(agent, "COMPANY_ID", missing)
+
+    bridge.run_tui = lambda max_steps=25, company_id=None: (
+        called.update(max_steps=max_steps, company_id=company_id) or 0
+    )
+
+    try:
+        result = agent.main(["--tui", "--company-id", "acme",
+                             "--max-steps", "5"])
+    finally:
+        bridge.run_tui = original_run
+        # main() sets COMPANY_ID globally; undo it so later tests are unbounded
+        if saved_company is missing:
+            delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved_company
+
+    assert result == 0
+    assert called == {"max_steps": 5, "company_id": "acme"}
+
+
+# ---------- credit-saving model routing + report ----------
+
+def test_select_model_uses_the_configured_tier():
+    with mock.patch.dict(os.environ, {
+        "AGENT_MODEL_FREE": "free/x",
+        "AGENT_MODEL_MID": "mid/x",
+        "AGENT_MODEL_PREMIUM": "premium/x",
+    }):
+        assert agent.select_model("free") == "free/x"
+        assert agent.select_model("eco") == "free/x"
+        assert agent.select_model("cheap") == "free/x"
+        assert agent.select_model("mid") == "mid/x"
+        assert agent.select_model("balanced") == "mid/x"
+        assert agent.select_model("premium") == "premium/x"
+        assert agent.select_model("quality") == "premium/x"
+        assert agent.select_model("best") == "premium/x"
+
+
+def test_select_model_auto_stays_free_until_the_turn_earns_more():
+    with mock.patch.dict(os.environ, {
+        "AGENT_MODEL_FREE": "free/x",
+        "AGENT_MODEL_MID": "mid/x",
+        "AGENT_MODEL_PREMIUM": "premium/x",
+    }):
+        # a clean, small step is free
+        assert agent.select_model("auto", prompt_chars=10) == "free/x"
+
+        # one failed tool, or a middling context, earns the mid tier
+        assert agent.select_model("auto", tool_failures=1) == "mid/x"
+        assert agent.select_model("auto",
+                                  prompt_chars=agent.MID_PROMPT_CHARS) == "mid/x"
+
+        # repeated failures, or a genuinely big context, earn the premium tier
+        assert agent.select_model("auto", tool_failures=2) == "premium/x"
+        assert agent.select_model("auto",
+                                  prompt_chars=agent.BIG_PROMPT_CHARS) == "premium/x"
+
+
+def test_select_model_defaults_to_the_current_model():
+    # with no tiers configured every policy resolves to MODEL, so switching the
+    # router on cannot silently change which model runs
+    assert agent.select_model("auto") == agent.MODEL
+    assert agent.select_model("static") == agent.MODEL
+    assert agent.select_model("premium") == agent.MODEL
+
+
+def test_select_model_static_ignores_difficulty():
+    with mock.patch.dict(os.environ, {"AGENT_MODEL_PREMIUM": "premium/x"}):
+        assert agent.select_model("static", tool_failures=99,
+                                  prompt_chars=99999) == agent.MODEL
+
+
+def test_run_turn_records_which_model_served_each_step():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')]),
+        response("done"),
+    ]))
+
+    stats = agent.new_stats()
+
+    assert agent.run_turn("go", 25, stats) == "done"
+    assert stats["steps"] == 2
+    assert sum(stats["models"].values()) == 2      # one tally per step
+    assert stats["turns"] == 1
+
+
+def test_credit_cost_favours_the_agent_over_the_baseline():
+    spent = agent.credit_cost(1000, 1000, 1, "tamias")
+    baseline = agent.credit_cost(1000, 1000, 1, "codex")
+
+    assert spent == (1000 * 0.25 + 1000 * 1.0) / 1000 + 0.5
+    assert baseline == (1000 * 0.50 + 1000 * 1.5) / 1000 + 0.6
+    assert spent < baseline
+
+
+def test_credit_report_prints_spend_and_saving():
+    reset(FakeClient([]))
+
+    stats = agent.new_stats()
+    stats["prompt_tokens"] = 1000
+    stats["completion_tokens"] = 1000
+    stats["turns"] = 1
+    stats["models"] = {"free/x": 2}
+
+    agent.credit_report(stats)
+
+    printed = "\n".join(PRINTED)
+
+    assert "credits" in printed
+    assert "spent" in printed and "saved" in printed
+    assert "codex baseline" in printed
+    assert "free/x ×2" in printed
+
+
+def test_interactive_credits_command():
+    reset(FakeClient([]))
+
+    ASKED.extend(["/credits", "/quit"])
+
+    assert agent.interactive_loop(25) == 0
+    assert "codex baseline" in "\n".join(PRINTED)
+
+
+# ---------- company boundary for run_shell ----------
+
+@contextlib.contextmanager
+def _as_company(company_id):
+    """Set agent.COMPANY_ID for the duration, restoring whatever was there."""
+    missing = object()
+    saved = getattr(agent, "COMPANY_ID", missing)
+    agent.COMPANY_ID = company_id
+
+    try:
+        yield
+    finally:
+        if saved is missing:
+            delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved
+
+
+def test_shell_escapes_company_flags_absolute_and_parent_paths():
+    company = os.path.realpath("/work/company/work/acme")
+
+    assert agent.shell_escapes_company("cat /etc/passwd", company) == "/etc/passwd"
+    assert agent.shell_escapes_company("cat ../../secret", company) == "../../secret"
+    assert agent.shell_escapes_company("cat ~/notes", company) == "~"
+
+    # a path inside the area, and a plain command, are both fine
+    assert agent.shell_escapes_company("cat src/app.py", company) is None
+    assert agent.shell_escapes_company("pytest -q", company) is None
+
+
+def test_run_shell_refuses_paths_outside_the_company_area():
+    with _as_company("acme"):
+        out = agent.run_shell("cat /etc/passwd")
+
+    assert out.startswith("Error:")
+    assert "outside company work area" in out
+
+
+def test_run_shell_refuses_parent_hops_when_bounded():
+    with _as_company("acme"):
+        out = agent.run_shell("cat ../../etc/passwd")
+
+    assert out.startswith("Error:")
+    assert "outside company work area" in out
+
+
+def test_run_shell_runs_inside_the_company_directory():
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _as_company("acme"), \
+             mock.patch.object(agent, "WORKSPACE", tmp), \
+             mock.patch.object(subprocess, "run", fake_run):
+            out = agent.run_shell("echo hi")
+
+    assert out == "ok"
+    assert seen["cwd"] == os.path.realpath(
+        os.path.join(tmp, "company", "work", "acme")
+    )
+
+
+def test_run_shell_without_company_is_unbounded():
+    with _as_company(None):
+        assert agent.run_shell("echo hi").strip() == "hi"
+
+
+# ---------- task assignment (--task-id / --assignee) ----------
+
+@contextlib.contextmanager
+def _as_assignment(task_id, assignee):
+    """Set agent.TASK_ID / agent.ASSIGNEE for the duration, restoring after."""
+    missing = object()
+    saved = {name: getattr(agent, name, missing)
+             for name in ("TASK_ID", "ASSIGNEE")}
+
+    agent.TASK_ID = task_id
+    agent.ASSIGNEE = assignee
+
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is missing:
+                delattr(agent, name)
+            else:
+                setattr(agent, name, value)
+
+
+def test_assignment_flags_parse():
+    args = agent.parse_args(["--task-id", "PROJ-1457", "--assignee", "alex"])
+
+    assert args.task_id == "PROJ-1457"
+    assert args.assignee == "alex"
+
+    default = agent.parse_args([])
+    assert default.task_id is None
+    assert default.assignee is None
+
+
+def test_assignment_line_names_the_task_owner_and_company():
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        line = agent.assignment_line()
+
+    assert "PROJ-1457" in line
+    assert "alex" in line
+    assert "company/work/acme" in line
+
+
+def test_assignment_line_is_empty_without_an_assignment():
+    with _as_company(None), _as_assignment(None, None):
+        assert agent.assignment_line() == ""
+
+
+def test_build_system_prompt_appends_the_assignment():
+    with _as_company(None), _as_assignment(None, None):
+        assert agent.build_system_prompt() == agent.SYSTEM_PROMPT
+
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        prompt = agent.build_system_prompt()
+
+    assert prompt.startswith("You are TAMIAS")   # the preamble still leads
+    assert "PROJ-1457" in prompt
+    assert "company/work/acme" in prompt
+
+
+def test_run_turn_sends_the_assignment_to_the_model():
+    reset(FakeClient([response("ok", prompt_tokens=1, completion_tokens=1)]))
+
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        assert agent.run_turn("do it", 25, agent.new_stats()) == "done"
+
+    system = agent.client.calls[0]["messages"][0]["content"]
+
+    assert system.startswith("You are TAMIAS")
+    assert "PROJ-1457" in system
+    assert "alex" in system
+
+
+def test_main_records_the_assignment_globals():
+    reset(FakeClient([response("done", prompt_tokens=1, completion_tokens=1)]))
+
+    missing = object()
+    saved = {name: getattr(agent, name, missing)
+             for name in ("COMPANY_ID", "TASK_ID", "ASSIGNEE")}
+
+    try:
+        result = agent.main(["--task", "go", "--company-id", "acme",
+                             "--task-id", "PROJ-1", "--assignee", "alex"])
+    finally:
+        for name, value in saved.items():
+            if value is missing:
+                if hasattr(agent, name):
+                    delattr(agent, name)
+            else:
+                setattr(agent, name, value)
+
+    assert result == 0
+    # the assignment reached the model through the system prompt
+    assert "PROJ-1" in agent.client.calls[0]["messages"][0]["content"]
+
+
+# ---------- secret protection + company-id validation ----------
+
+def test_is_sensitive_path_matches_credentials_not_placeholders():
+    assert agent.is_sensitive_path(".env")
+    assert agent.is_sensitive_path("./.env")
+    assert agent.is_sensitive_path("config/.env.production")
+    assert agent.is_sensitive_path("keys/server.pem")
+    assert agent.is_sensitive_path(".ssh/id_rsa")
+    assert agent.is_sensitive_path("sub/.aws/credentials")
+    assert agent.is_sensitive_path("secrets.json")
+
+    assert not agent.is_sensitive_path(".env.example")
+    assert not agent.is_sensitive_path("src/app.py")
+    assert not agent.is_sensitive_path("README.md")
+
+
+def test_read_file_refuses_dotenv():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, ".env"), "w") as handle:
+            handle.write("OPENROUTER_API_KEY=leak-me\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.read_file(".env")
+
+    assert out.startswith("Error:")
+    assert "leak-me" not in out
+    assert "protected secret" in out
+
+
+def test_write_and_edit_refuse_dotenv():
+    with tempfile.TemporaryDirectory() as tmp:
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            wrote = agent.write_file(".env", "OPENROUTER_API_KEY=x")
+            edited = agent.edit_file(".env", "x", "y")
+
+        assert not os.path.exists(os.path.join(tmp, ".env"))
+
+    assert wrote.startswith("Error:")
+    assert edited.startswith("Error:")
+
+
+def test_list_directory_hides_secret_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, ".env"), "w") as handle:
+            handle.write("SECRET=1\n")
+        with open(os.path.join(tmp, "notes.txt"), "w") as handle:
+            handle.write("hello\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            listing = agent.list_directory(".")
+
+    assert "notes.txt" in listing
+    assert ".env" not in listing
+
+
+def test_search_in_files_skips_secret_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "credentials.json"), "w") as handle:
+            handle.write('{"token": "findme"}\n')
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.search_in_files("findme", ".")
+
+    assert out.startswith("No matches")
+    assert '{"token"' not in out
+
+
+def test_run_shell_refuses_dotenv():
+    out = agent.run_shell("cat .env")
+
+    assert out.startswith("Error:")
+    assert "protected secret" in out
+
+
+def test_scrubbed_env_drops_credentials_but_keeps_the_rest():
+    with mock.patch.dict(os.environ, {
+        "OPENROUTER_API_KEY": "leak-me",
+        "SOME_TOKEN": "leak-me",
+        "TAMIAS_BASE_URL": "http://localhost",
+    }):
+        env = agent.scrubbed_env()
+
+    assert "OPENROUTER_API_KEY" not in env
+    assert "SOME_TOKEN" not in env
+    assert env["TAMIAS_BASE_URL"] == "http://localhost"
+    assert "PATH" in env
+
+
+def test_run_shell_passes_a_scrubbed_environment():
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "leak-me"}), \
+         mock.patch.object(subprocess, "run", fake_run):
+        agent.run_shell("echo hi")
+
+    assert "OPENROUTER_API_KEY" not in seen["env"]
+
+
+def test_valid_company_id_rejects_traversal_and_separators():
+    assert agent.valid_company_id("acme")
+    assert agent.valid_company_id("team-1.2")
+
+    assert not agent.valid_company_id("../etc")
+    assert not agent.valid_company_id("a/b")
+    assert not agent.valid_company_id("..")
+    assert not agent.valid_company_id("")
+    assert not agent.valid_company_id(None)
+
+
+def test_company_boundary_rejects_a_traversal_id():
+    with _as_company("../../etc"):
+        out = agent.run_shell("echo hi")
+
+    assert out.startswith("Error:")
+    assert "not a valid single path segment" in out
+
+
+def test_resolve_in_company_workspace_rejects_a_bad_id():
+    resolved, err = agent.resolve_in_company_workspace("x", "../etc")
+
+    assert resolved is None
+    assert "not a valid single path segment" in err
+
+
+def test_edit_file_refuses_empty_old_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "note.txt")
+
+        with open(path, "w") as handle:
+            handle.write("hello\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.edit_file("note.txt", "", "X")
+
+        with open(path) as handle:
+            unchanged = handle.read()
+
+    assert "old_text must not be empty" in out
+    assert unchanged == "hello\n"
+
+
 def _run_all():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
