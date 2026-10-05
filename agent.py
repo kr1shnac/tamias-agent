@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import argparse
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -10,9 +11,11 @@ import subprocess #run_shell
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 from rich.align import Align
 from rich.panel import Panel
+from rich.prompt import Prompt
 
 console = Console()
 
@@ -380,9 +383,9 @@ def print_banner():
 
         wordmark.append(row, style=COLOURS[index % len(COLOURS)])
 
-    wordmark.append("\n\na terminal coding agent\n", style="dim italic")
+    wordmark.append("\n\na terminal coding agent", style="dim italic")
     wordmark.append(
-        f"{MODEL} · {len(TOOLS)} tools · /quit to leave", style="dim"
+        f"\n\n{MODEL} · {len(TOOLS)} tools · /help for commands", style="dim"
     )
 
     console.print(
@@ -427,7 +430,7 @@ def new_stats():
 
 
 #one dim line after every API call - works when usage is missing
-def log_step(step, response, stats):
+def log_step(step, response, stats, took):
     usage = getattr(response, "usage", None)
     prompt_tokens = getattr(usage, "prompt_tokens", None)
     completion_tokens = getattr(usage, "completion_tokens", None)
@@ -442,25 +445,43 @@ def log_step(step, response, stats):
 
     console.print(
         f"[dim]step {step} · model {getattr(response, 'model', None)} · "
-        f"prompt {prompt_tokens} · completion {completion_tokens}[/dim]"
+        f"prompt {prompt_tokens} · completion {completion_tokens} · "
+        f"{took:.1f}s[/dim]"
     )
 
 
-#every tool call gets a card of its own
-def print_tool_call(tool_name, target, result):
-    failed = result.startswith("Error:")
+#every tool call of one step shares a single card, tool name on the left
+def print_step_cards(calls):
+    cards = Table.grid(padding=(0, 2), expand=True)
 
-    preview = result if len(result) <= 400 else result[:400] + "..."
+    cards.add_column(no_wrap=True)
+    cards.add_column(ratio=1, overflow="fold")
+
+    for tool_name, target, result in calls:
+        failed = result.startswith("Error:")
+
+        name = Text(tool_name, style="bold red" if failed else "bold yellow")
+
+        if target:
+            name.append(f"\n{target}", style="dim")
+
+        preview = result if len(result) <= 800 else result[:800] + "..."
+
+        cards.add_row(
+            name,
+            Text(preview, style="red" if failed else "dim")
+        )
+
+    count = len(calls)
 
     console.print(
         Panel(
-            Text(preview, style="dim"),
+            cards,
             title=Text(
-                f"⚙  {tool_name}",
-                style="bold red" if failed else "bold yellow"
+                f"⚙  {count} tool{'' if count == 1 else 's'}",
+                style="bold yellow"
             ),
-            subtitle=Text(str(target) or "-", style="dim"),
-            border_style="red" if failed else "yellow",
+            border_style="yellow",
             padding=(0, 1)
         )
     )
@@ -493,9 +514,10 @@ def run_turn(user_input, max_steps, stats):
             return "cap"
 
         step += 1
+        started = time.perf_counter()
 
-        with console.status("[dim]thinking…[/dim]"):
-            try :
+        try:
+            with console.status("[dim]thinking…[/dim]"):
                 response = client.chat.completions.create(
                             model=MODEL,
                             messages=[
@@ -514,12 +536,12 @@ def run_turn(user_input, max_steps, stats):
                             tools=TOOLS
                 )
 
-            except Exception as e:
-                del history[checkpoint:] #undo the turn, history stays valid
-                print_error("api error", e)
-                return "error"
+        except Exception as e:
+            del history[checkpoint:] #undo the turn, history stays valid
+            print_error("api error", e)
+            return "error"
 
-        log_step(step, response, stats)
+        log_step(step, response, stats, time.perf_counter() - started)
 
         message = response.choices[0].message
 
@@ -547,6 +569,8 @@ def run_turn(user_input, max_steps, stats):
                 "tool_calls": tool_calls_list
             })
 
+            calls = []
+
             for tc in message.tool_calls:
                 tool_name = tc.function.name
 
@@ -555,15 +579,17 @@ def run_turn(user_input, max_steps, stats):
 
                 target = list(args.values())[0] if args else ""
 
-                print_tool_call(tool_name, target, result)
-
                 history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result
                 })
 
+                calls.append((tool_name, target, result))
+
                 continue #take tool context goes back to input
+
+            print_step_cards(calls)
 
         else:
             reply = message.content
@@ -595,28 +621,44 @@ def run_task(task, max_steps):
     return 1 if outcome in ("error", "cap") else 0
 
 
-#what can I type
-HELP = """[bold green]/quit[/bold green]   leave TAMIAS
-[bold green]/help[/bold green]   this list
-
-[bold]tools[/bold]
-  run_shell          run a shell command (60s timeout)
-  read_file          read a file
-  write_file         write a file
-  edit_file          replace exact text in a file
-  list_directory     list a directory
-  create_directory   make a folder
-  search_in_files    grep across a directory
-
-[bold]flags[/bold]
-  --task "text"      do one task, print a summary, exit
-  --max-steps N      API calls per turn (default 25)"""
+#what can I type - the tool list comes straight from TOOLS so it never drifts
+HELP = [
+    ("commands", [
+        ("/help", "show this list"),
+        ("/clear", "wipe the screen and the history"),
+        ("/quit", "leave TAMIAS"),
+    ]),
+    ("flags", [
+        ('--task "text"', "do one task, print a summary, exit"),
+        ("--max-steps N", "API calls per turn (default 25)"),
+    ]),
+]
 
 
 def print_help():
+    listing = Table.grid(padding=(0, 2))
+    listing.add_column(no_wrap=True)
+    listing.add_column(style="dim")
+
+    for section, rows in HELP:
+        listing.add_row(Text(section.upper(), style="bold magenta"), "")
+
+        for name, description in rows:
+            listing.add_row(name, description)
+
+        listing.add_row("", "")
+
+    listing.add_row(Text("TOOLS", style="bold magenta"), "")
+
+    for tool in TOOLS:
+        listing.add_row(
+            tool["function"]["name"],
+            tool["function"]["description"]
+        )
+
     console.print(
         Panel(
-            Text(HELP),
+            listing,
             title=Text("help", style="bold cyan"),
             border_style="cyan",
             padding=(0, 2)
@@ -634,9 +676,13 @@ def goodbye():
 def interactive_loop(max_steps):
     while True:
         try:
-            user_input = console.input("[bold green]You ›[/bold green]").strip()
+            user_input = Prompt.ask(
+                "[bold green]You[/bold green] [bold cyan]▸[/bold cyan]",
+                default="",
+                console=console
+            ).strip()
 
-        except (EOFError, KeyboardInterrupt):
+        except Exception: #ctrl-c, ctrl-d, closed pipe
             goodbye()
             return 0
 
@@ -649,6 +695,12 @@ def interactive_loop(max_steps):
 
         if user_input == "/help":
             print_help()
+            continue;
+
+        if user_input == "/clear":
+            history.clear()
+            console.clear()
+            print_banner()
             continue;
 
         run_turn(user_input, max_steps, new_stats())

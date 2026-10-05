@@ -29,6 +29,9 @@ class FakeConsole:
             raise EOFError
         return ASKED.pop(0)
 
+    def clear(self):
+        PRINTED.append("screen cleared")
+
     @contextlib.contextmanager
     def status(self, *args, **kwargs):
         #real console prints nothing when it is not a terminal
@@ -46,6 +49,53 @@ class FakeText:
 
     def __str__(self):
         return "".join(part for part, _ in self.parts)
+
+
+class FakeTable:
+    """enough of rich.table.Table.grid to keep agent.py honest"""
+
+    def __init__(self, **kwargs):
+        self.rows = []
+        self.columns = 0
+
+    @classmethod
+    def grid(cls, **kwargs):
+        return cls(**kwargs)
+
+    def add_column(self, *args, **kwargs):
+        self.columns += 1
+
+    def add_row(self, *cells):
+        self.rows.append(cells)
+
+    def __str__(self):
+        return "\n".join(
+            "  ".join(str(cell) for cell in row) for row in self.rows
+        )
+
+
+class FakePrompt:
+    @staticmethod
+    def ask(*args, **kwargs):
+        if not ASKED:
+            raise EOFError
+        return ASKED.pop(0)
+
+
+class FakePanel:
+    """enough of rich.panel.Panel to keep agent.py honest"""
+
+    def __init__(self, renderable="", title=None, subtitle=None, **kwargs):
+        self.renderable = renderable
+        self.title = title
+
+    def __str__(self):
+        parts = [str(self.renderable)]
+
+        if self.title is not None:
+            parts.insert(0, str(self.title))
+
+        return "\n".join(parts)
 
 
 class FakeOpenAI:
@@ -74,12 +124,17 @@ def _install_stubs():
                             ("rich.rule", "Rule"),
                             ("rich.text", "Text"),
                             ("rich.align", "Align"),
-                            ("rich.panel", "Panel")):
+                            ("rich.panel", "Panel"),
+                            ("rich.table", "Table"),
+                            ("rich.prompt", "Prompt")):
         mod = types.ModuleType(name)
         setattr(mod, attribute, lambda *a, **k: a[0] if a else "")
         sys.modules[name] = mod
 
     sys.modules["rich.text"].Text = FakeText
+    sys.modules["rich.table"].Table = FakeTable
+    sys.modules["rich.prompt"].Prompt = FakePrompt
+    sys.modules["rich.panel"].Panel = FakePanel
 
     # Align.center has to exist as an attribute of rich.align
     sys.modules["rich.align"].Align = SimpleNamespace(
@@ -220,7 +275,7 @@ def test_name_is_the_project_name():
     assert PRINTED[0].startswith("████████╗")
     assert "a terminal coding agent" in PRINTED[0]
     assert agent.MODEL in PRINTED[0]
-    assert "/quit to leave" in PRINTED[0]
+    assert "/help for commands" in PRINTED[0]
 
 
 def test_agent_calls_itself_tamias():
@@ -416,8 +471,47 @@ def test_interactive_help_command():
     printed = "\n".join(PRINTED)
 
     assert "--max-steps" in printed
-    assert "run_shell" in printed
+    assert "/clear" in printed
+    #the tool list is generated from TOOLS, so it cannot drift
+    for tool in agent.TOOLS:
+        assert tool["function"]["name"] in printed
+
     assert agent.history == []  # help never reaches the model
+
+
+def test_interactive_clear_command():
+    reset(FakeClient([]))
+
+    agent.history.append({"role": "user", "content": "old turn"})
+
+    ASKED.extend(["/clear", "/quit"])
+
+    assert agent.interactive_loop(25) == 0
+    assert agent.history == []
+    assert "screen cleared" in PRINTED
+    assert "████████╗" in "\n".join(PRINTED)  # banner redrawn
+
+
+def test_tool_calls_of_one_step_share_one_card():
+    reset(FakeClient([
+        response(None, [
+            tool_call("c1", "run_shell", '{"command": "echo hi"}'),
+            tool_call("c2", "read_file", '{"file_path": "agent.py"}'),
+        ], prompt_tokens=10, completion_tokens=2),
+        response("both read"),
+    ]))
+
+    assert agent.run_turn("look around", 25, agent.new_stats()) == "done"
+    assert_history_valid(agent.history)
+
+    printed = "\n".join(PRINTED)
+
+    #one card for the step, both tools named inside it
+    assert "2 tools" in printed
+    assert printed.count("run_shell") >= 1
+    assert printed.count("read_file") >= 1
+    assert [m["role"] for m in agent.history] == \
+        ["user", "assistant", "tool", "tool", "assistant"]
 
 
 def test_interactive_survives_eof():
