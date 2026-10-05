@@ -206,17 +206,18 @@ def test_name_is_the_project_name():
     assert "krish" not in source
     assert "TAMIAS" in source
 
-    # six coloured rows, one per letter of TAMIAS
-    assert len(agent.BANNER) == 6
-    assert all(style for _, style in agent.BANNER)
-    assert len({style for _, style in agent.BANNER}) >= 4
+    # the wordmark is block letters, one colour per row
+    assert len(agent.WORDMARK.split("\n")) == len(agent.COLOURS)
+    assert agent.WORDMARK.startswith("████████╗")
+    assert agent.WORDMARK.endswith("╚══════╝")
+    assert all(style for style in agent.COLOURS)
 
     reset()
     agent.print_banner()
 
     # the whole wordmark is one bordered card
     assert len(PRINTED) == 1
-    assert PRINTED[0].startswith("██╗  ██╗")
+    assert PRINTED[0].startswith("████████╗")
     assert "a terminal coding agent" in PRINTED[0]
     assert agent.MODEL in PRINTED[0]
     assert "/quit to leave" in PRINTED[0]

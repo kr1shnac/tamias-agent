@@ -352,24 +352,35 @@ def safe_tool_call(tool_name, raw_args):
 
 #-------------------------
 #Welcome message
-#the name, one colour per letter - T A M I A S
-BANNER = [
-    ("██╗  ██╗██████╗ ██╗███████╗██╗  ██╗", "bold bright_cyan"),
-    ("██║ ██╔╝██╔══██╗██║██╔════╝██║  ██║", "bold cyan"),
-    ("█████╔╝ ██████╔╝██║███████╗███████║", "bold bright_blue"),
-    ("██╔═██╗ ██╔══██╗██║╚════██║██╔══██║", "bold bright_magenta"),
-    ("██║  ██╗██║  ██║██║███████║██║  ██║", "bold magenta"),
-    ("╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝", "bold bright_magenta"),
+#the project name in block letters - T A M I A S
+WORDMARK = """████████╗ █████╗ ███╗   ███╗██╗ █████╗ ███████╗
+╚══██╔══╝██╔══██╗████╗ ████║██║██╔══██╗██╔════╝
+   ██║   ███████║██╔████╔██║██║███████║███████╗
+   ██║   ██╔══██║██║╚██╔╝██║██║██╔══██║╚════██║
+   ██║   ██║  ██║██║ ╚═╝ ██║██║██║  ██║███████║
+   ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═╝╚══════╝"""
+
+COLOURS = [
+    "bold bright_cyan",   # row 1
+    "bold cyan",          # row 2
+    "bold bright_blue",   # row 3
+    "bold bright_magenta", # row 4
+    "bold magenta",       # row 5
+    "bold bright_magenta", # row 6
 ]
 
 
 def print_banner():
+    rows = WORDMARK.split("\n")
     wordmark = Text()
 
-    for line, style in BANNER:
-        wordmark.append(line + "\n", style=style)
+    for index, row in enumerate(rows):
+        if index:
+            wordmark.append("\n")
 
-    wordmark.append("\na terminal coding agent\n", style="dim italic")
+        wordmark.append(row, style=COLOURS[index % len(COLOURS)])
+
+    wordmark.append("\n\na terminal coding agent\n", style="dim italic")
     wordmark.append(
         f"{MODEL} · {len(TOOLS)} tools · /quit to leave", style="dim"
     )
