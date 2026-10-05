@@ -364,17 +364,21 @@ BANNER = [
 
 
 def print_banner():
-    console.print()
+    wordmark = Text()
 
     for line, style in BANNER:
-        console.print(Align.center(Text(line, style=style)))
+        wordmark.append(line + "\n", style=style)
+
+    wordmark.append("\na terminal coding agent\n", style="dim italic")
+    wordmark.append(
+        f"{MODEL} · {len(TOOLS)} tools · /quit to leave", style="dim"
+    )
 
     console.print(
-        Align.center(Text("a terminal coding agent", style="dim italic"))
-    )
-    console.print(
-        Align.center(
-            Text(f"{MODEL} · {len(TOOLS)} tools · /quit to leave", style="dim")
+        Panel(
+            Align.center(wordmark),
+            border_style="cyan",
+            padding=(1, 4)
         )
     )
     console.print()
@@ -431,6 +435,38 @@ def log_step(step, response, stats):
     )
 
 
+#every tool call gets a card of its own
+def print_tool_call(tool_name, target, result):
+    failed = result.startswith("Error:")
+
+    preview = result if len(result) <= 400 else result[:400] + "..."
+
+    console.print(
+        Panel(
+            Text(preview, style="dim"),
+            title=Text(
+                f"⚙  {tool_name}",
+                style="bold red" if failed else "bold yellow"
+            ),
+            subtitle=Text(str(target) or "-", style="dim"),
+            border_style="red" if failed else "yellow",
+            padding=(0, 1)
+        )
+    )
+
+
+#errors and warnings get their own card
+def print_error(label, message, style="red"):
+    console.print(
+        Panel(
+            Text(str(message), style=style),
+            title=Text(label, style=f"bold {style}"),
+            border_style=style,
+            padding=(0, 1)
+        )
+    )
+
+
 #one user turn - returns "done", "error" or "cap"
 def run_turn(user_input, max_steps, stats):
     checkpoint = len(history) #remember where this turn started
@@ -441,34 +477,36 @@ def run_turn(user_input, max_steps, stats):
     while True:
         if step >= max_steps: #out of steps, throw the whole turn away
             del history[checkpoint:]
-            console.print(f"[yellow]step cap of {max_steps} reached[/yellow]")
+            print_error("step limit", f"step cap of {max_steps} reached",
+                        style="yellow")
             return "cap"
 
         step += 1
 
-        try :
-            response = client.chat.completions.create(
-                        model=MODEL,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are TAMIAS, a helpful terminal coding agent. "
-                                    "You can read files, write files, edit files, run shell commands, "
-                                    "list directories, create folders, and search across files. "
-                                    "When given a task, think step by step and use your tools to complete it. "
-                                    "Always verify your work — after writing or editing a file, read it back. "
-                                    "After running code, check the output for errors and fix them."
-                                )
-                            }
-                        ] + history,
-                        tools=TOOLS
-            )
+        with console.status("[dim]thinking…[/dim]"):
+            try :
+                response = client.chat.completions.create(
+                            model=MODEL,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "You are TAMIAS, a helpful terminal coding agent. "
+                                        "You can read files, write files, edit files, run shell commands, "
+                                        "list directories, create folders, and search across files. "
+                                        "When given a task, think step by step and use your tools to complete it. "
+                                        "Always verify your work — after writing or editing a file, read it back. "
+                                        "After running code, check the output for errors and fix them."
+                                    )
+                                }
+                            ] + history,
+                            tools=TOOLS
+                )
 
-        except Exception as e:
-            del history[checkpoint:] #undo the turn, history stays valid
-            console.print(f"\n[red]API error: {e}[/red]")
-            return "error"
+            except Exception as e:
+                del history[checkpoint:] #undo the turn, history stays valid
+                print_error("api error", e)
+                return "error"
 
         log_step(step, response, stats)
 
@@ -504,13 +542,9 @@ def run_turn(user_input, max_steps, stats):
                 #every tool call gets a result back, even a broken one
                 args, result = safe_tool_call(tool_name, tc.function.arguments)
 
-                console.print(
-                    f"\n[dim yellow]⚙  {tool_name} → "
-                    f"{list(args.values())[0] if args else ''}[/dim yellow]"
-                )
+                target = list(args.values())[0] if args else ""
 
-                preview = result[:120] + "..." if len(result) > 120 else result
-                console.print(f"[dim green]   {preview}[/dim green]")
+                print_tool_call(tool_name, target, result)
 
                 history.append({
                     "role": "tool",
@@ -528,7 +562,8 @@ def run_turn(user_input, max_steps, stats):
                 "content": reply
             })
 
-            console.print("\n[bold purple]TAMIAS ›[/bold purple]")
+            console.print(Rule(Text("TAMIAS ›", style="bold magenta"),
+                               style="magenta"))
             console.print(Markdown(reply or ""))
             console.print()
 
@@ -549,22 +584,61 @@ def run_task(task, max_steps):
     return 1 if outcome in ("error", "cap") else 0
 
 
+#what can I type
+HELP = """[bold green]/quit[/bold green]   leave TAMIAS
+[bold green]/help[/bold green]   this list
+
+[bold]tools[/bold]
+  run_shell          run a shell command (60s timeout)
+  read_file          read a file
+  write_file         write a file
+  edit_file          replace exact text in a file
+  list_directory     list a directory
+  create_directory   make a folder
+  search_in_files    grep across a directory
+
+[bold]flags[/bold]
+  --task "text"      do one task, print a summary, exit
+  --max-steps N      API calls per turn (default 25)"""
+
+
+def print_help():
+    console.print(
+        Panel(
+            Text(HELP),
+            title=Text("help", style="bold cyan"),
+            border_style="cyan",
+            padding=(0, 2)
+        )
+    )
+
+
+def goodbye():
+    console.print(
+        Align.center(Text("see you soon · /quit", style="dim"))
+    )
+
+
 #ask, answer, ask again
 def interactive_loop(max_steps):
     while True:
         try:
-            user_input = console.input("[bold green]You > [/bold green]").strip()
+            user_input = console.input("[bold green]You ›[/bold green]").strip()
 
         except (EOFError, KeyboardInterrupt):
-            console.log("Good bye")
+            goodbye()
             return 0
 
         if not user_input:
             continue;
 
         if user_input == "/quit":
-            console.log("Good bye")
+            goodbye()
             return 0
+
+        if user_input == "/help":
+            print_help()
+            continue;
 
         run_turn(user_input, max_steps, new_stats())
 

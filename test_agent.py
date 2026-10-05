@@ -1,3 +1,4 @@
+import contextlib
 import os
 import pathlib
 import subprocess
@@ -28,6 +29,24 @@ class FakeConsole:
             raise EOFError
         return ASKED.pop(0)
 
+    @contextlib.contextmanager
+    def status(self, *args, **kwargs):
+        #real console prints nothing when it is not a terminal
+        yield self
+
+
+class FakeText:
+    """enough of rich.text.Text to keep agent.py honest"""
+
+    def __init__(self, text="", style=None):
+        self.parts = [(text, style)]
+
+    def append(self, text="", style=None):
+        self.parts.append((text, style))
+
+    def __str__(self):
+        return "".join(part for part, _ in self.parts)
+
 
 class FakeOpenAI:
     def __init__(self, **kwargs):
@@ -51,16 +70,16 @@ def _install_stubs():
     sys.modules["rich"] = rich
     sys.modules["rich.console"] = console_mod
 
-    for name in ("rich.markdown", "rich.rule", "rich.text",
-                 "rich.align", "rich.panel"):
+    for name, attribute in (("rich.markdown", "Markdown"),
+                            ("rich.rule", "Rule"),
+                            ("rich.text", "Text"),
+                            ("rich.align", "Align"),
+                            ("rich.panel", "Panel")):
         mod = types.ModuleType(name)
-        setattr(mod, {"rich.markdown": "Markdown",
-                      "rich.rule": "Rule",
-                      "rich.text": "Text",
-                      "rich.align": "Align",
-                      "rich.panel": "Panel"}[name],
-                lambda *a, **k: a[0] if a else "")
+        setattr(mod, attribute, lambda *a, **k: a[0] if a else "")
         sys.modules[name] = mod
+
+    sys.modules["rich.text"].Text = FakeText
 
     # Align.center has to exist as an attribute of rich.align
     sys.modules["rich.align"].Align = SimpleNamespace(
@@ -194,8 +213,13 @@ def test_name_is_the_project_name():
 
     reset()
     agent.print_banner()
-    assert len(PRINTED) > 3
-    assert any("a terminal coding agent" in line for line in PRINTED)
+
+    # the whole wordmark is one bordered card
+    assert len(PRINTED) == 1
+    assert PRINTED[0].startswith("██╗  ██╗")
+    assert "a terminal coding agent" in PRINTED[0]
+    assert agent.MODEL in PRINTED[0]
+    assert "/quit to leave" in PRINTED[0]
 
 
 def test_agent_calls_itself_tamias():
@@ -323,6 +347,9 @@ def test_tool_crash_never_ends_the_program():
     assert tool_message["content"] == "Error: list_directory failed: tool exploded"
     assert agent.history[-1]["content"] == "still alive"
 
+    #the card shows the failed tool, not a crash
+    assert any("Error: list_directory failed" in line for line in PRINTED)
+
 
 def test_step_cap_exits_1_and_rolls_back():
     looping = [tool_call("c1", "list_directory", '{"path": "."}')]
@@ -378,11 +405,25 @@ def test_interactive_keeps_going_after_api_error():
         ["second ask", "second try worked"]
 
 
+def test_interactive_help_command():
+    reset(FakeClient([]))
+
+    ASKED.extend(["/help", "/quit"])
+
+    assert agent.interactive_loop(25) == 0
+
+    printed = "\n".join(PRINTED)
+
+    assert "--max-steps" in printed
+    assert "run_shell" in printed
+    assert agent.history == []  # help never reaches the model
+
+
 def test_interactive_survives_eof():
     reset(FakeClient([]))
 
     assert agent.interactive_loop(25) == 0  # nothing queued -> EOFError
-    assert "Good bye" in "\n".join(PRINTED)
+    assert "see you soon" in "\n".join(PRINTED)
 
 
 def test_run_shell_uses_timeout_60():
