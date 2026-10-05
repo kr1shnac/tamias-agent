@@ -63,7 +63,9 @@ def _install_stubs():
         sys.modules[name] = mod
 
     # Align.center has to exist as an attribute of rich.align
-    sys.modules["rich.align"].Align = SimpleNamespace(center=lambda *a, **k: "")
+    sys.modules["rich.align"].Align = SimpleNamespace(
+        center=lambda *a, **k: a[0] if a else ""
+    )
 
 
 _install_stubs()
@@ -176,6 +178,35 @@ def test_ask_default_is_25():
     assert args.max_steps == 25
     assert args.task is None
     assert agent.parse_args(["--task", "hi", "--max-steps", "3"]).max_steps == 3
+
+
+def test_name_is_the_project_name():
+    source = pathlib.Path(agent.__file__).read_text(encoding="utf-8")
+
+    assert "Krish" not in source
+    assert "krish" not in source
+    assert "TAMIAS" in source
+
+    # six coloured rows, one per letter of TAMIAS
+    assert len(agent.BANNER) == 6
+    assert all(style for _, style in agent.BANNER)
+    assert len({style for _, style in agent.BANNER}) >= 4
+
+    reset()
+    agent.print_banner()
+    assert len(PRINTED) > 3
+    assert any("a terminal coding agent" in line for line in PRINTED)
+
+
+def test_agent_calls_itself_tamias():
+    reset(FakeClient([response("ready", prompt_tokens=1, completion_tokens=1)]))
+
+    assert agent.run_turn("who are you?", 25, agent.new_stats()) == "done"
+
+    system = agent.client.calls[0]["messages"][0]["content"]
+
+    assert system.startswith("You are TAMIAS")
+    assert any("TAMIAS ›" in line for line in PRINTED)
 
 
 def test_usage_line_is_printed_and_none_safe():

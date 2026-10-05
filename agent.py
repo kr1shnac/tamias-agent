@@ -352,29 +352,38 @@ def safe_tool_call(tool_name, raw_args):
 
 #-------------------------
 #Welcome message
-console.print(
-    Align.center(
-        """
-██╗  ██╗██████╗ ██╗███████╗██╗  ██╗
-██║ ██╔╝██╔══██╗██║██╔════╝██║  ██║
-█████╔╝ ██████╔╝██║███████╗███████║
-██╔═██╗ ██╔══██╗██║╚════██║██╔══██║
-██║  ██╗██║  ██║██║███████║██║  ██║
-╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝
-        """,
-        style="bold bright_cyan"
+#the name, one colour per letter - T A M I A S
+BANNER = [
+    ("██╗  ██╗██████╗ ██╗███████╗██╗  ██╗", "bold bright_cyan"),
+    ("██║ ██╔╝██╔══██╗██║██╔════╝██║  ██║", "bold cyan"),
+    ("█████╔╝ ██████╔╝██║███████╗███████║", "bold bright_blue"),
+    ("██╔═██╗ ██╔══██╗██║╚════██║██╔══██║", "bold bright_magenta"),
+    ("██║  ██╗██║  ██║██║███████║██║  ██║", "bold magenta"),
+    ("╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝", "bold bright_magenta"),
+]
+
+
+def print_banner():
+    console.print()
+
+    for line, style in BANNER:
+        console.print(Align.center(Text(line, style=style)))
+
+    console.print(
+        Align.center(Text("a terminal coding agent", style="dim italic"))
     )
-)
-console.print(
-    Align.center("[dim]my first terminal AGENT[/dim]")
-)
-console.print()
+    console.print(
+        Align.center(
+            Text(f"{MODEL} · {len(TOOLS)} tools · /quit to leave", style="dim")
+        )
+    )
+    console.print()
 
 #CLI
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="agent.py",
-        description="Krish - a terminal coding agent"
+        description="TAMIAS - a terminal coding agent"
     )
 
     parser.add_argument(
@@ -444,7 +453,7 @@ def run_turn(user_input, max_steps, stats):
                             {
                                 "role": "system",
                                 "content": (
-                                    "You are Krish, a helpful AI coding agent. "
+                                    "You are TAMIAS, a helpful terminal coding agent. "
                                     "You can read files, write files, edit files, run shell commands, "
                                     "list directories, create folders, and search across files. "
                                     "When given a task, think step by step and use your tools to complete it. "
@@ -519,7 +528,7 @@ def run_turn(user_input, max_steps, stats):
                 "content": reply
             })
 
-            console.print("\n[bold purple]Krish ›[/bold purple]")
+            console.print("\n[bold purple]TAMIAS ›[/bold purple]")
             console.print(Markdown(reply or ""))
             console.print()
 
@@ -561,6 +570,8 @@ def interactive_loop(max_steps):
 
 
 def main(argv=None):
+    print_banner()
+
     args = parse_args(argv)
 
     if args.task: #no chat, just do it and leave
