@@ -280,16 +280,117 @@ def test_m_cycles_through_the_model_tiers():
     _run(drive())
 
 
-def test_f1_toggles_fullscreen_class():
+# ----------------------------------------------------- landing & palette (§4)
+
+def test_landing_shows_the_wordmark_then_hands_over_to_the_chat():
     from tui.app import TAMIASApp
 
     async def drive():
         app = TAMIASApp(queue.Queue(), queue.Queue())
-        async with app.run_test(size=(120, 32)) as pilot:
-            await pilot.press("f1")
-            assert app.screen.has_class("fullscreen")
-            await pilot.press("f1")
-            assert not app.screen.has_class("fullscreen")
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            assert app.screen.has_class("landing")
+            assert len(app.query("#hero")) == 1
+
+            app.query_one("#user-input").value = "read hello.py"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert not app.screen.has_class("landing")
+            assert len(app.query("#hero")) == 0
+            assert app.ui_queue.get_nowait() == "read hello.py"
+
+    _run(drive())
+
+
+def test_slash_palette_lists_commands_completes_with_tab_and_runs():
+    from tui.app import TAMIASApp
+    from tui.slash import SlashMenu
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            menu = app.query_one(SlashMenu)
+            assert not menu.open
+
+            await pilot.press("/")
+            await pilot.pause()
+            assert menu.open and menu.mode == "commands"
+            assert menu.rows[menu.highlight][0] == "/model"
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert menu.rows[menu.highlight][0] == "/task"
+
+            await pilot.press("tab")                 # complete, do not run
+            await pilot.pause()
+            assert app.query_one("#user-input").value == "/task"
+            assert not app.query_one("#task-board").display
+
+            await pilot.press("enter")               # now run the command
+            await pilot.pause()
+            assert not menu.open
+            assert app.query_one("#task-board").display
+
+    _run(drive())
+
+
+def test_slash_palette_offers_matching_models_after_model_command():
+    from tui.app import TAMIASApp
+    from tui.slash import SlashMenu
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app.query_one("#user-input").value = "/model nemotron-3-ultra"
+            await pilot.pause()
+            menu = app.query_one(SlashMenu)
+            assert menu.open and menu.mode == "models"
+            assert len(menu.rows) == 1
+            assert "ultra" in menu.rows[0][0]
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.current_model.endswith("nemotron-3-ultra-550b-a55b:free")
+            assert app.ui_queue.get_nowait() == f"/model {app.current_model}"
+
+    _run(drive())
+
+
+def test_unknown_slash_command_is_reported_locally():
+    from tui.app import TAMIASApp
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app.query_one("#user-input").value = "/nope"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.ui_queue.empty()               # never reaches the agent
+            shown = " ".join(str(node.render())
+                             for node in app.query(".agent-turn"))
+            assert "unknown command" in shown
+
+    _run(drive())
+
+
+def test_responsive_header_drops_wide_chips_on_small_terminals():
+    from tui.app import TAMIASApp
+
+    async def drive():
+        for width, narrow, tiny in ((120, False, False), (90, True, False),
+                                    (60, True, True)):
+            app = TAMIASApp(queue.Queue(), queue.Queue())
+            async with app.run_test(size=(width, 30)) as pilot:
+                await pilot.pause()
+                assert app.screen.has_class("narrow") is narrow, width
+                assert app.screen.has_class("tiny") is tiny, width
+                assert app.query_one("#model-display").display is not narrow
+                # the credits readout is the one readout that never hides
+                assert app.query_one("#credits-readout").display
 
     _run(drive())
 

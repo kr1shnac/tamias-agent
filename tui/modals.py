@@ -126,11 +126,11 @@ class HelpScreen(ModalScreen[None]):
         ("M", "cycle models (free → mid → premium)"),
         ("H", "this help overlay"),
         ("Q / Ctrl+C", "quit"),
-        ("F1", "toggle fullscreen (hide chrome)"),
         ("F3", "credits dashboard"),
         ("/model", "open the model picker"),
         ("/task", "toggle the task board"),
         ("/complete", "complete the current task"),
+        ("/clear", "clear the transcript"),
         ("/quit", "exit"),
     ]
 
@@ -142,7 +142,7 @@ class HelpScreen(ModalScreen[None]):
                 label = f"[{key}]".ljust(key_w)
                 yield Static(f"{label}  {description}", classes="modal-row",
                              markup=False)
-            yield Static("while typing, use F1 · F3 · Ctrl+T or the /commands",
+            yield Static("type / for the command palette · F3 credits · Ctrl+T task",
                          classes="modal-hint")
 
     def action_dismiss_help(self) -> None:

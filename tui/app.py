@@ -3,17 +3,20 @@ import queue
 import re
 import json
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical, Horizontal, ScrollableContainer
 from textual.widgets import Static, Input
 from textual import work
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 
+from tui.branding import Hero
 from tui.events import (
     TurnStart, MessageDelta, ToolStart, ToolProgress, ToolEnd, TurnEnd,
     StatusUpdate, ErrorEvent,
 )
 from tui.credits import CreditsLedger
+from tui.slash import SlashMenu
 from tui.tasks import TaskBoard, is_boundary_violation
 from tui.widgets import ToolCard, CreditsReadout, TaskBoardWidget, SPINNER_FRAMES
 from tui.modals import ConfirmModal, BoundaryModal, HelpScreen, CreditsDashboard
@@ -36,21 +39,58 @@ Screen {
 /* --- Transcript --- */
 #transcript-area {
     height: 1fr;
-    padding: 1 2;
+    padding: 2 3;
     overflow-y: auto;
-    align: center top;
+    align: left top;
+}
+
+/* --- Home screen (OpenCode-style) --------------------------------------
+   Before the first message there is no chrome: the header bar is hidden and
+   the wordmark + composer sit together in the middle of the screen. The first
+   submitted message drops Screen.landing and the full chat takes over. */
+Screen.landing {
+    align-horizontal: center;
+    align-vertical: middle;
+}
+
+Screen.landing #header-bar { display: none; }
+
+Screen.landing #transcript-area {
+    height: auto;
+    width: 76;
+    max-width: 100%;
+    align: center middle;
+}
+
+Screen.landing #composer {
+    height: auto;
+    width: 76;
+    max-width: 100%;
+    background: transparent;
+    border-top: none;
+    padding: 0 3;
+}
+
+Screen.landing #slash-menu {
+    width: 76;
+    max-width: 100%;
+}
+
+#hero {
+    height: auto;
+    width: auto;
 }
 
 .turn {
     height: auto;
     margin-bottom: 1;
-    max-width: 120;
+    max-width: 112;
 }
 
 .user-turn-container {
     height: auto;
     margin-bottom: 1;
-    max-width: 120;
+    max-width: 112;
 }
 
 .user-turn {
@@ -116,7 +156,7 @@ Screen {
 /* --- Header bar --- */
 #header-bar {
     layout: horizontal;
-    padding: 0 2 0 2;
+    padding: 0 3;
     height: 2;
     background: #1a1a1a;
     border-bottom: solid #3a3a3a;
@@ -147,12 +187,29 @@ Screen {
     min-width: 34;
 }
 
+/* responsive header: drop the wide model chip first, then the small wordmark
+   (the credits readout stays visible), so nothing is ever clipped */
+Screen.narrow #model-display { display: none; }
+Screen.tiny #wordmark { display: none; }
+Screen.tiny #header-bar { padding: 0 2; }
+
+/* --- Slash palette (§4) --- */
+#slash-menu {
+    display: none;
+    height: auto;
+    max-height: 11;
+    padding: 1 3;
+    background: #141414;
+    border-top: solid #2a2a2a;
+    color: #e2e8f0;
+}
+
 /* --- Task board (§6) --- */
 #task-board {
     display: none;
     height: auto;
     max-height: 10;
-    padding: 1 2;
+    padding: 1 3;
     background: #1a1a1a;
     border-top: solid #3a3a3a;
     color: #e2e8f0;
@@ -160,8 +217,8 @@ Screen {
 
 /* --- Composer --- */
 #composer {
-    height: 3;
-    padding: 0 2;
+    height: 4;
+    padding: 0 3;
     background: #1a1a1a;
     border-top: solid #3a3a3a;
     color: #e8e8e8;
@@ -170,7 +227,7 @@ Screen {
 .composer-prompt {
     color: #00ff9f;
     text-style: bold;
-    width: 4;
+    width: 2;
     content-align: center middle;
 }
 
@@ -201,10 +258,6 @@ Screen {
     color: #00ff9f;
     margin: 1 0 1 4;
 }
-
-/* Fullscreen / zen: give the transcript the room, keep credits visible */
-Screen.fullscreen #wordmark { display: none; }
-Screen.fullscreen #task-board { display: none; }
 """
 
 
@@ -214,6 +267,8 @@ class TAMIASApp(App):
     # Plain letters work whenever the composer is not focused (see ✦ nav mode
     # below); the /commands and the function keys work while typing too.
     BINDINGS = [
+        # priority so Tab completes the slash palette before focus traversal
+        Binding("tab", "complete_slash", "Complete", priority=True, show=False),
         ("t", "toggle_tasks", "Task"),
         ("c", "complete_task", "Complete"),
         ("m", "cycle_model", "Model"),
@@ -221,7 +276,6 @@ class TAMIASApp(App):
         ("q", "quit", "Quit"),
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+t", "toggle_tasks", "Task"),
-        ("f1", "toggle_fullscreen", "Fullscreen"),
         ("f3", "credits", "Credits"),
         ("escape", "nav_mode", "Nav"),
         ("i", "focus_input", "Input"),
@@ -242,7 +296,6 @@ class TAMIASApp(App):
         self.spinner_idx = 0
         self.nav_mode = False
         self.listening = True
-        self.fullscreen = False
         self.session_id = ""
 
         self.current_model = os.environ.get(
@@ -268,24 +321,56 @@ class TAMIASApp(App):
         yield TaskBoardWidget(self.board, company_id=self.company_id,
                               id="task-board")
 
+        yield SlashMenu(id="slash-menu")
+
         with Horizontal(id="composer"):
-            yield Static("│ ❯ ", classes="composer-prompt")
-            yield Input(placeholder="type your task to begin...", id="user-input")
+            yield Static("❯ ", classes="composer-prompt")
+            yield Input(placeholder="type a task, or / for commands...",
+                        id="user-input")
 
     def on_mount(self) -> None:
         self.listen_to_agent()
         self.query_one(Input).focus()
         self.set_interval(0.1, self.tick_spinners)
+        self._apply_responsive(self.size.width)
+        self.call_later(self._show_landing)
 
+    def on_resize(self, event) -> None:
+        self._apply_responsive(event.size.width)
+
+    def _apply_responsive(self, width: int) -> None:
+        """Hide the widest header chips when the terminal cannot fit them,
+        so the wordmark and the credits readout never get clipped."""
+        screen = self.screen
+        for name, present in (("narrow", width < 104), ("tiny", width < 64)):
+            if present:
+                screen.add_class(name)
+            else:
+                screen.remove_class(name)
+
+    def _show_landing(self) -> None:
+        """Show the OpenCode-style home: big wordmark, no conversation yet."""
+        self.screen.add_class("landing")
+        # clear children and mount the hero in one awaited worker so the old
+        # #hero is fully removed before the new one is registered (mounting
+        # while the prior removal is still queued raises DuplicateIds).
+        self.run_worker(self._mount_landing(), group="landing", exclusive=True)
+
+    async def _mount_landing(self) -> None:
         transcript = self.query_one("#transcript-area")
-        welcome = Horizontal(
-            Static("◆", classes="gutter-icon"),
-            Static(RichMarkdown(
-                "Welcome to **TAMIAS**. Type your task to begin, or use "
-                "`/model` to change the engine."), classes="agent-turn"),
-            classes="turn",
-        )
-        self.call_later(transcript.mount, welcome)
+        await transcript.remove_children()
+        # a turn may have started while we were clearing; don't resurrect the hero
+        if not self.screen.has_class("landing"):
+            return
+        transcript.mount(Hero(compact=self.size.width < 60, id="hero"))
+
+    def _enter_chat(self) -> None:
+        """Leave the landing and let the conversation take the screen."""
+        if not self.screen.has_class("landing"):
+            return
+        self.screen.remove_class("landing")
+        for hero in self.query("#hero"):
+            hero.remove()
 
     def on_unmount(self) -> None:
         self.listening = False
@@ -346,11 +431,35 @@ class TAMIASApp(App):
         return text
 
     # --------------------------------------------------------------- composer
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "user-input":
+            self._refresh_slash(event.value)
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         user_text = event.value.strip()
+        menu = self.query_one("#slash-menu", SlashMenu)
+
+        # Enter accepts the highlighted palette row before it submits text.
+        if menu.open:
+            decision = menu.accept()
+            if decision is not None:
+                value, submit_now = decision
+                event.input.value = ""
+                if not submit_now:
+                    event.input.value = value
+                    event.input.cursor_position = len(value)
+                    self._refresh_slash(value)
+                    return
+                user_text = value
+
+        event.input.value = ""
         if not user_text:
             return
-        event.input.value = ""
+        await self._run_command_or_turn(user_text)
+
+    async def _run_command_or_turn(self, user_text: str) -> None:
+        self._close_slash()
+        self._enter_chat()
 
         if user_text in ("/quit", "/exit"):
             self.exit()
@@ -380,17 +489,60 @@ class TAMIASApp(App):
             self.action_credits()
             return
 
-        if user_text == "/fullscreen":
-            self.action_toggle_fullscreen()
-            return
-
         if user_text in ("/clear", "/compact"):
             self.ui_queue.put(user_text)
+            return
+
+        if user_text.startswith("/"):
+            self.show_system(
+                f"unknown command `{user_text}` — press / for the list")
             return
 
         # ordinary turn: echo it, then hand it to the agent
         await self._mount_user_turn(user_text)
         self.ui_queue.put(user_text)
+
+    # ------------------------------------------------------------ slash palette
+    def _refresh_slash(self, value: str) -> None:
+        menu = self.query_one("#slash-menu", SlashMenu)
+        text = value.lstrip()
+        if text.startswith("/model "):
+            menu.show_models(text[len("/model "):])
+        elif text.startswith("/") and " " not in text:
+            menu.show_commands(text)
+        else:
+            menu.close()
+
+    def _close_slash(self) -> None:
+        self.query_one("#slash-menu", SlashMenu).close()
+
+    async def on_key(self, event) -> None:
+        """Drive the palette with the arrow keys while the composer is focused."""
+        menu = self.query_one("#slash-menu", SlashMenu)
+        if not menu.open:
+            return
+        if not self.query_one("#user-input", Input).has_focus:
+            return
+        if event.key == "down":
+            menu.move(1)
+            event.stop()
+            event.prevent_default()
+        elif event.key == "up":
+            menu.move(-1)
+            event.stop()
+            event.prevent_default()
+
+    def action_complete_slash(self) -> None:
+        menu = self.query_one("#slash-menu", SlashMenu)
+        if menu.open:
+            completed = menu.complete()
+            if completed is not None:
+                inp = self.query_one("#user-input", Input)
+                inp.value = completed
+                inp.cursor_position = len(completed)
+                self._refresh_slash(completed)
+            return
+        self.action_focus_next()
 
     async def _mount_user_turn(self, text: str) -> None:
         transcript = self.query_one("#transcript-area")
@@ -403,6 +555,7 @@ class TAMIASApp(App):
         turn.scroll_visible()
 
     def _open_model_picker(self) -> None:
+        self._close_slash()
         from tui.model_picker import ModelPicker
         self.push_screen(ModelPicker(), self._on_model_picked)
 
@@ -452,6 +605,7 @@ class TAMIASApp(App):
             self.refresh_task_board()
 
     def action_complete_task(self) -> None:
+        self._close_slash()
         task = self.board.current
         if task is None:
             self.show_system("No active task to complete.")
@@ -515,19 +669,18 @@ class TAMIASApp(App):
         self._choose_model(dict(MODEL_TIERS)[nxt])
 
     def action_help(self) -> None:
+        self._close_slash()
         self.push_screen(HelpScreen())
 
     def action_credits(self) -> None:
+        self._close_slash()
         self.push_screen(CreditsDashboard(self.ledger.snapshot()))
 
-    def action_toggle_fullscreen(self) -> None:
-        self.fullscreen = not self.fullscreen
-        if self.fullscreen:
-            self.screen.add_class("fullscreen")
-        else:
-            self.screen.remove_class("fullscreen")
-
     def action_nav_mode(self) -> None:
+        # the palette owns Escape while it is open
+        if self.query_one("#slash-menu", SlashMenu).open:
+            self._close_slash()
+            return
         # blur the composer so the plain T/C/M/H shortcuts fire; Enter refocuses
         if self.query_one(Input).has_focus:
             self.set_focus(None)
@@ -590,7 +743,7 @@ class TAMIASApp(App):
 
     # ------------------------------------------------------------ transcript
     def clear_transcript(self) -> None:
-        self.query_one("#transcript-area").remove_children()
+        self._show_landing()
 
     def update_model_display(self, model_name: str) -> None:
         if model_name:
@@ -599,6 +752,7 @@ class TAMIASApp(App):
 
     def start_agent_turn(self, user_prompt: str = "",
                          session_id: str = "") -> None:
+        self._enter_chat()
         self.current_agent_text = ""
         if session_id:
             self.session_id = session_id
@@ -723,7 +877,7 @@ class TAMIASApp(App):
 
         inp = self.query_one(Input)
         inp.disabled = False
-        inp.placeholder = "type your task to begin..."
+        inp.placeholder = "type a task, or / for commands..."
         inp.focus()
 
 

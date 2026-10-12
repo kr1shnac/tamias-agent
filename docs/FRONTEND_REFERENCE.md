@@ -38,8 +38,11 @@ Read it top to bottom, then implement in the order in **§B**.
 | Task board + completion flow (§6) | **BUILT** | `tui/tasks.py`, `tui/modals.py` |
 | Model **tier** cycling UX (§7) | **BUILT** — `MODEL_TIERS` + `M` | `tui/app.py` |
 | Boundary-violation modal (§8) | **BUILT** — driven by blocked results | `tui/modals.py` |
-| Nav bindings `T` / `C` / `H` / `F1` (§9) | **BUILT** (+ nav mode / `/commands`) | `tui/app.py` |
+| Nav bindings `T` / `C` / `H` / `F3` (§9) | **BUILT** (+ nav mode / `/commands`) | `tui/app.py` |
 | Session / task / credits panels | **BUILT** — task board + credits dashboard | `tui/app.py` |
+| Landing hero / home screen (§4.1) | **BUILT** — no chrome, swap on first turn | `tui/branding.py` |
+| Slash-command palette (§4.2) | **BUILT** — `/` menu, `↑↓`/`Tab`/`Enter` | `tui/slash.py` |
+| Responsive header (§3.A) | **BUILT** — drops chips, never clips | `tui/app.py` |
 
 ## C. Integration contract (how the UI talks to the agent)
 - `TAMIASApp(ui_queue, agent_queue, company_id=None)` takes **two `queue.Queue`s**.
@@ -64,7 +67,7 @@ Read it top to bottom, then implement in the order in **§B**.
 3. **Task board + completion modal** (§6); wire the `T` and `C` bindings.
 4. **Boundary-violation modal** (§8) driven by blocked-tool results.
 5. **Model tiers** (§7) + the `M` binding.
-6. **Help overlay** (`H`) and **fullscreen** (`F1`).
+6. **Help overlay** (`H`).
 
 ## E. Acceptance criteria (definition of done)
 - [x] Credits readout is always visible and color-coded (green ≥39% · amber 20–38% · red <20%).
@@ -73,6 +76,11 @@ Read it top to bottom, then implement in the order in **§B**.
 - [x] A boundary violation shows the red `BLOCKED` modal.
 - [x] No `.env` value is ever read or rendered.
 - [x] The palette is exactly §1 — introduce no new colors.
+- [x] No header chip or the composer box is ever clipped, at any terminal width.
+- [x] `/` opens a command palette; unknown `/…` never reaches the agent.
+- [x] The landing shows no chrome (no header, no bottom bar); the first submitted
+      message swaps in the full chat with the header and the bottom composer.
+- [x] No fullscreen mode — opening the chat *is* "full screen".
 
 ## F. Scope & rules
 - **Frontend only.** Do not rewrite `agent.py`'s tool logic or weaken any test.
@@ -92,8 +100,11 @@ Panels       #1a1a1a      Panel border #3a3a3a
 Glass        rgba(255,255,255,0.03) bg / 0.1 border / 0.3 top edge
 ```
 
-Navigation: `T` task · `C` complete · `M` model · `H` help · `Q` quit · `F1` fullscreen · `F3` credits.
-Plain letters work in nav mode (`Esc`); `F1`/`F3`/`Ctrl+T` and the `/commands` work while typing.
+Navigation: `T` task · `C` complete · `M` model · `H` help · `Q` quit · `F3` credits.
+Plain letters work in nav mode (`Esc`); `F3`/`Ctrl+T` and the `/commands` work while typing.
+Type `/` for the command palette (`↑↓` move · `Tab` complete · `Enter` run · `Esc` close).
+On start you get a chrome-free centred `TAMIAS` wordmark + input; the first message
+opens the chat (header appears, composer drops to the bottom). No fullscreen mode.
 
 Credits header always visible → `SCR 58/150 (39% saved)` → green ≥39%, amber 20–38%, red <20%.
 
@@ -157,21 +168,53 @@ Screen {
 /* --- Transcript --- */
 #transcript-area {
     height: 1fr;
-    padding: 1 2;
+    padding: 2 3;
     overflow-y: auto;
-    align: center top;
+    align: left top;
+}
+
+/* --- Home screen (OpenCode-style) --------------------------------------
+   Before the first message there is no chrome: the header bar is hidden and
+   the wordmark + composer sit together in the middle of the screen. The first
+   submitted message drops Screen.landing and the full chat takes over. */
+Screen.landing {
+    align-horizontal: center;
+    align-vertical: middle;
+}
+Screen.landing #header-bar { display: none; }
+Screen.landing #transcript-area {
+    height: auto;
+    width: 76;
+    max-width: 100%;
+    align: center middle;
+}
+Screen.landing #composer {
+    height: auto;
+    width: 76;
+    max-width: 100%;
+    background: transparent;
+    border-top: none;
+    padding: 0 3;
+}
+Screen.landing #slash-menu {
+    width: 76;
+    max-width: 100%;
+}
+#hero {
+    height: auto;
+    width: auto;
 }
 
 .turn {
     height: auto;
     margin-bottom: 1;
-    max-width: 120;
+    max-width: 112;
 }
 
 .user-turn-container {
     height: auto;
     margin-bottom: 1;
-    max-width: 120;
+    max-width: 112;
 }
 
 .user-turn {
@@ -237,7 +280,7 @@ Screen {
 /* --- Header bar --- */
 #header-bar {
     layout: horizontal;
-    padding: 0 2 0 2;
+    padding: 0 3;
     height: 2;
     background: #1a1a1a;
     border-bottom: solid #3a3a3a;
@@ -268,12 +311,29 @@ Screen {
     min-width: 34;
 }
 
+/* responsive header: drop the wide model chip first, then the small wordmark
+   (the credits readout stays visible), so nothing is ever clipped */
+Screen.narrow #model-display { display: none; }
+Screen.tiny #wordmark { display: none; }
+Screen.tiny #header-bar { padding: 0 2; }
+
+/* --- Slash palette (§4) --- */
+#slash-menu {
+    display: none;
+    height: auto;
+    max-height: 11;
+    padding: 1 3;
+    background: #141414;
+    border-top: solid #2a2a2a;
+    color: #e2e8f0;
+}
+
 /* --- Task board (§6) --- */
 #task-board {
     display: none;
     height: auto;
     max-height: 10;
-    padding: 1 2;
+    padding: 1 3;
     background: #1a1a1a;
     border-top: solid #3a3a3a;
     color: #e2e8f0;
@@ -281,8 +341,8 @@ Screen {
 
 /* --- Composer --- */
 #composer {
-    height: 3;
-    padding: 0 2;
+    height: 4;
+    padding: 0 3;
     background: #1a1a1a;
     border-top: solid #3a3a3a;
     color: #e8e8e8;
@@ -291,7 +351,7 @@ Screen {
 .composer-prompt {
     color: #00ff9f;
     text-style: bold;
-    width: 4;
+    width: 2;
     content-align: center middle;
 }
 
@@ -306,6 +366,21 @@ Screen {
 #user-input:focus {
     border: solid #00b8ff;
     background: #1a1a1a;
+}
+
+/* Supporting tokens (§2.1) */
+.composer-placeholder {
+    color: #64748b;
+    content-align: left middle;
+}
+.active-spinner {
+    color: #00ff9f;
+}
+
+/* Model switch card (§7) */
+.model-card {
+    color: #00ff9f;
+    margin: 1 0 1 4;
 }
 ```
 
@@ -353,32 +428,39 @@ even gradients if needed.
 ```
 
 **Gutter glyphs.** User `❯` (green `#00ff9f`) · Agent `⬡` (cyan `#00b8ff`) ·
-Welcome/system `◆`.
+System/task `◆`.
 
-**Welcome message** (mounted on start):
-
-```
-◆  Welcome to TAMIAS. Type your task to begin, or use /model to change the engine.
-```
+**Home screen.** There is no welcome *turn* any more. On mount the transcript is
+replaced by a centred `#hero` wordmark (see §4.1); the first submitted message
+swaps it out for the live conversation.
 
 ---
 
 ## 3. WIDGET SPECIFICATIONS
 
 ### A. `#header-bar` (top bar)
-- `layout: horizontal`, `height: 2`, `padding: 0 2`
+- `layout: horizontal`, `height: 2`, `padding: 0 3`
 - `background: #1a1a1a`, `border-bottom: solid #3a3a3a`
 - Contains `#wordmark` (left, flexible), `#credits-readout` (right), and
   `#model-display` (right, `min-width: 34`).
-- Hosts the **always-visible credits readout** (see §5).
+- Hosts the **always-visible credits readout while the chat is open** (see §5).
+- **Hidden on the landing.** While `Screen.landing`, the whole bar is
+  `display: none` — the home screen is chrome-free (§4.1); it returns the moment
+  the first message opens the chat.
+- **Responsive.** `TAMIASApp._apply_responsive()` (from `on_resize`) toggles
+  `narrow` on the `Screen` below 104 cols and `tiny` below 64. `narrow` hides
+  `#model-display`; `tiny` also hides `#wordmark` and tightens the padding. The
+  credits readout is the one child that never hides — so the bar never clips the
+  model id into the wordmark (the old bug) and never overflows the terminal.
 
 ### B. `#wordmark`
-- `width: 1fr`, **left**-aligned middle, bold, `color: #00b8ff`
+- `width: 1fr`, **left**-aligned middle, bold
 - Left-aligned (not centred) so it sits on the same column as every other
   left-aligned element (turns, task board, composer) and never drifts as the
   credits readout / model chip change width.
 - Renders a **cyan→green gradient** via `create_gradient_text(text, "#00b8ff", "#00ff9f")`.
-- Text: `T A M I A S   A G E N T`.
+- Text: `T A M I A S   A G E N T`. Hidden while `Screen.landing` (§4.1) and under
+  `Screen.tiny`.
 
 ### C. `#model-display`
 - `width: auto`, right-aligned middle, `padding: 0 2`, `margin-left: 2`, bold,
@@ -387,11 +469,17 @@ Welcome/system `◆`.
 - Shows the **live model chip** with a single-cell status dot:
   `● ⟨ <model> · <effort> ⟩` (defaults: `nvidia/nemotron-3.5-lightning:free`,
   effort `auto`). No emoji — only monochrome glyphs.
-- Updated on `init` / `model_update` events.
+- Updated on `init` / `model_update` events. Hidden under `Screen.narrow`.
 
 ### D. `#transcript-area`
-- `height: 1fr`, `padding: 1 2`, `overflow-y: auto`, `align: center top`
+- `height: 1fr`, `padding: 2 3`, `overflow-y: auto`, `align: left top`
 - Holds alternating turn containers; auto-scrolls to newest.
+- **Left**-aligned so the turn gutter sits on the same column as `#wordmark`
+  (col 3) at every width; `max-width: 112` caps line length for readability
+  without ever centring the column (which would drift the left edge on wide
+  terminals).
+- While `Screen.landing` (§4.1) the rule flips: `height: auto`, fixed column
+  `width: 76` (centred), so the hero floats centred above the landing composer.
 
 ### E. Turn containers
 - **User turn:** `Horizontal(gutter "❯", user-turn)`, class `user-turn-container`.
@@ -427,19 +515,41 @@ Welcome/system `◆`.
 - Header row: `.tool-name` (bold, `1fr`) + `.tool-status` (`auto`).
 
 ### G. `#composer`
-- `height: 3`, `padding: 0 2`, `background: #1a1a1a`, `border-top: solid #3a3a3a`
-- `.composer-prompt` = green bold `│ ❯ ` (`#00ff9f`), width 4, centered middle.
+- `height: 4`, `padding: 0 3`, `background: #1a1a1a`, `border-top: solid #3a3a3a`
+  (the extra row is required: the bordered `#user-input` is 3 rows, so a 3-row
+  composer clipped its bottom border and the text sat on the last terminal row).
+- `.composer-prompt` = green bold `❯ ` (`#00ff9f`), width 2, centered middle.
+  Dropping the old `│ ` prefix puts the prompt glyph on col 3 — the same column
+  as the turn gutters and `#wordmark` — and the input box left edge on col 5,
+  the same column as turn text.
 - `#user-input`: `background #0d0d0d`, `border solid #3a3a3a`, `padding 0 1`,
   text `#f8fafc`.
   Focus: `border solid #00b8ff`, `background #1a1a1a`.
 - While the agent works: input is disabled, placeholder becomes `Agent is working...`.
 
+### H. `#hero` (home screen, §4.1)
+- A `Static` rendering `tui.branding.hero_text()`: a six-row ASCII-Shadow
+  `TAMIAS` wordmark with a diagonal cyan→green gradient, a tagline and two hint
+  lines. `min-width` is not set — the art is 52 cells wide, so below 60 cols
+  `Hero(compact=True)` swaps in `fallback_text()` (a one-line brand).
+- `height: auto`, `width: auto`; the transcript centres it while landing.
+
+### I. `#slash-menu` (§4.2)
+- `display: none` until a `/` value opens it; `height: auto`, `max-height: 11`
+  (1 border + 2 padding rows + heading + six commands + "more"), `padding: 1 3`,
+  `background #141414`, `border-top: solid #2a2a2a`.
+- Renders a `MODELS`/`COMMANDS` heading and up to six rows as a single Rich
+  `Text`; the highlighted row gets `❯` (green) and a bold white label.
+- Owned by `tui/slash.py::SlashMenu`; the app owns the keys.
+
 > **The component set is closed.** There is no `.plan-card`, no `.bubble`
 > alternate chat layout, and no second theme. Turn containers (§E), tool cards
-> (§F) and the composer (§G) are the complete component set; a new surface must
-> extend §1/§2, not add a parallel design.
+> (§F), the composer (§G), the landing hero (§H) and the slash palette (§I) are
+> the complete component set; a new surface must extend §1/§2, not add a parallel
+> design. (The hero and palette are the only additions since the first
+> alignment pass; they reuse the existing palette and glyph vocabulary.)
 
-### H. `ModelPicker` modal (`tui/model_picker.py`)
+### J. `ModelPicker` modal (`tui/model_picker.py`)
 
 Pushed when the user runs `/model` (or `M`). A centered `ModalScreen[str]` that
 dismisses with the chosen model id (or `""` to cancel via `Escape`).
@@ -506,19 +616,60 @@ Screen                          bg #0d0d0d · color #e8e8e8 · vertical
 │   ├── #wordmark               1fr · left · gradient cyan→green
 │   ├── #credits-readout        auto · right · colour-coded SCR readout (§5)
 │   └── #model-display          auto · right · green · model chip (● ⟨ … ⟩)
-├── #transcript-area            h1fr · padding 1 2 · scroll · align center top
+├── #transcript-area            h1fr · padding 2 3 · scroll · align left top
+│   ├── Screen.landing → #hero   chrome-free centred wordmark block (§4.1)
 │   ├── .turn / .user-turn-container
 │   │   ├── .gutter-icon        ❯ (user) / ⬡ (agent) · fixed width 2
 │   │   └── .user-turn | .agent-turn  (agent text wrapped in .turn-body)
 │   └── .tool-card …            nested inside agent turn
 ├── #task-board                 hidden by default · T toggles (§6)
-└── #composer                   h3 · bg #1a1a1a · border-top #3a3a3a · horizontal
-    ├── .composer-prompt        │ ❯  (green)
+├── #slash-menu                 hidden by default · / opens it (§4.2)
+└── #composer                   h4 · bg #1a1a1a · border-top #3a3a3a · horizontal
+    ├── .composer-prompt        ❯  (green)
     └── #user-input             1fr input
 ```
 
-`F1` adds `Screen.fullscreen`, which hides `#wordmark` and `#task-board` to
-widen the transcript while keeping the credits readout visible.
+**Screen.landing overrides the whole tree** (§4.1): `#header-bar` is
+`display: none`, `#transcript-area` shrinks to the hero (`width: 76`, centred,
+`height: auto`) and `#composer` loses its bar background, drops below the hero,
+and is centred — so the home screen is wordmark + input, nothing else. There is
+no fullscreen mode; opening the chat *is* "full screen".
+
+### 4.1 Landing / home screen
+
+On mount — and again after `/clear` — the app shows a **home screen** before any
+conversation: `TAMIASApp._show_landing()` clears the transcript, adds
+`Screen.landing`, and mounts `#hero` (`tui/branding.py`). The hero is a six-row
+ASCII-Shadow `TAMIAS` wordmark with a diagonal `#00b8ff → #00ff9f` gradient,
+a `bounded agentic coding · savings-first` tagline and two hint lines
+(`type a task…` / `/model /task /credits /help`), all centred against the art's
+52-cell width. Below 60 cols `Hero(compact=True)` renders a one-line fallback.
+
+`TAMIASApp._enter_chat()` removes the `landing` class and the hero the first time
+a message is submitted or an agent turn starts, and the conversation takes over —
+the OpenCode-style "type to open the chat" hand-off. **The header bar, the
+credits readout and the bottom-anchored composer appear at that moment** (the
+landing is deliberately chrome-free, so the readout is not visible until the chat
+opens — §5).
+
+### 4.2 Slash-command palette
+
+Typing `/` (with no space yet) opens `#slash-menu` above the composer with the
+matching commands; `/model <partial>` switches it to the filtered model
+catalogue. `tui/slash.py` holds the `Command` table, the `SlashMenu` widget
+(rows + highlight) and the pure match/accept logic; `TAMIASApp` owns the keys:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | move the highlight (`on_key`, only while the composer is focused) |
+| `Tab` | complete the highlighted row into the box, do not run (priority binding) |
+| `Enter` | run the highlighted row: a leaf command executes, `/model` fills `/model ` and flips to models, a model row submits `/model <id>` |
+| `Esc` | close the palette (and stay in the composer) |
+
+Commands: `/model` (takes an arg) · `/task` · `/complete` · `/credits` · `/help`
+· `/clear` · `/quit`. Typing an unrecognised `/…` never reaches
+the agent: the app prints `unknown command … — press / for the list` as a system
+turn.
 
 **Modal screens** (`ConfirmModal`, `BoundaryModal`, `HelpScreen`,
 `CreditsDashboard`) each assign `CSS = DIALOG_CSS` (from `tui/modals.py`) and the
@@ -534,9 +685,11 @@ viewport and pushes the transcript off screen with a spurious scrollbar.
 
 ---
 
-## 5. CREDITS DISPLAY (always visible)
+## 5. CREDITS DISPLAY (always visible in the chat)
 
-Credits are the reason the product exists. **Never hide them.**
+Credits are the reason the product exists. **Never hide them** while the chat is
+open (§4.1: the chrome-free landing intentionally shows no header until the first
+message).
 
 **Header readout** (single line in `#header-bar`, right side; always visible):
 
@@ -546,6 +699,11 @@ SCR 58/150 (39% saved)
 
 The readout is colour-coded (see table below); it is **not** boxed — the model
 chip sits to its right on the same line (`● ⟨ model · effort ⟩`).
+
+It is also the one header child that **never hides**: the responsive header
+(§3.A) drops `#model-display` first and `#wordmark` second when the terminal is
+narrow, so the credits readout is always present and never pushes anything off
+screen.
 
 **Color coding by savings rate:**
 
@@ -705,25 +863,29 @@ tool card still shows `✗ failed`.
 
 | Key | Action |
 |---|---|
-| `↑` / `↓` | Move between panels / history |
+| `↑` / `↓` | Move the slash-palette highlight (else move between panels / history) |
+| `Tab` | Complete the highlighted slash row (else move focus) |
 | `←` / `→` | Switch sections (Task / Credits / Session / Actions) |
-| `Enter` | Activate focused panel / submit · recharge the composer |
+| `Enter` | Accept the highlighted slash row, else activate / submit · recharge the composer |
 | `T` | Toggle task & progress view |
 | `C` | Complete current task (confirmation modal) |
 | `M` | Cycle models (free → mid → premium) — same as `/model` |
 | `H` | Help overlay |
 | `Q` / `Ctrl+C` | Exit |
-| `F1` | Toggle fullscreen (hides wordmark + task board) |
 | `F3` | Credits dashboard (§5) |
-| `Esc` | Leave the composer → navigation mode |
+| `Esc` | Close the slash palette, else leave the composer → navigation mode |
+| `/` | Open the command palette (§4.2) |
 | `/model` | Open the model picker (or `/model <id>` to set one) |
 | `/task`, `/complete` | Task board / completion aliases |
-| `/credits`, `/help`, `/fullscreen` | Aliases |
+| `/credits`, `/help` | Aliases |
 | `/clear`, `/compact`, `/quit` | Forwarded to the agent / exit |
 
 **Nav mode.** The composer owns printable keys, so `T`/`C`/`M`/`H`/`Q` fire
 while it is blurred: press `Esc` to enter navigation mode, then `Enter` to
-return. `F1`, `F3`, `Ctrl+T`, `↑`/`↓` and every `/command` work while typing.
+return. `F3`, `Ctrl+T`, `↑`/`↓` and every `/command` work while typing —
+and while the slash palette is open, `↑`/`↓`/`Tab`/`Enter`/`Esc` drive it
+instead (§4.2). There is **no fullscreen key** — the chat already takes the whole
+screen.
 
 ---
 
@@ -761,6 +923,8 @@ tamias-agent/
 │   └── FRONTEND_REFERENCE.md   ← THIS FILE (single source of truth)
 ├── tui/
 │   ├── app.py                  ← authoritative TCSS + TAMIASApp (view + bindings)
+│   ├── branding.py             ← landing hero: ASCII wordmark + gradient (§4.1)
+│   ├── slash.py                ← slash-command table + SlashMenu widget (§4.2)
 │   ├── bridge.py               ← agent→UI adapter: runs the core, emits events
 │   ├── events.py               ← event protocol: TUIEvent, TurnStart, MessageDelta,
 │   │                              StatusUpdate, ToolStart, ToolProgress, ToolEnd,
