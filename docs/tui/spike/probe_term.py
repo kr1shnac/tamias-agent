@@ -3,8 +3,9 @@ import tty
 import termios
 import select
 import re
+import time
 
-def probe_terminal(sequence: str, timeout: float = 0.15) -> str:
+def probe_terminal(sequence: str, timeout: float = 1.0) -> str:
     """Send an ANSI sequence and read the raw response from stdin."""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -15,21 +16,17 @@ def probe_terminal(sequence: str, timeout: float = 0.15) -> str:
         sys.stdout.flush()
         
         response = ""
-        # Poll for response with timeout
-        while True:
-            r, w, x = select.select([sys.stdin], [], [], timeout)
+        start = time.time()
+        while time.time() - start < timeout:
+            r, w, x = select.select([sys.stdin], [], [], timeout - (time.time() - start))
             if not r:
                 break
             char = sys.stdin.read(1)
             response += char
-            # Stop if we hit typical terminators (ST/BEL/string terminator)
-            if char in ('\x07', '\x1c', '\x9c'):
-                break
-            # OSC 11 response often ends in ESC \
-            if response.endswith('\x1b\\'):
-                break
-            # DECRQM response often ends in 'y'
+            
             if sequence.endswith('$p') and char == 'y':
+                break
+            if '11;?' in sequence and (char == '\x07' or response.endswith('\x1b\\')):
                 break
                 
         return response
@@ -39,38 +36,21 @@ def probe_terminal(sequence: str, timeout: float = 0.15) -> str:
 def main():
     print("Testing Terminal Capabilities...\n")
     
-    # 1. DEC 2026 (Sync Output)
-    # DECRQM format: ESC [ ? <mode> $ p
     dec_query = "\x1b[?2026$p"
-    dec_response = probe_terminal(dec_query)
+    dec_response = probe_terminal(dec_query, timeout=1.0)
+    print(f"DEC 2026 Raw Response: {repr(dec_response)}")
     
-    if dec_response:
-        # Expected: ESC [ ? 2026 ; <setting> $ y
-        print(f"DEC 2026 Raw Response: {repr(dec_response)}")
-        if ";1$y" in dec_response or ";2$y" in dec_response:
-            print("DEC 2026: SUPPORTED (Recognized)")
-        elif ";0$y" in dec_response:
-            print("DEC 2026: UNRECOGNIZED (Not supported)")
-        else:
-            print("DEC 2026: UNKNOWN RESPONSE")
-    else:
-        print("DEC 2026 Raw Response: NONE (Timeout)")
-
-    # 2. OSC 11 (Background Color)
-    # OSC 11 format: ESC ] 11 ; ? ESC \
+    # Wait slightly to clear buffer if terminal was slow
+    time.sleep(0.5)
+    
     osc_query = "\x1b]11;?\x1b\\"
-    osc_response = probe_terminal(osc_query)
+    osc_response = probe_terminal(osc_query, timeout=1.0)
+    print(f"\nOSC 11 Raw Response: {repr(osc_response)}")
     
     if osc_response:
-        print(f"\nOSC 11 Raw Response: {repr(osc_response)}")
-        # Look for rgb:RRRR/GGGG/BBBB
         match = re.search(r"rgb:([0-9a-fA-F/]+)", osc_response)
         if match:
             print(f"OSC 11: Background Color = {match.group(1)}")
-        else:
-            print("OSC 11: Response received but no RGB found.")
-    else:
-        print("\nOSC 11 Raw Response: NONE (Timeout)")
 
 if __name__ == "__main__":
     main()

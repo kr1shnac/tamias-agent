@@ -1,7 +1,6 @@
 import asyncio
 import time
 import os
-import psutil
 from textual.app import App, ComposeResult
 from textual.widgets import RichLog, Header, Footer
 from textual import work
@@ -57,8 +56,10 @@ class StreamStress(App):
         p50 = self.frame_times[len(self.frame_times)//2]
         p95 = self.frame_times[int(len(self.frame_times)*0.95)]
         
-        process = psutil.Process(os.getpid())
-        cpu_usage = process.cpu_percent(interval=1.0)
+        try:
+            cpu_usage = float(os.popen(f"ps -p {os.getpid()} -o %cpu=").read().strip())
+        except Exception:
+            cpu_usage = 0.0
         
         stats = f"\n\n[bold green]STRESS TEST COMPLETE[/bold green]\n" \
                 f"p50 frame time: {p50:.2f} ms\n" \
