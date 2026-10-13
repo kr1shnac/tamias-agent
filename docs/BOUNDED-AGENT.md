@@ -104,24 +104,41 @@ allow_write = ["company/work/acme/bots/codefix/**"]
 deny_read   = ["company/work/acme/hr/**", "**/*.pem"]
 ```
 
-### How the agent would enforce it (each maps to code)
+### Using it
 
-1. **Tool dispatch gate** — before executing any tool, consult the policy:
-   `hard deny` (tool-level or arg-pattern) → return `Error: policy deny …` and
-   never run. This is *exactly* where `resolve_in_company_workspace` sits today;
-   the policy check goes in the same dispatch path (`execute_tool`).
-2. **`run_shell` pattern allow/deny** — extend `shell_escapes_company` with a
-   second pass over `allow`/`deny` command patterns; deny wins.
-3. **Filesystem scope** — `resolve_*` already returns the fence; a policy
-   `allow_write`/`deny_read` glob set is a second check next to `refuse_secret`.
-4. **Read-only mode** — a write gate: when `read_only = true`, every
-   write/edit/create returns the policy error. One flag, high value (plan-agent).
-5. **Escalation (ask)** — when a call matches neither allow nor hard deny,
+```bash
+# company admin keeps the policy outside the fence, agent reads it at startup
+.venv/bin/python agent.py \
+  --company-id acme \
+  --policy ~/.config/tamias/policies/acme.toml \
+  --task "fix the failing test in codefix"
+```
+
+`TAMIAS_POLICY` env var works too. A missing or malformed policy **refuses to
+start** (exit 1) rather than silently running unbounded. Every gate decision is
+in `agent.POLICY_AUDIT` and, when `[audit] path` is set, appended as JSONL.
+
+### How the agent enforces it (each maps to code)
+
+Implemented in `agent.py` (2026-10-13, committed):
+
+1. ✅ **Tool dispatch gate** — lives at the top of `dispatch_tool`, so every
+   tool call from the model passes it before anything runs. `hard deny`
+   (tool-level) → `Error: policy deny …` and never runs; deny wins over allow.
+2. ✅ **`run_shell` pattern allow/deny** — a second pass over `allow`/`deny`
+   command substrings, after `shell_escapes_company`; deny wins.
+3. ✅ **Filesystem scope** — `resolve_*` returns the fence; the policy
+   `allow_write`/`deny_read` glob set is checked in the same gate, next to
+   `refuse_secret`.
+4. ✅ **Read-only mode** — when `read_only = true`, every write/edit/create and
+   the shell return the policy error. One flag, high value (plan-agent).
+5. ⏳ **Escalation (ask)** — when a call matches neither allow nor hard deny,
    emit an `ask` event to the UI bridge; interactive run shows a confirm,
-   headless run denies.
-6. **Audit trail** — each decision (allowed / denied / asked / cmd) appended to
-   a local JSONL (per company, rotated), containing `ts, company, tool, args,
-   decision, rule_id`. This is the SIEM-ready record companies ask for ([9][12]).
+   headless run denies. *(not yet built)*
+6. ✅ **Audit trail** — every gate decision (allowed / denied) appended to
+   `POLICY_AUDIT`; a `[audit] path =` JSONL writer is wired in `policy_audit`.
+   Each row: `ts, use_case, tool, decision, reason, args` — the SIEM-ready
+   record companies ask for ([9][12]).
 7. **Policy can't be edited by the agent** — the policy file is outside the
    fence, and `is_sensitive_path`-style rules refuse any tool path that touches
    it (same mechanism as `.env` today).
@@ -139,11 +156,18 @@ deny_read   = ["company/work/acme/hr/**", "**/*.pem"]
 
 ## 5. Suggested build order (all offline-testable)
 
-1. `PolicyProfile` dataclass + TOML loader (`tui`-free, pure `agent.py`).
-2. Dispatch gate: tool allow / hard deny + `read_only` flag (first tests).
-3. `run_shell` command-family allow/deny patterns.
-4. Filesystem glob scope (`allow_write` / `deny_read`) beside `refuse_secret`.
-5. `ask` escalation event + JSONL audit trail.
+Status as of 2026-10-13: steps 1–4 and the in-memory audit half of 5 are **done
+and committed** (`f76489a` + policy commit). The `--policy FILE` flag (and
+`TAMIAS_POLICY`) loads a profile in `main()`; the gate runs inside
+`dispatch_tool`, so every path into every tool passes it.
+
+1. ✅ `PolicyProfile` dataclass + TOML loader (`tui`-free, pure `agent.py`).
+2. ✅ Dispatch gate: tool allow / hard deny + `read_only` flag (first tests).
+3. ✅ `run_shell` command-family allow/deny patterns.
+4. ✅ Filesystem glob scope (`allow_write` / `deny_read`) beside `refuse_secret`.
+5. ⏳ `ask` escalation event + JSONL audit trail — the *in-memory* gate audit
+   (`POLICY_AUDIT`) is done; the `[audit] path =` JSONL writer is implemented in
+   `policy_audit`; wiring `ask` to the interactive UI is open.
 6. Policy-file self-protection test (agent cannot read/edit its own policy).
 7. Demo: `--company-id acme` + a policy whose `deny` blocks `rm`/`curl` — show a
    command getting refused *and* the audit row being written.

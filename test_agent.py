@@ -1805,6 +1805,339 @@ def test_edit_file_refuses_empty_old_text():
     assert unchanged == "hello\n"
 
 
+def _load_policy_text(toml_text):
+    """Load a policy from raw TOML through the real file loader."""
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(toml_text)
+        path = fh.name
+
+    try:
+        return agent.load_policy(path)
+    finally:
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def _with_policy(profile):
+    """Set agent._ACTIVE_POLICY for the duration, restoring whatever was there."""
+    missing = object()
+    saved = getattr(agent, "_ACTIVE_POLICY", missing)
+    agent.set_active_policy(profile)
+
+    try:
+        yield
+    finally:
+        if saved is missing:
+            delattr(agent, "_ACTIVE_POLICY")
+        else:
+            agent.set_active_policy(saved)
+
+
+def test_load_policy_parses_full_toml():
+    profile, err = _load_policy_text(
+        """
+        version = "1"
+
+        [use_case]
+        name = "code-fix-bot"
+        read_only = false
+
+        [tools]
+        allow = ["read_file", "search_in_files", "edit_file", "run_shell"]
+        deny = ["git push", "write_file"]
+
+        [run_shell]
+        allow = ["git status", "git diff", "python3 -m pytest"]
+        deny = ["rm ", "curl ", "git push "]
+
+        [paths]
+        allow_write = ["company/work/acme/bots/**"]
+        deny_read = ["company/work/acme/hr/**"]
+        """
+    )
+
+    assert err is None
+    assert profile.name == "code-fix-bot"
+    assert profile.read_only is False
+    assert "write_file" in profile.tool_deny
+    assert "read_file" in profile.tool_allow
+    assert "rm " in profile.shell_deny
+    assert "git status" in profile.shell_allow
+    assert profile.allow_write == ["company/work/acme/bots/**"]
+    assert profile.deny_read == ["company/work/acme/hr/**"]
+
+
+def test_load_policy_rejects_missing_file():
+    profile, err = agent.load_policy("/no/such/policy.toml")
+
+    assert profile is None
+    assert err.startswith("Error:")
+    assert "could not load policy" in err
+
+
+def test_load_policy_requires_use_case_name():
+    profile, err = _load_policy_text('[tools]\nallow = ["read_file"]\n')
+
+    assert profile is None
+    assert "use_case" in err
+
+
+def test_policy_gate_blocks_all_dispatched_tools_equally():
+    """The gate sits in front of dispatch_tool, so safe_tool_call hits it too."""
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "narrow"
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "not allowed for use case 'narrow'" in out
+
+
+def test_policy_hard_deny_wins_over_allow():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "no-shell"
+
+        [tools]
+        allow = ["run_shell", "read_file"]
+        deny = ["run_shell"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("run_shell", {"command": "echo hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "hard-denied" in out
+
+
+def test_policy_read_only_blocks_writes_and_shell():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "reviewer"
+        read_only = true
+
+        [tools]
+        allow = ["read_file", "write_file", "run_shell"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile), tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        write = agent.dispatch_tool("write_file",
+                                    {"file_path": "x.txt", "content": "hi"})
+        shell = agent.dispatch_tool("run_shell", {"command": "echo hi"})
+
+    assert "read-only" in write
+    assert "read-only" in shell
+
+
+def test_policy_read_only_still_allows_reads():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "reviewer"
+        read_only = true
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "note.txt")
+
+        with open(path, "w") as handle:
+            handle.write("hello\n")
+
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.dispatch_tool("read_file", {"file_path": "note.txt"})
+
+    assert "hello" in out
+    assert not out.startswith("Error: policy deny -")
+
+
+def test_policy_shell_denies_a_forbidden_command_family():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "no-egress"
+
+        [tools]
+        allow = ["run_shell"]
+
+        [run_shell]
+        allow = ["git status", "python3 -m pytest"]
+        deny = ["rm ", "curl "]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        denied = agent.dispatch_tool("run_shell", {"command": "curl http://x"})
+        allowed = agent.dispatch_tool("run_shell", {"command": "git status"})
+
+    assert "denied family" in denied
+    assert not allowed.startswith("Error: policy deny -")
+
+
+def test_policy_shell_requires_an_allowed_family():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "only-tests"
+
+        [tools]
+        allow = ["run_shell"]
+
+        [run_shell]
+        allow = ["python3 -m pytest"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("run_shell", {"command": "ls -la"})
+
+    assert "not in an allowed family" in out
+
+
+def test_policy_path_deny_read_blocks_read_tools():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "clean-room"
+
+        [tools]
+        allow = ["read_file"]
+
+        [paths]
+        deny_read = ["company/work/acme/hr/**"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "payroll.txt"), "w") as handle:
+            handle.write("secret\n")
+
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            denied = agent.dispatch_tool(
+                "read_file", {"file_path": "company/work/acme/hr/payroll.txt"})
+
+    assert "off-limits" in denied
+
+
+def test_policy_path_allow_write_scope_blocks_outside_writes():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "bots-only"
+
+        [tools]
+        allow = ["write_file"]
+
+        [paths]
+        allow_write = ["company/work/acme/bots/**"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            denied = agent.dispatch_tool(
+                "write_file",
+                {"file_path": "company/work/acme/elsewhere/x.txt",
+                 "content": "hi"})
+            allowed = agent.dispatch_tool(
+                "write_file",
+                {"file_path": "company/work/acme/bots/x.txt", "content": "hi"})
+
+    assert "outside the write scope" in denied
+    assert "written completely" in allowed
+
+
+def test_policy_audit_records_every_gate_decision():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "tracked"
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        agent.dispatch_tool("read_file", {"file_path": "a.txt"})
+        agent.dispatch_tool("update_plan", {"todos": []})
+        audit = list(agent.POLICY_AUDIT)
+
+    decisions = [row["decision"] for row in audit]
+
+    assert len(audit) == 2
+    assert decisions == ["allow", "deny"]
+    assert audit[0]["use_case"] == "tracked"
+    assert "not allowed" in audit[1]["reason"]
+
+
+def test_policy_inactive_by_default_passes_everything_through():
+    """No policy loaded - the dispatch gate is a no-op, unbounded as before."""
+    with _with_policy(None), tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "w.txt", "content": "hi"})
+
+    assert "written completely" in out
+    assert agent.POLICY_AUDIT == []
+
+
+def test_main_loads_policy_flag_before_running():
+    profile_toml = """
+        [use_case]
+        name = "cli-bounded"
+
+        [tools]
+        allow = ["read_file"]
+    """
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(profile_toml)
+        policy_path = fh.name
+
+    reset(FakeClient([response("done", prompt_tokens=10, completion_tokens=2)]))
+
+    try:
+        code = agent.main(["--policy", policy_path,
+                           "--task", "look around"])
+    finally:
+        os.unlink(policy_path)
+
+    active = agent._ACTIVE_POLICY
+    agent.set_active_policy(None)
+    assert code == 0
+    assert active is not None and active.name == "cli-bounded"
+
+
 def _run_all():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

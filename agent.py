@@ -2,6 +2,9 @@ import os
 import sys
 import time
 import argparse
+import fnmatch
+import tomllib
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -879,9 +882,184 @@ def update_plan(todos):
     )
 
 
-# TOOL DISPACTHER 
+#TOOL DISPACTHER 
+
+# --- bounded use-case policy --------------------------------------------
+# A company deploys the agent for one use case at a time, and the model only
+# proposes tool calls - so the real fence is here, a per-company TOML policy
+# checked at dispatch time, exactly like the workspace/company path fences.
+# The policy file itself lives outside the fence and is never written by the
+# agent (same protection as .env via is_sensitive_path).
+
+WRITE_TOOLS = {"write_file", "edit_file", "create_directory"}
+READ_TOOLS = {"read_file", "search_in_files", "list_directory"}
+PATH_ARG = {
+    "write_file": "file_path",
+    "edit_file": "file_path",
+    "read_file": "file_path",
+    "create_directory": "path",
+    "list_directory": "path",
+    "search_in_files": "directory",
+}
+
+
+@dataclass
+class PolicyProfile:
+    """One company use-case fence, loaded from TOML at startup."""
+    version: str = "1"
+    name: str = ""
+    read_only: bool = False
+    tool_allow: list = field(default_factory=list)   # empty = all tools on
+    tool_deny: list = field(default_factory=list)    # hard deny wins
+    shell_allow: list = field(default_factory=list)  # command-family rules
+    shell_deny: list = field(default_factory=list)
+    allow_write: list = field(default_factory=list)  # glob scope for writes
+    deny_read: list = field(default_factory=list)    # glob scope for reads
+    audit_path: str = ""                             # JSONL audit trail
+
+
+def load_policy(toml_path):
+    """Read a company policy file into a PolicyProfile.
+
+    Returns (None, "Error: ...") on any failure so a broken policy stops the
+    run loudly instead of silently running unbounded.
+    """
+    try:
+        with open(toml_path, "rb") as handle:
+            data = tomllib.load(handle)
+    except Exception as e:
+        return None, f"Error: could not load policy '{toml_path}': {e}"
+
+    use_case = data.get("use_case", {})
+    tools = data.get("tools", {})
+    shell = data.get("run_shell", {})
+    paths = data.get("paths", {})
+
+    profile = PolicyProfile(
+        version=str(data.get("version", "1")),
+        name=str(use_case.get("name", "")),
+        read_only=bool(use_case.get("read_only", False)),
+        tool_allow=[str(t) for t in tools.get("allow", [])],
+        tool_deny=[str(t) for t in tools.get("deny", [])],
+        shell_allow=[str(p) for p in shell.get("allow", [])],
+        shell_deny=[str(p) for p in shell.get("deny", [])],
+        allow_write=[str(g) for g in paths.get("allow_write", [])],
+        deny_read=[str(g) for g in paths.get("deny_read", [])],
+        audit_path=str(data.get("audit", {}).get("path", "")),
+    )
+
+    if not profile.name:
+        return None, f"Error: policy '{toml_path}' needs [use_case] name"
+
+    # future-proofing: a policy written for a newer schema is refused, not guessed
+    if int(profile.version or "1") > 1:
+        return None, f"Error: policy '{toml_path}' version {profile.version} unsupported"
+
+    return profile, None
+
+
+#the policy active for this process; None keeps the current unbounded behaviour
+_ACTIVE_POLICY = None
+POLICY_AUDIT = []  # JSON-ready rows: every gate decision
+
+
+def set_active_policy(profile):
+    global _ACTIVE_POLICY, POLICY_AUDIT
+    _ACTIVE_POLICY = profile
+    POLICY_AUDIT = []
+
+
+def active_policy():
+    return _ACTIVE_POLICY
+
+
+def _glob_any(text, patterns):
+    """fnmatch match against relative and absolute forms of the same path."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(text, pattern):
+            return True
+        if not os.path.isabs(text) and fnmatch.fnmatch(os.path.abspath(text), pattern):
+            return True
+    return False
+
+
+def policy_check(tool_name, args):
+    """An 'Error: ...' string when the policy blocks this call, else None."""
+    policy = _ACTIVE_POLICY
+    if policy is None:
+        return None
+
+    # 1. tool-level allowlist and hard deny (deny wins over allow)
+    if policy.tool_deny and tool_name in policy.tool_deny:
+        return f"Error: policy deny - tool '{tool_name}' is hard-denied for use case '{policy.name}'"
+
+    if policy.tool_allow and tool_name not in policy.tool_allow:
+        return f"Error: policy deny - tool '{tool_name}' is not allowed for use case '{policy.name}'"
+
+    # 2. read-only use case: no write/create/edit, no shell
+    if policy.read_only and tool_name in WRITE_TOOLS | {"run_shell"}:
+        return f"Error: policy deny - use case '{policy.name}' is read-only"
+
+    # 3. command-family rules for the shell (deny wins)
+    if tool_name == "run_shell":
+        command = args.get("command", "")
+        if any(pattern in command for pattern in policy.shell_deny):
+            return f"Error: policy deny - command matches a denied family for use case '{policy.name}'"
+
+        if policy.shell_allow and not any(pattern in command for pattern in policy.shell_allow):
+            return f"Error: policy deny - command is not in an allowed family for use case '{policy.name}'"
+
+    # 4. finer filesystem scope on top of the company fence
+    path = args.get(PATH_ARG[tool_name]) if tool_name in PATH_ARG else None
+    if path:
+        if tool_name in READ_TOOLS and _glob_any(path, policy.deny_read):
+            return f"Error: policy deny - path '{path}' is off-limits for use case '{policy.name}'"
+
+        if tool_name in WRITE_TOOLS and policy.allow_write \
+                and not _glob_any(path, policy.allow_write):
+            return f"Error: policy deny - path '{path}' is outside the write scope for use case '{policy.name}'"
+
+    return None
+
+
+def policy_audit(tool_name, args, decision, reason):
+    """Record the gate decision; append JSONL when the policy asks for a trail."""
+    policy = _ACTIVE_POLICY
+    if policy is None:
+        return
+
+    row = {
+        "ts": time.time(),
+        "use_case": policy.name,
+        "tool": tool_name,
+        "decision": decision,  # "allow" | "deny"
+        "reason": reason or "",
+        "args": {k: v for k, v in args.items()},
+    }
+    POLICY_AUDIT.append(row)
+
+    if policy.audit_path:
+        try:
+            with open(policy.audit_path, "a") as handle:
+                handle.write(json.dumps(row) + "\n")
+        except OSError:
+            # a broken audit trail must never break the agent itself
+            pass
+
+
+def _policy_blocked(tool_name, args):
+    """Gate used by the dispatcher: returns the deny string or None."""
+    reason = policy_check(tool_name, args)
+    policy_audit(tool_name, args, "deny" if reason else "allow", reason)
+    return reason
+
 
 def dispatch_tool(tool_name, args):
+    #the policy gate sits in front of every tool, before any action runs
+    blocked = _policy_blocked(tool_name, args)
+    if blocked:
+        return blocked
+
     if tool_name == "run_shell":
         return run_shell(args["command"])
     elif tool_name == "write_file":
@@ -1115,6 +1293,13 @@ def parse_args(argv=None):
         default=None,
         help="company identifier for work bounding (e.g., 'acme', 'unreal'). "
              "Agent will only access files under company/work/{company_id}/"
+    )
+
+    parser.add_argument(
+        "--policy",
+        default=None,
+        help="path to a company policy TOML that bounds which tools, commands "
+             "and paths this run may use (also read from TAMIAS_POLICY)"
     )
 
     parser.add_argument(
@@ -1566,6 +1751,7 @@ HELP = [
         ("--tui", "launch the terminal UI (default on a TTY)"),
         ("--plain", "force the classic text REPL"),
         ("--company-id ID", "bound work to company/work/{ID}/"),
+        ("--policy FILE", "bound to a company use-case policy TOML"),
         ("--task-id ID", "record the assigned task id"),
         ("--assignee NAME", "record who owns the task"),
     ]),
@@ -1677,6 +1863,23 @@ def main(argv=None):
     globals()['COMPANY_ID'] = args.company_id
     globals()['TASK_ID'] = args.task_id
     globals()['ASSIGNEE'] = args.assignee
+
+    # A company policy bounds this run to one use case. A broken or missing
+    # policy file refuses to start rather than silently running unbounded.
+    policy_path = args.policy or os.environ.get("TAMIAS_POLICY")
+
+    if policy_path:
+        policy, err = load_policy(policy_path)
+
+        if err:
+            console.print(f"[red]{err}[/red]")
+            return 1
+
+        set_active_policy(policy)
+        note = f"policy active: {policy.name}"
+        if policy.read_only:
+            note += " (read-only)"
+        console.print(f"[dim]{note}[/dim]")
 
     # --task is always the non-interactive text path.
     if args.task:
