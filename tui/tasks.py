@@ -53,8 +53,7 @@ class Task:
     status: str = "active"          # active | complete
     steps: int = 0
     tool_calls: int = 0
-    saved_credits: float = 0.0
-    pass_rate: float = 57.9
+    spent_usd: float = 0.0          # provider-billed USD over the task
     completed_at: Optional[float] = None
 
     @property
@@ -81,11 +80,16 @@ class Task:
 class TaskBoard:
     """Tracks the current task and the completed ones for this session."""
 
-    def __init__(self, project: str = "acme", assignee: str = "tamias",
-                 first_number: int = FIRST_TASK_NUMBER) -> None:
+    def __init__(self, project: str = "unassigned",
+                 assignee: str = "unassigned",
+                 first_number: int = FIRST_TASK_NUMBER,
+                 task_id: Optional[str] = None) -> None:
         self.project = project
         self.assignee = assignee
         self._next = first_number
+        # --task-id names the first task explicitly; later tasks auto-number,
+        # so the board never invents an id when one was supplied
+        self._task_id = task_id
         self.current: Optional[Task] = None
         self.history: list[Task] = []
 
@@ -97,13 +101,19 @@ class TaskBoard:
             # board never silently drops work
             self.history.append(self.current)
 
+        if self._task_id:
+            task_id = self._task_id
+            self._task_id = None            # only the first task is named
+        else:
+            task_id = f"PROJ-{self._next}"
+            self._next += 1
+
         self.current = Task(
-            id=f"PROJ-{self._next}",
+            id=task_id,
             project=self.project,
             assignee=self.assignee,
             title=title.strip() or "(untitled task)",
         )
-        self._next += 1
         return self.current
 
     def note_step(self) -> None:
@@ -128,13 +138,13 @@ class TaskBoard:
         if self.current is not None and self.current.status == "active":
             self.current.progress = 100
 
-    def complete(self, saved_credits: float = 0.0) -> Optional[Task]:
+    def complete(self, spent_usd: float = 0.0) -> Optional[Task]:
         """Confirm completion. Only ever called from the confirmation modal."""
         if self.current is None:
             return None
         self.current.progress = 100
         self.current.status = "complete"
-        self.current.saved_credits = saved_credits
+        self.current.spent_usd = spent_usd
         self.current.completed_at = time.monotonic()
         done = self.current
         self.history.append(done)

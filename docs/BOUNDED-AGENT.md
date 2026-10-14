@@ -45,7 +45,7 @@ Verified in `agent.py` (demoed live, test suite green):
 | Use-case gate | `--company-id <id>` activates the active fence | `bridge.py:108`, `agent.py:1677` |
 | Secret control | `refuse_secret()` / `is_sensitive_path()` | `agent.py:400` |
 | Shell hardening | cwd = company box, escape guard, scrubbed env, `TAMIAS_ALLOW_SHELL=0` | `agent.py:447-499` |
-| Assignment | `--task-id` / `--assignee` recorded into the prompt | `build_system_prompt` |
+| Assignment | `--task-id` / `--assignee` recorded into the prompt and the task board | `build_system_prompt`, `run_tui` |
 | Visibility | blocked calls surface (boundary state / violation) | UI |
 
 So the *spatial* boundary (what directories an agent may touch) is done and

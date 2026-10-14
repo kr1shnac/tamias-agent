@@ -2,8 +2,7 @@
 
 Kept together so the dialog styling follows the same single theme as the main
 screen (docs/FRONTEND_REFERENCE.md §1). Every screen uses only palette colours:
-cyan ``#00b8ff`` for neutral dialogs, red ``#fca5a5`` for boundary violations,
-green ``#00ff9f`` for savings.
+cyan ``#00b8ff`` for neutral dialogs, red ``#fca5a5`` for boundary violations.
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ ConfirmModal, BoundaryModal, HelpScreen, CreditsDashboard {
     color: #e2e8f0;
 }
 #boundary-dialog { border: round #fca5a5; }
-#credits-dialog { border: round #00ff9f; width: 64; }
+#credits-dialog { border: round #00b8ff; width: 64; }
 #confirm-title, #boundary-title, #help-title, #credits-title {
     text-style: bold;
     color: #00ff9f;
@@ -38,6 +37,7 @@ ConfirmModal, BoundaryModal, HelpScreen, CreditsDashboard {
     content-align: center middle;
 }
 #boundary-title { color: #fca5a5; }
+#credits-title { color: #00b8ff; }
 .modal-body { color: #e2e8f0; }
 .modal-hint {
     color: #64748b;
@@ -126,7 +126,7 @@ class HelpScreen(ModalScreen[None]):
         ("M", "cycle models (free → mid → premium)"),
         ("H", "this help overlay"),
         ("Q / Ctrl+C", "quit"),
-        ("F3", "credits dashboard"),
+        ("F3", "spend (USD) dashboard"),
         ("/model", "open the model picker"),
         ("/task", "toggle the task board"),
         ("/complete", "complete the current task"),
@@ -142,7 +142,7 @@ class HelpScreen(ModalScreen[None]):
                 label = f"[{key}]".ljust(key_w)
                 yield Static(f"{label}  {description}", classes="modal-row",
                              markup=False)
-            yield Static("type / for the command palette · F3 credits · Ctrl+T task",
+            yield Static("type / for the command palette · F3 spend · Ctrl+T task",
                          classes="modal-hint")
 
     def action_dismiss_help(self) -> None:
@@ -150,17 +150,17 @@ class HelpScreen(ModalScreen[None]):
 
 
 class CreditsDashboard(ModalScreen[None]):
-    """The `F3` credits dashboard (§5)."""
+    """The `F3` spend dashboard (§5).
+
+    Every row it shows is a figure the ledger recorded from the provider; it
+    deliberately has no model-mix, trend, pass-rate or savings rows, because
+    the agent measures none of those.
+    """
 
     CSS = DIALOG_CSS
 
     BINDINGS = [("escape", "dismiss_dash", "Close"),
                 ("f3", "dismiss_dash", "Close")]
-
-    USAGE = [("free", 65), ("mid", 25), ("premium", 10)]
-
-    # inner width of #credits-dialog (64) minus 2 border and 2×2 padding
-    CONTENT_WIDTH = 58
 
     def __init__(self, ledger: CreditsLedger) -> None:
         super().__init__()
@@ -168,17 +168,9 @@ class CreditsDashboard(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="credits-dialog"):
-            yield Static("◆ CREDITS DASHBOARD", id="credits-title")
+            yield Static("◆ SPEND (USD, provider-billed)", id="credits-title")
             for label, value in self._ledger.dashboard_lines():
                 yield Static(f"{label}: {value}", classes="modal-row")
-            yield Static("", classes="modal-row")
-            heading = "MODEL USAGE "
-            yield Static(heading + "─" * (self.CONTENT_WIDTH - len(heading)),
-                         classes="modal-row")
-            for name, pct in self.USAGE:
-                filled = int(round(20 * pct / 100))
-                bar = "█" * filled + " " * (20 - filled)
-                yield Static(f"{name:<8}{bar} {pct:>3}%", classes="modal-row")
             yield Static("\\[esc] close", classes="modal-hint")
 
     def action_dismiss_dash(self) -> None:

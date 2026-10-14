@@ -28,7 +28,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("/model", "switch engine · pick a model or pass an id", True),
     Command("/task", "toggle the task & progress board"),
     Command("/complete", "complete the current task"),
-    Command("/credits", "open the credits dashboard"),
+    Command("/credits", "open the spend (USD) dashboard"),
     Command("/help", "show keys & commands"),
     Command("/clear", "clear the transcript"),
     Command("/quit", "exit TAMIAS"),

@@ -63,7 +63,7 @@ class ToolCard(Vertical):
 
 
 class CreditsReadout(Static):
-    """The always-visible credits strip in the header bar (§5)."""
+    """The always-visible spend strip in the header bar (§5)."""
 
     def __init__(self, ledger: CreditsLedger, **kwargs):
         super().__init__(**kwargs)
@@ -73,7 +73,8 @@ class CreditsReadout(Static):
     def refresh_readout(self) -> None:
         color = self.ledger.color()
         self.update(f"[{color}]{self.ledger.readout()}[/]")
-        self.tooltip = "savings vs the Codex baseline · F3 for the dashboard"
+        self.tooltip = ("provider-billed USD spent this session · "
+                        "F3 for the dashboard")
 
 
 class TaskBoardWidget(Static):

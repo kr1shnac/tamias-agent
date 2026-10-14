@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import argparse
 import fnmatch
 import tomllib
@@ -1362,69 +1363,66 @@ def parse_args(argv=None):
 def new_stats():
     return {"steps": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "compactions": 0, "turns": 0, "models": {},
+            "cost_usd": 0.0, "unpriced_steps": 0,
             "effort_policy": EFFORT_POLICY}
 
 
-# --- credit accounting ------------------------------------------------------
-# The TUI owns the always-visible ledger; these figures mirror it so the CLI
-# tells the same story. Credits per 1000 tokens, plus a per-turn overhead; the
-# Codex baseline re-sends more context and writes longer replies, which is where
-# the saving comes from.
-CREDIT_WEIGHTS = {
-    "tamias": (0.25, 1.0, 0.5),
-    "codex": (0.50, 1.5, 0.6),
-}
-SAVINGS_GREEN = 39.0
-SAVINGS_AMBER = 20.0
+def usage_cost(usage):
+    """The provider-billed USD for one response, or None when it is absent.
+
+    OpenRouter returns ``usage.cost``; the OpenAI SDK keeps that unknown field
+    on ``usage.model_extra``. A missing cost stays None -- it is never read as
+    a free step, the same rule the tamias proxy applies to its own ledger. A
+    malformed cost (a bool, a string, a negative or non-finite number) is
+    likewise None, so it is counted as unpriced rather than folded in.
+    """
+    if usage is None:
+        return None
+    value = getattr(usage, "cost", None)
+    if value is None:
+        extra = getattr(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            value = extra.get("cost")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
 
 
-def credit_cost(prompt_tokens, completion_tokens, turns, side):
-    """Credit cost of the usage so far for one side ('tamias' or 'codex')."""
-    prompt_w, completion_w, overhead = CREDIT_WEIGHTS[side]
-    return ((max(0, prompt_tokens) * prompt_w
-             + max(0, completion_tokens) * completion_w) / 1000.0
-            + max(0, turns) * overhead)
-
-
-def credit_report(stats):
-    """Print a session credit report: tokens, spend, saving and model mix."""
-    prompt_tokens = stats.get("prompt_tokens", 0)
-    completion_tokens = stats.get("completion_tokens", 0)
-    turns = stats.get("turns", 0)
-
-    spent = credit_cost(prompt_tokens, completion_tokens, turns, "tamias")
-    baseline = credit_cost(prompt_tokens, completion_tokens, turns, "codex")
-    saved = max(0.0, baseline - spent)
-    pct = (100.0 * saved / baseline) if baseline > 0 else 0.0
-
-    colour = ("green" if pct >= SAVINGS_GREEN
-              else "yellow" if pct >= SAVINGS_AMBER else "red")
+# --- spend accounting -------------------------------------------------------
+# USD is the only unit the CLI reports. It never derives a number from token
+# counts and never compares against an invented baseline; a step whose cost the
+# provider did not report is counted as unpriced, not as zero.
+def print_summary(stats):
+    """Print the session/task tally, in provider-billed USD."""
+    spent = stats.get("cost_usd", 0.0)
+    unpriced = stats.get("unpriced_steps", 0)
+    if unpriced and not spent:
+        money = "UNKNOWN (no step reported a cost)"
+    elif unpriced:
+        money = f"${spent:.4f} (partial: {unpriced} of {stats['steps']} steps unpriced)"
+    else:
+        money = f"${spent:.4f}"
 
     table = Table.grid(padding=(0, 2))
-    table.add_column(no_wrap=True)
-    table.add_column(style="dim")
-
-    table.add_row("turns", str(turns))
+    table.add_column(justify="right", style="dim")
+    table.add_column(style="bold")
     table.add_row("steps", str(stats.get("steps", 0)))
-    table.add_row("prompt tokens", str(prompt_tokens))
-    table.add_row("completion tokens", str(completion_tokens))
+    table.add_row("turns", str(stats.get("turns", 0)))
+    table.add_row("prompt tokens", str(stats.get("prompt_tokens", 0)))
+    table.add_row("completion tokens", str(stats.get("completion_tokens", 0)))
     table.add_row("compactions", str(stats.get("compactions", 0)))
-    table.add_row("spent", f"{spent:.0f} credits")
-    table.add_row("codex baseline", f"{baseline:.0f} credits")
-    table.add_row("saved", Text(f"{saved:.0f} credits ({pct:.0f}%)",
-                                style=f"bold {colour}"))
+    table.add_row("spent (USD, provider-billed)", money)
 
-    for name, count in (stats.get("models") or {}).items():
-        table.add_row("model", f"{name} ×{count}")
+    models = stats.get("models") or {}
+    if models:
+        mix = ", ".join(f"{name}×{count}" for name, count in sorted(models.items()))
+        table.add_row("served by", mix)
 
-    console.print(
-        Panel(
-            table,
-            title=Text("credits", style="bold green"),
-            border_style="green",
-            padding=(0, 2)
-        )
-    )
+    console.print(Panel(table, title=Text("spend", style="bold cyan"),
+                        border_style="cyan", padding=(0, 1)))
 
 
 def _model_tier(env_name):
@@ -1527,11 +1525,20 @@ def log_step(step, response, stats, took):
     if isinstance(completion_tokens, int):
         stats["completion_tokens"] += completion_tokens
 
+    cost = usage_cost(usage)
+    if cost is None:
+        stats["unpriced_steps"] = stats.get("unpriced_steps", 0) + 1
+        cost_text = "cost ?"
+    else:
+        stats["cost_usd"] = stats.get("cost_usd", 0.0) + cost
+        cost_text = f"${cost:.4f}"
+
     console.print(
         f"[dim]  ↳ step {step} · "
         f"{served_by} · "
         f"effort {stats.get('effort_policy', EFFORT_POLICY)} · "
         f"prompt {prompt_tokens} · completion {completion_tokens} · "
+        f"{cost_text} · "
         f"{took:.1f}s[/dim]"
     )
 
@@ -1613,7 +1620,9 @@ def run_turn(user_input, max_steps, stats, on_event=None):
             emit("turn_end",
                  prompt_tokens=stats["prompt_tokens"],
                  completion_tokens=stats["completion_tokens"],
-                 total_duration_sec=time.perf_counter() - turn_started)
+                 total_duration_sec=time.perf_counter() - turn_started,
+                 cost_usd=stats.get("cost_usd"),
+                 unpriced_steps=stats.get("unpriced_steps", 0))
             return "cap"
 
         #fold the history before it costs more than the model can take
@@ -1649,7 +1658,9 @@ def run_turn(user_input, max_steps, stats, on_event=None):
             emit("turn_end",
                  prompt_tokens=stats["prompt_tokens"],
                  completion_tokens=stats["completion_tokens"],
-                 total_duration_sec=time.perf_counter() - turn_started)
+                 total_duration_sec=time.perf_counter() - turn_started,
+                 cost_usd=stats.get("cost_usd"),
+                 unpriced_steps=stats.get("unpriced_steps", 0))
             return "error"
 
         log_step(step, response, stats, time.perf_counter() - started)
@@ -1738,7 +1749,9 @@ def run_turn(user_input, max_steps, stats, on_event=None):
             emit("turn_end",
                  prompt_tokens=stats["prompt_tokens"],
                  completion_tokens=stats["completion_tokens"],
-                 total_duration_sec=time.perf_counter() - turn_started)
+                 total_duration_sec=time.perf_counter() - turn_started,
+                 cost_usd=stats.get("cost_usd"),
+                 unpriced_steps=stats.get("unpriced_steps", 0))
 
             return "done" #exit inner loop
 
@@ -1748,11 +1761,20 @@ def run_task(task, max_steps, on_event=None):
     stats = new_stats()
     outcome = run_turn(task, max_steps, stats, on_event=on_event)
 
+    spent = stats.get("cost_usd", 0.0)
+    unpriced = stats.get("unpriced_steps", 0)
+    if unpriced:
+        money = (f"${spent:.4f} (+{unpriced} unpriced steps)"
+                 if spent else "cost UNKNOWN (no step reported a cost)")
+    else:
+        money = f"${spent:.4f}"
+
     console.print(
         f"[dim]steps: {stats['steps']} · "
         f"prompt tokens: {stats['prompt_tokens']} · "
         f"completion tokens: {stats['completion_tokens']} · "
-        f"compactions: {stats['compactions']}[/dim]"
+        f"compactions: {stats['compactions']} · "
+        f"spent: {money}[/dim]"
     )
 
     return 1 if outcome in ("error", "cap") else 0
@@ -1764,7 +1786,7 @@ HELP = [
         ("/help", "show this list"),
         ("/clear", "wipe the screen and the history"),
         ("/compact", "fold the history into a handover note now"),
-        ("/credits", "show credits spent and saved this session"),
+        ("/credits", "show provider-billed USD spent this session"),
         ("/quit", "leave TAMIAS"),
     ]),
     ("flags", [
@@ -1864,7 +1886,7 @@ def interactive_loop(max_steps):
             continue
 
         if user_input == "/credits":
-            credit_report(session)
+            print_summary(session)
             continue
 
         run_turn(user_input, max_steps, session)
@@ -1918,7 +1940,8 @@ def main(argv=None):
     # the alternate screen.
     if args.tui or (not args.plain and is_interactive_terminal()):
         from tui.bridge import run_tui
-        return run_tui(args.max_steps, args.company_id)
+        return run_tui(args.max_steps, args.company_id, args.task_id,
+                       args.assignee)
 
     print_banner()
     assignment = assignment_line()

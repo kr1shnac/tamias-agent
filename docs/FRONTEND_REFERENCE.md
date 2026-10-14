@@ -34,18 +34,19 @@ Read it top to bottom, then implement in the order in **§B**.
 | Event dataclasses (protocol) | **EXISTS, now emitted** | `tui/events.py` |
 | Glass / gradient helpers | **EXISTS** | `tui/color_math.py` |
 | Agent→TUI adapter (queue producer) | **BUILT** | `tui/bridge.py`, `agent.py` (`on_event`) |
-| Credits header readout + F3 dashboard (§5) | **BUILT** | `tui/credits.py`, `tui/widgets.py`, `tui/modals.py` |
+| Spend (USD) header readout + F3 dashboard (§5) | **BUILT** | `tui/credits.py`, `tui/widgets.py`, `tui/modals.py` |
 | Task board + completion flow (§6) | **BUILT** | `tui/tasks.py`, `tui/modals.py` |
 | Model **tier** cycling UX (§7) | **BUILT** — `MODEL_TIERS` + `M` | `tui/app.py` |
 | Boundary-violation modal (§8) | **BUILT** — driven by blocked results | `tui/modals.py` |
 | Nav bindings `T` / `C` / `H` / `F3` (§9) | **BUILT** (+ nav mode / `/commands`) | `tui/app.py` |
-| Session / task / credits panels | **BUILT** — task board + credits dashboard | `tui/app.py` |
+| Session / task / spend panels | **BUILT** — task board + spend dashboard | `tui/app.py` |
 | Landing hero / home screen (§4.1) | **BUILT** — no chrome, swap on first turn | `tui/branding.py` |
 | Slash-command palette (§4.2) | **BUILT** — `/` menu, `↑↓`/`Tab`/`Enter` | `tui/slash.py` |
 | Responsive header (§3.A) | **BUILT** — drops chips, never clips | `tui/app.py` |
 
 ## C. Integration contract (how the UI talks to the agent)
-- `TAMIASApp(ui_queue, agent_queue, company_id=None)` takes **two `queue.Queue`s**.
+- `TAMIASApp(ui_queue, agent_queue, company_id=None, task_id=None,
+  assignee=None)` takes **two `queue.Queue`s**.
 - UI → agent: put the user's text on `ui_queue`.
 - Agent → UI: `tui/bridge.py` runs the real agent core on a thread and emits
   `events.py` dataclasses on `agent_queue`; the app's `listen_to_agent` worker
@@ -53,7 +54,10 @@ Read it top to bottom, then implement in the order in **§B**.
 - Launch with `python agent.py` (the TUI is the default on an interactive
   terminal), or `python agent.py --tui` to force it; `--plain` keeps the classic
   text REPL and non-TTY runs never open a screen. `python agent.py --tui
-  --company-id acme` bounds work to a company; `python -m tui.bridge` starts the
+  --company-id acme` bounds work to a company; `--task-id` / `--assignee` name
+  the work and its owner and are forwarded to the task board (`run_tui(...)
+  → TAMIASApp(...)`) so it shows the real values, never a made-up one;
+  `python -m tui.bridge` starts the
   bridge standalone. The CLI banner is printed only on the text-REPL path, so it
   never scribbles over the TUI. `agent.run_turn` / `run_task` take an optional
   `on_event` callback, so the CLI (`on_event=None`) is unchanged.
@@ -62,15 +66,15 @@ Read it top to bottom, then implement in the order in **§B**.
 1. **Adapter:** run the agent's model loop and emit `TurnStart / MessageDelta /
    ToolStart / ToolEnd / TurnEnd / StatusUpdate` onto `agent_queue`; read user turns
    from `ui_queue`.
-2. **Credits** (§5): compute savings from `TurnEnd` token counts vs the Codex
-   baseline; render the always-visible header readout + the F3 dashboard.
+2. **Spend** (§5): read the provider-billed `cost_usd` from each `TurnEnd`; render
+   the always-visible header readout + the F3 dashboard.
 3. **Task board + completion modal** (§6); wire the `T` and `C` bindings.
 4. **Boundary-violation modal** (§8) driven by blocked-tool results.
 5. **Model tiers** (§7) + the `M` binding.
 6. **Help overlay** (`H`).
 
 ## E. Acceptance criteria (definition of done)
-- [x] Credits readout is always visible and color-coded (green ≥39% · amber 20–38% · red <20%).
+- [x] Spend readout is always visible and shows provider-billed USD only (no baseline, no invented budget).
 - [x] Every tool call renders a card that transitions active → finished.
 - [x] A task can only be completed through the confirmation modal.
 - [x] A boundary violation shows the red `BLOCKED` modal.
@@ -100,13 +104,14 @@ Panels       #1a1a1a      Panel border #3a3a3a
 Glass        rgba(255,255,255,0.03) bg / 0.1 border / 0.3 top edge
 ```
 
-Navigation: `T` task · `C` complete · `M` model · `H` help · `Q` quit · `F3` credits.
+Navigation: `T` task · `C` complete · `M` model · `H` help · `Q` quit · `F3` spend.
 Plain letters work in nav mode (`Esc`); `F3`/`Ctrl+T` and the `/commands` work while typing.
 Type `/` for the command palette (`↑↓` move · `Tab` complete · `Enter` run · `Esc` close).
 On start you get a chrome-free centred `TAMIAS` wordmark + input; the first message
 opens the chat (header appears, composer drops to the bottom). No fullscreen mode.
 
-Credits header always visible → `SCR 58/150 (39% saved)` → green ≥39%, amber 20–38%, red <20%.
+Spend header always visible → `$0.0123` (provider-billed USD; `$0.0000 · no usage yet` before the
+first turn). Unpriced steps append ` + N unpriced`; there is no savings rate or colour band.
 
 ---
 
@@ -118,7 +123,7 @@ the user and cyan `#00b8ff` for the agent. The base is *unwaveringly black* — 
 glass is suggested by overlays, not by real transparency.
 
 **Core principle.** The agent is a *focused team member*. The UI shows only what
-matters: **work boundary · task status · credits saved**. Nothing decorative
+matters: **work boundary · task status · spend (USD)**. Nothing decorative
 competes with those three signals.
 
 ### 1.1 Base palette
@@ -293,7 +298,7 @@ Screen.landing #slash-menu {
     color: #00b8ff;
 }
 
-/* Credits: always visible, colour-coded by savings rate (§5) */
+/* Spend: always visible, provider-billed USD (no savings band) (§5) */
 #credits-readout {
     width: auto;
     content-align: right middle;
@@ -312,7 +317,7 @@ Screen.landing #slash-menu {
 }
 
 /* responsive header: drop the wide model chip first, then the small wordmark
-   (the credits readout stays visible), so nothing is ever clipped */
+   (the spend readout stays visible), so nothing is ever clipped */
 Screen.narrow #model-display { display: none; }
 Screen.tiny #wordmark { display: none; }
 Screen.tiny #header-bar { padding: 0 2; }
@@ -443,21 +448,21 @@ swaps it out for the live conversation.
 - `background: #1a1a1a`, `border-bottom: solid #3a3a3a`
 - Contains `#wordmark` (left, flexible), `#credits-readout` (right), and
   `#model-display` (right, `min-width: 34`).
-- Hosts the **always-visible credits readout while the chat is open** (see §5).
+- Hosts the **always-visible spend readout while the chat is open** (see §5).
 - **Hidden on the landing.** While `Screen.landing`, the whole bar is
   `display: none` — the home screen is chrome-free (§4.1); it returns the moment
   the first message opens the chat.
 - **Responsive.** `TAMIASApp._apply_responsive()` (from `on_resize`) toggles
   `narrow` on the `Screen` below 104 cols and `tiny` below 64. `narrow` hides
   `#model-display`; `tiny` also hides `#wordmark` and tightens the padding. The
-  credits readout is the one child that never hides — so the bar never clips the
+  spend readout is the one child that never hides — so the bar never clips the
   model id into the wordmark (the old bug) and never overflows the terminal.
 
 ### B. `#wordmark`
 - `width: 1fr`, **left**-aligned middle, bold
 - Left-aligned (not centred) so it sits on the same column as every other
   left-aligned element (turns, task board, composer) and never drifts as the
-  credits readout / model chip change width.
+  spend readout / model chip change width.
 - Renders a **cyan→green gradient** via `create_gradient_text(text, "#00b8ff", "#00ff9f")`.
 - Text: `T A M I A S   A G E N T`. Hidden while `Screen.landing` (§4.1) and under
   `Screen.tiny`.
@@ -614,7 +619,7 @@ Default active model: `nvidia/nemotron-3.5-lightning:free` (env `AGENT_MODEL`).
 Screen                          bg #0d0d0d · color #e8e8e8 · vertical
 ├── #header-bar                 h2 · bg #1a1a1a · border-bottom #3a3a3a · horizontal
 │   ├── #wordmark               1fr · left · gradient cyan→green
-│   ├── #credits-readout        auto · right · colour-coded SCR readout (§5)
+│   ├── #credits-readout        auto · right · provider-billed USD readout (§5)
 │   └── #model-display          auto · right · green · model chip (● ⟨ … ⟩)
 ├── #transcript-area            h1fr · padding 2 3 · scroll · align left top
 │   ├── Screen.landing → #hero   chrome-free centred wordmark block (§4.1)
@@ -641,14 +646,14 @@ On mount — and again after `/clear` — the app shows a **home screen** before
 conversation: `TAMIASApp._show_landing()` clears the transcript, adds
 `Screen.landing`, and mounts `#hero` (`tui/branding.py`). The hero is a six-row
 ASCII-Shadow `TAMIAS` wordmark with a diagonal `#00b8ff → #00ff9f` gradient,
-a `bounded agentic coding · savings-first` tagline and two hint lines
+a `bounded agentic coding · measured, never guessed` tagline and two hint lines
 (`type a task…` / `/model /task /credits /help`), all centred against the art's
 52-cell width. Below 60 cols `Hero(compact=True)` renders a one-line fallback.
 
 `TAMIASApp._enter_chat()` removes the `landing` class and the hero the first time
 a message is submitted or an agent turn starts, and the conversation takes over —
 the OpenCode-style "type to open the chat" hand-off. **The header bar, the
-credits readout and the bottom-anchored composer appear at that moment** (the
+spend readout and the bottom-anchored composer appear at that moment** (the
 landing is deliberately chrome-free, so the readout is not visible until the chat
 opens — §5).
 
@@ -685,75 +690,69 @@ viewport and pushes the transcript off screen with a spurious scrollbar.
 
 ---
 
-## 5. CREDITS DISPLAY (always visible in the chat)
+## 5. SPEND DISPLAY (always visible in the chat)
 
-Credits are the reason the product exists. **Never hide them** while the chat is
-open (§4.1: the chrome-free landing intentionally shows no header until the first
+Spend is the reason the product exists. **Never hide it** while the chat is open
+(§4.1: the chrome-free landing intentionally shows no header until the first
 message).
+
+Every figure is **provider-billed USD**. The ledger never derives a number from
+token counts, never compares against a baseline, and never invents a budget; a
+step whose provider cost is missing is shown as *unpriced*, never as `$0`.
 
 **Header readout** (single line in `#header-bar`, right side; always visible):
 
 ```
-SCR 58/150 (39% saved)
+$0.0123
 ```
 
-The readout is colour-coded (see table below); it is **not** boxed — the model
-chip sits to its right on the same line (`● ⟨ model · effort ⟩`).
+Before the first turn it reads `$0.0000 · no usage yet`. When any step was
+unpriced it appends ` + N unpriced`. The readout is neutral `#e8e8e8` until the
+first turn, then cyan `#00b8ff`; it is **not** boxed — the model chip sits to
+its right on the same line (`● ⟨ model · effort ⟩`).
 
 It is also the one header child that **never hides**: the responsive header
 (§3.A) drops `#model-display` first and `#wordmark` second when the terminal is
-narrow, so the credits readout is always present and never pushes anything off
+narrow, so the spend readout is always present and never pushes anything off
 screen.
-
-**Color coding by savings rate:**
-
-| Savings | Color | Sample |
-|---|---|---|
-| **≥ 39%** | green `#00ff9f` | `SCR 58/150 (39% saved)` |
-| **20–38%** | amber `#f59e0b` | `SCR 80/150 (27% saved)` |
-| **< 20%** | red `#fca5a5` | `SCR 132/150 (12% saved)` + `WARNING: low savings` |
 
 **Detailed dashboard** (`F3` / focused panel). Icons are single-cell
 **monochrome glyphs** (no emoji) and every label is padded to the same width, so
-the `:` column lines up exactly:
+the `:` column lines up exactly. Every row is derived from recorded usage; none
+is a literal:
 
 ```
-◆ CREDITS DASHBOARD
-◈ BALANCE  : 92 / 150 credits (61.3% remaining)
-◇ SAVINGS  : 58 credits (39% vs Codex baseline)
-↗ TREND    : steady vs baseline
-✓ PASS RATE: 57.9% (parity with Codex — no quality loss)
-⬡ MODEL    : free (async-optimized)
-⇄ ASYNC    : ~80% of tool calls parallelized
-⬚ BOUNDARY : enforced — zero off-task spend
-
-MODEL USAGE ──────────────────────────────────────────────
-free    █████████████         65%
-mid     █████                 25%
-premium ██                    10%
+◆ SPEND (USD, provider-billed)
+◈ SPENT (USD) : $0.0123
+◇ PRICING     : provider-billed USD
+✓ TURNS       : 4
+⬡ TOKENS      : 1,540
+⇄ PROMPT      : 1,200
+⇄ COMPLETION  : 340
 ```
 
-Row icons: `◈` balance · `◇` savings · `↗` trend · `✓` pass rate · `⬡` model ·
-`⇄` async · `⬚` boundary. The `MODEL USAGE` rule spans the full dialog content
-width, and the bar + `%` column is fixed so the percentages line up.
+When any step was unpriced the `PRICING` row reads `<N> steps unpriced` instead.
 
-**How the numbers are computed** (`tui/credits.py`). Each `TurnEnd` folds its
-`prompt_tokens` / `completion_tokens` into a `CreditsLedger`. Credits are a
-weighted token count (per 1000 tokens) plus a fixed per-turn overhead:
+Row icons: `◈` spent · `◇` pricing · `✓` turns · `⬡` tokens · `⇄` prompt /
+completion.
 
-| | prompt | completion | per-turn overhead |
-|---|---|---|---|
-| Tamias | `0.25` | `1.0` | `0.5` |
-| Codex baseline | `0.50` | `1.5` | `0.6` |
+**How the numbers are computed** (`tui/credits.py`). Each `TurnEnd` carries the
+provider-billed `cost_usd` and how many of its steps came back without one; the
+app folds both into a `CreditsLedger`:
 
-`savings = codex_spent − spent`, `savings% = savings / codex_spent`, and
-`balance = budget (150) − spent`. The readout
-(`SCR <saved>/150 (<pct>% saved)`) is colour-coded by the thresholds above;
-before the first turn it is neutral `#e8e8e8`. Brief turns save less (amber /
-red), long agentic turns land green — the gauge is an estimate, not a bill.
+* `spent_usd` = the sum of the costs the provider reported (OpenRouter's
+  `usage.cost`, or the OpenAI SDK's `usage.model_extra["cost"]`);
+* `unpriced_steps` = API steps that reported no cost;
+* `prompt_tokens` / `completion_tokens` = the counts, kept for display.
 
-The dashboard's TREND / PASS RATE / ASYNC / BOUNDARY rows are steady-state
-labels; only BALANCE and SAVINGS are derived from live token counts.
+The ledger has **no budget field**: the per-key USD allowance lives in the
+gateway, and until the agent can read it (Phase 4) the UI shows real spend and
+nothing else. There is no savings rate and no colour band — spend has no
+baseline to compare against.
+
+(D16: `test_dashboard_rows_are_all_derived_from_recorded_usage` renders these
+rows against a ledger with known figures and fails on any literal the figures do
+not produce.)
 
 ---
 
@@ -765,21 +764,22 @@ labels; only BALANCE and SAVINGS are derived from live token counts.
 2. Reaches 100% → modal: "Task complete? [Y/N]"
         │
 3. [C] pressed →
-        ├── Yes → agent writes savings report
-        │         "Saved 58 credits (39%) vs Codex baseline"
+        ├── Yes → agent writes the task report
+        │         "PROJ-1457 completed · 00:23:45 · $0.0123 spent
+        │          this session (provider-billed USD)"
         │         saves task.json under company/tasks/
         └── No  → return to transcript, task continues
         │
 4. Marked completed →
         ├── task board: "[✓] PROJ-1457 completed"
         └── team view refreshes; next queued task or idle
-        │
-5. Session log: "PROJ-1457 completed in 00:23:45 · 57.9% pass"
 ```
 
 **Implementation** (`tui/tasks.py`, `tui/modals.py`). A task begins on
-`TurnStart` (id `PROJ-####`, project/assignee from `--company-id`, start time
-now). Tool cards nudge progress up to a 95% in-flight cap; `TurnEnd` fills it to
+`TurnStart` (id `PROJ-####`, or the `--task-id` given; project from
+`--company-id`, assignee from `--assignee`, both `unassigned` when unspecified;
+start time now). Tool cards nudge progress up to a 95% in-flight cap; `TurnEnd`
+fills it to
 100% and shows a "task ready — press C" line. Completion is *only* possible
 through `ConfirmModal` (`C` / `/complete`): **Yes** writes the report, logs the
 line, and resets the engine to free; **No** returns to the transcript with the
@@ -802,19 +802,22 @@ Each switch shows a small aligned card, then persists for the **current task
 only**:
 
 ```
-┌ MODEL ─────────────────┐
-│ model   : premium      │
-│ savings : 33% vs Codex │
-│ pass    : 57.9%        │
-└────────────────────────┘
+┌ MODEL ───────────────────────────┐
+│ model : premium                  │
+│ spent : $0.0123 this session     │
+└──────────────────────────────────┘
 ```
 
 The box is built from the row widths so its edges always line up (rendered as a
 `.model-card` turn).
 
-**Rationale.** Free model for ~80% of simple turns (list/read/search), mid-tier
-~15%, premium ~5% (multi-file / git / hard reasoning). Switching is always
-user-initiated — never automatic without a prompt.
+**Rationale (design intent, not yet measured).** The free model is meant for
+simple turns (list/read/search), mid-tier for edits and verification, premium
+for multi-file / git / hard reasoning. Switching is always **user-initiated —
+never automatic without a prompt**. Percentages of turns per tier are *not*
+shown here because the agent has not measured them; when the routing work lands
+(the `tamias` proxy's `routing.decide`, D2) the realised mix becomes a measured
+number and can appear.
 
 **Tier map** (`MODEL_TIERS` in `tui/app.py`):
 
@@ -865,19 +868,19 @@ tool card still shows `✗ failed`.
 |---|---|
 | `↑` / `↓` | Move the slash-palette highlight (else move between panels / history) |
 | `Tab` | Complete the highlighted slash row (else move focus) |
-| `←` / `→` | Switch sections (Task / Credits / Session / Actions) |
+| `←` / `→` | Switch sections (Task / Spend / Session / Actions) |
 | `Enter` | Accept the highlighted slash row, else activate / submit · recharge the composer |
 | `T` | Toggle task & progress view |
 | `C` | Complete current task (confirmation modal) |
 | `M` | Cycle models (free → mid → premium) — same as `/model` |
 | `H` | Help overlay |
 | `Q` / `Ctrl+C` | Exit |
-| `F3` | Credits dashboard (§5) |
+| `F3` | Spend (USD) dashboard (§5) |
 | `Esc` | Close the slash palette, else leave the composer → navigation mode |
 | `/` | Open the command palette (§4.2) |
 | `/model` | Open the model picker (or `/model <id>` to set one) |
 | `/task`, `/complete` | Task board / completion aliases |
-| `/credits`, `/help` | Aliases |
+| `/credits`, `/help` | Spend dashboard / help |
 | `/clear`, `/compact`, `/quit` | Forwarded to the agent / exit |
 
 **Nav mode.** The composer owns printable keys, so `T`/`C`/`M`/`H`/`Q` fire
@@ -892,7 +895,7 @@ screen.
 ## 10. AGENT BEHAVIOR RULES (UI contract)
 
 **MUST always show**
-1. Credits / savings — never hidden.
+1. Spend (USD, provider-billed) — never hidden.
 2. Current task: id, project, assignee, start time.
 3. Progress (`███████░░░░░`).
 4. Model in use (free / mid / premium).
@@ -900,7 +903,7 @@ screen.
 6. Boundary status (enforced / active / violation).
 
 **MUST NOT**
-1. Hide credit information.
+1. Hide spend information.
 2. Access outside `company/work/<company_id>/`.
 3. Auto-switch models without a user prompt.
 4. Mark a task complete without the confirmation modal.
@@ -911,7 +914,7 @@ screen.
 - Tool activation: border → `#00b8ff`, top → `#00ff9f`, text → `#f8fafc`.
 - Tool completion: border removed, background transparent, text → `#64748b`.
 - Boundary violation: red `#fca5a5` modal, `BLOCKED`, `[ OK ]` to dismiss.
-- Savings thresholds: ≥39% green · 20–38% amber · <20% red.
+- Spend is provider-billed USD — no savings thresholds and no colour band.
 
 ---
 
@@ -929,7 +932,7 @@ tamias-agent/
 │   ├── events.py               ← event protocol: TUIEvent, TurnStart, MessageDelta,
 │   │                              StatusUpdate, ToolStart, ToolProgress, ToolEnd,
 │   │                              TurnEnd, ErrorEvent  (emitted via bridge.py)
-│   ├── credits.py              ← CreditsLedger + savings colour thresholds (§5)
+│   ├── credits.py              ← CreditsLedger (provider-billed USD only, §5)
 │   ├── tasks.py                ← Task / TaskBoard + boundary detection (§6)
 │   ├── widgets.py              ← ToolCard, CreditsReadout, TaskBoardWidget
 │   ├── modals.py               ← ConfirmModal, BoundaryModal, HelpScreen,
@@ -961,7 +964,7 @@ The TUI renders by consuming dataclass events from the agent queue
 | `ToolStart` | `tool_call_id`, `tool_name`, `arguments` | mount `.tool-card.tool-active` with spinner |
 | `ToolProgress` | `tool_call_id`, `output_chunk` | stream long-running tool output |
 | `ToolEnd` | `tool_call_id`, `result`, `success`, `duration_sec` | mark card `.tool-finished`, stop spinner, hide args |
-| `TurnEnd` | `prompt_tokens`, `completion_tokens`, `total_duration_sec` | close turn, re-enable input (feeds credit accounting) |
+| `TurnEnd` | `prompt_tokens`, `completion_tokens`, `total_duration_sec`, `cost_usd`, `unpriced_steps` | close turn, re-enable input (feeds spend accounting) |
 | `ErrorEvent` | `error_type`, `message`, `fatal` | surface an error; `fatal` ends the turn |
 
 Internal dict messages (not dataclasses):
@@ -972,8 +975,9 @@ Internal dict messages (not dataclasses):
 `ToolEnd.success` is false **or** the result starts with `Error:` — the two are
 kept consistent.
 
-**Credit link:** `TurnEnd.prompt_tokens` / `completion_tokens` are the raw input to
-the credit-savings math in §5 (compare against the Codex baseline).
+**Spend link:** `TurnEnd.cost_usd` is the provider-billed USD for the turn (and
+`unpriced_steps` how many of its steps reported no cost); §5 folds both into the
+ledger. Token counts are kept for display only — no number is derived from them.
 
 **Producer.** `tui/bridge.py` is the live backend: it runs `agent.run_turn` with
 an `on_event` callback that maps the core's milestones to these dataclasses and

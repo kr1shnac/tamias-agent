@@ -162,11 +162,20 @@ def tool_call(id_, name, arguments):
 
 
 def response(content=None, tool_calls=None, model="fake/model",
-             prompt_tokens=None, completion_tokens=None):
+             prompt_tokens=None, completion_tokens=None, cost=None,
+             cost_in_extra=False):
     usage = None
-    if prompt_tokens is not None or completion_tokens is not None:
+    if (prompt_tokens is not None or completion_tokens is not None
+            or cost is not None):
         usage = SimpleNamespace(prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens)
+        if cost is not None:
+            # OpenRouter returns usage.cost; the OpenAI SDK parks it in
+            # model_extra.  Both shapes must be read the same way.
+            if cost_in_extra:
+                usage.model_extra = {"cost": cost}
+            else:
+                usage.cost = cost
 
     return SimpleNamespace(
         model=model,
@@ -1372,7 +1381,7 @@ def test_bridge_translator_maps_milestones_to_events():
     emit("tool_end", tool_call_id="t1", result="ok", success=True,
          duration_sec=1.25)
     emit("turn_end", prompt_tokens=10, completion_tokens=2,
-         total_duration_sec=3.0)
+         total_duration_sec=3.0, cost_usd=0.0042, unpriced_steps=1)
 
     got = [out.get_nowait() for _ in range(6)]
 
@@ -1391,6 +1400,28 @@ def test_bridge_translator_maps_milestones_to_events():
     assert got[4].success is True and got[4].duration_sec == 1.25
 
     assert isinstance(got[5], TurnEnd) and got[5].prompt_tokens == 10
+    # the provider cost and the unpriced count survive the mapping: this is the
+    # contract that feeds the spend ledger in the TUI
+    assert got[5].cost_usd == 0.0042
+    assert got[5].unpriced_steps == 1
+
+
+def test_bridge_keeps_a_missing_turn_cost_as_none():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import TurnEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    # a turn whose cost the provider never reported must arrive as None, not 0
+    emit("turn_end", prompt_tokens=1, completion_tokens=1,
+         total_duration_sec=0.5)
+    turn = out.get_nowait()
+    assert isinstance(turn, TurnEnd)
+    assert turn.cost_usd is None
+    assert turn.unpriced_steps == 0
 
 
 def test_bridge_translator_tolerates_missing_optional_fields():
@@ -1421,8 +1452,10 @@ def test_main_routes_tui_mode():
     missing = object()
     saved_company = getattr(agent, "COMPANY_ID", missing)
 
-    bridge.run_tui = lambda max_steps=25, company_id=None: (
-        called.update(max_steps=max_steps, company_id=company_id) or 0
+    bridge.run_tui = lambda max_steps=25, company_id=None, task_id=None, \
+        assignee=None: (
+        called.update(max_steps=max_steps, company_id=company_id,
+                      task_id=task_id, assignee=assignee) or 0
     )
 
     try:
@@ -1437,7 +1470,41 @@ def test_main_routes_tui_mode():
             agent.COMPANY_ID = saved_company
 
     assert result == 0
-    assert called == {"max_steps": 5, "company_id": "acme"}
+    assert called == {"max_steps": 5, "company_id": "acme",
+                      "task_id": None, "assignee": None}
+
+
+def test_main_forwards_task_id_and_assignee_to_the_tui():
+    reset(FakeClient([]))
+
+    import tui.bridge as bridge
+
+    called = {}
+    original_run = bridge.run_tui
+    missing = object()
+    saved_company = getattr(agent, "COMPANY_ID", missing)
+
+    bridge.run_tui = lambda max_steps=25, company_id=None, task_id=None, \
+        assignee=None: (
+        called.update(max_steps=max_steps, company_id=company_id,
+                      task_id=task_id, assignee=assignee) or 0
+    )
+
+    try:
+        result = agent.main(["--tui", "--company-id", "acme", "--max-steps",
+                             "5", "--task-id", "PROJ-1457", "--assignee",
+                             "alex"])
+    finally:
+        bridge.run_tui = original_run
+        if saved_company is missing:
+            delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved_company
+
+    assert result == 0
+    # the board can only be honest if the CLI stops dropping these (§10)
+    assert called == {"max_steps": 5, "company_id": "acme",
+                      "task_id": "PROJ-1457", "assignee": "alex"}
 
 
 # ---------- credit-saving model routing + report ----------
@@ -1506,41 +1573,88 @@ def test_run_turn_records_which_model_served_each_step():
     assert stats["turns"] == 1
 
 
-def test_credit_cost_favours_the_agent_over_the_baseline():
-    spent = agent.credit_cost(1000, 1000, 1, "tamias")
-    baseline = agent.credit_cost(1000, 1000, 1, "codex")
+def test_usage_cost_reads_the_provider_billed_amount_or_none():
+    assert agent.usage_cost(None) is None
+    assert agent.usage_cost(SimpleNamespace()) is None
 
-    assert spent == (1000 * 0.25 + 1000 * 1.0) / 1000 + 0.5
-    assert baseline == (1000 * 0.50 + 1000 * 1.5) / 1000 + 0.6
-    assert spent < baseline
+    # a real zero is a price (a free model), and must survive as 0.0
+    assert agent.usage_cost(SimpleNamespace(cost=0.0)) == 0.0
+    assert agent.usage_cost(SimpleNamespace(cost=0.0123)) == 0.0123
+
+    # the OpenAI SDK keeps the unknown field on model_extra
+    assert agent.usage_cost(SimpleNamespace(model_extra={"cost": 0.5})) == 0.5
+
+    # a bool is not a price, even though bool is an int subclass
+    assert agent.usage_cost(SimpleNamespace(cost=True)) is None
+    assert agent.usage_cost(SimpleNamespace(cost="0.01")) is None
+    # a negative or non-finite cost is malformed, not a real price
+    assert agent.usage_cost(SimpleNamespace(cost=-0.01)) is None
+    assert agent.usage_cost(SimpleNamespace(cost=float("nan"))) is None
+    assert agent.usage_cost(SimpleNamespace(cost=float("inf"))) is None
 
 
-def test_credit_report_prints_spend_and_saving():
+def test_log_step_accumulates_provider_cost_and_counts_the_unpriced():
     reset(FakeClient([]))
 
     stats = agent.new_stats()
-    stats["prompt_tokens"] = 1000
-    stats["completion_tokens"] = 1000
+    agent.log_step(1, response("a", prompt_tokens=10, completion_tokens=2,
+                               cost=0.0042), stats, 0.1)
+    # second step reports no cost at all: it must be counted, not read as $0
+    agent.log_step(2, response("b", prompt_tokens=10, completion_tokens=2),
+                   stats, 0.1)
+    # the SDK shape (model_extra) accumulates too
+    agent.log_step(3, response("c", prompt_tokens=1, completion_tokens=1,
+                               cost=0.0008, cost_in_extra=True), stats, 0.1)
+
+    assert abs(stats["cost_usd"] - 0.0050) < 1e-9
+    assert stats["unpriced_steps"] == 1
+
+
+def test_spend_report_prints_provider_billed_usd_with_no_baseline():
+    reset(FakeClient([]))
+
+    stats = agent.new_stats()
+    stats["steps"] = 3
     stats["turns"] = 1
+    stats["cost_usd"] = 0.0123
+    stats["unpriced_steps"] = 1
     stats["models"] = {"free/x": 2}
 
-    agent.credit_report(stats)
+    agent.print_summary(stats)
 
     printed = "\n".join(PRINTED)
 
-    assert "credits" in printed
-    assert "spent" in printed and "saved" in printed
-    assert "codex baseline" in printed
-    assert "free/x ×2" in printed
+    assert "$0.0123" in printed
+    assert "unpriced" in printed
+    assert "free/x×2" in printed
+    # the fabricated comparison is gone for good
+    lowered = printed.lower()
+    assert "codex" not in lowered
+    assert "baseline" not in lowered
+    assert "saved" not in lowered
 
 
-def test_interactive_credits_command():
+def test_spend_report_says_unknown_when_nothing_was_priced():
+    reset(FakeClient([]))
+    stats = agent.new_stats()
+    stats["steps"] = 2
+    stats["unpriced_steps"] = 2
+
+    agent.print_summary(stats)
+
+    assert "UNKNOWN" in "\n".join(PRINTED)
+
+
+def test_interactive_credits_command_reports_usd_not_a_baseline():
     reset(FakeClient([]))
 
     ASKED.extend(["/credits", "/quit"])
 
     assert agent.interactive_loop(25) == 0
-    assert "codex baseline" in "\n".join(PRINTED)
+    printed = "\n".join(PRINTED)
+    assert "spend" in printed.lower()
+    assert "codex" not in printed.lower()
+    assert "baseline" not in printed.lower()
 
 
 # ---------- company boundary for run_shell ----------

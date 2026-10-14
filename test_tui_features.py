@@ -10,9 +10,7 @@ import sys
 
 import pytest
 
-from tui.credits import (
-    AMBER, GREEN, NEUTRAL, RED, CreditsLedger, savings_color,
-)
+from tui.credits import NEUTRAL, CYAN, CreditsLedger
 from tui.tasks import TaskBoard, is_boundary_violation, progress_bar
 
 
@@ -32,76 +30,101 @@ def _real_rich():
     finally:
         sys.modules.update(saved)
 
-# --------------------------------------------------------------- credits (§5)
+# ------------------------------------------------------- spend / USD (§5, D7)
 
 
-def test_savings_color_thresholds():
-    assert savings_color(100) == GREEN
-    assert savings_color(39) == GREEN
-    assert savings_color(38.9) == AMBER
-    assert savings_color(20) == AMBER
-    assert savings_color(19.9) == RED
-    assert savings_color(0) == RED
-
-
-def test_ledger_is_neutral_until_the_first_turn():
+def test_ledger_is_neutral_and_empty_until_the_first_turn():
     ledger = CreditsLedger()
     assert not ledger.has_data
     assert ledger.color() == NEUTRAL
-    assert ledger.readout() == "SCR 0/150 (0% saved)"
+    assert ledger.readout() == "$0.0000 · no usage yet"
+    assert not ledger.fully_priced
 
 
-def test_long_agentic_turn_lands_green():
+def test_ledger_records_provider_billed_usd_not_a_token_formula():
     ledger = CreditsLedger()
-    ledger.record(12000, 800)
-    assert ledger.savings_pct >= 39
-    assert ledger.color() == GREEN
+    ledger.record(prompt_tokens=12_000, completion_tokens=800, cost_usd=0.0123)
+    # the spend is exactly what the provider said, whatever the token counts
+    assert ledger.spent_usd == 0.0123
+    assert ledger.readout() == "$0.0123"
+    assert ledger.color() == CYAN
+    assert ledger.fully_priced
 
 
-def test_short_exchange_lands_amber():
+def test_a_zero_cost_is_a_price_not_a_missing_one():
     ledger = CreditsLedger()
-    ledger.record(500, 50)
-    assert 20 <= ledger.savings_pct < 39
-    assert ledger.color() == AMBER
+    ledger.record(prompt_tokens=10, completion_tokens=2, cost_usd=0.0)
+    assert ledger.spent_usd == 0.0
+    assert ledger.fully_priced
+    assert "unpriced" not in ledger.readout()
 
 
-def test_tiny_turn_can_warn_red():
+def test_an_unpriced_step_flags_the_total_as_partial():
     ledger = CreditsLedger()
-    ledger.record(0, 0)
-    assert ledger.savings_pct < 20
-    assert ledger.color() == RED
+    ledger.record(prompt_tokens=10, completion_tokens=2, cost_usd=0.0042)
+    ledger.record(prompt_tokens=10, completion_tokens=2, cost_usd=None,
+                  unpriced_steps=1)
+    assert ledger.spent_usd == 0.0042
+    assert not ledger.fully_priced
+    assert ledger.readout() == "$0.0042 + 1 unpriced"
+    assert "1 steps unpriced" in " ".join(
+        v for _, v in ledger.dashboard_lines())
 
 
-def test_red_readout_carries_the_warning_suffix():
+def test_a_malformed_cost_is_treated_as_unpriced():
+    for bad in (True, "0.01", -0.01, float("nan"), float("inf"), object()):
+        ledger = CreditsLedger()
+        ledger.record(prompt_tokens=1, completion_tokens=1, cost_usd=bad)
+        assert ledger.spent_usd == 0.0, bad
+        assert not ledger.fully_priced, bad
+        assert ledger.unpriced_steps == 1, bad
+
+
+def test_ledger_accumulates_and_snapshots_a_copy():
     ledger = CreditsLedger()
-    ledger.record(0, 0)
-    assert ledger.color() == RED
-    assert ledger.readout().endswith("WARNING: low savings")
-
-
-def test_green_readout_stays_terse():
-    ledger = CreditsLedger()
-    ledger.record(12000, 800)
-    assert ledger.color() == GREEN
-    assert "WARNING" not in ledger.readout()
-
-
-def test_ledger_accumulates_and_tracks_remaining():
-    ledger = CreditsLedger()
-    ledger.record(1000, 100)
-    ledger.record(1000, 100)
+    ledger.record(1000, 100, cost_usd=0.001)
+    ledger.record(1000, 100, cost_usd=0.002)
     assert ledger.turns == 2
-    assert ledger.remaining == 150 - ledger.spent
-    assert ledger.snapshot().turns == 2  # snapshot is a copy
+    assert ledger.spent_usd == pytest.approx(0.003)
+    copy = ledger.snapshot()
+    assert copy.turns == 2 and copy.spent_usd == ledger.spent_usd
+    copy.record(0, 0, cost_usd=99.0)
+    assert ledger.spent_usd == pytest.approx(0.003)   # snapshot is a copy
 
 
-def test_dashboard_covers_the_required_signals():
+# D16: the UI may only show metrics it measured.  This test renders the
+# dashboard rows against a ledger with known figures and fails on any literal
+# the figures do not produce.
+def test_dashboard_rows_are_all_derived_from_recorded_usage():
     ledger = CreditsLedger()
-    ledger.record(6000, 600)
-    text = " ".join(f"{k} {v}" for k, v in ledger.dashboard_lines())
-    for needle in ("BALANCE", "SAVINGS", "TREND", "PASS RATE", "MODEL",
-                   "BOUNDARY"):
-        assert needle in text
+    ledger.record(prompt_tokens=1200, completion_tokens=340, cost_usd=0.0789)
+
+    text = " ".join(f"{label} {value}"
+                    for label, value in ledger.dashboard_lines())
+
+    # every value is the recorded figure, rendered
+    assert "$0.0789" in text
+    assert "1,540" in text          # tokens = 1200 + 340
+    assert "1,200" in text
+    assert "340" in text
+    assert "provider-billed USD" in text
+
+    # and no invented metric can sneak back in
+    for fabricated in ("Codex", "codex", "57.9", "off-task", "async",
+                       "savings", "SAVINGS", "80%", "PASS RATE"):
+        assert fabricated not in text, fabricated
+
+
+def test_dashboard_and_readout_carry_no_baseline_anywhere():
+    ledger = CreditsLedger()
+    ledger.record(10, 2, cost_usd=0.001)
+    blob = ledger.readout() + " " + " ".join(
+        f"{k} {v}" for k, v in ledger.dashboard_lines())
+    lowered = blob.lower()
+    assert "codex" not in lowered
+    assert "baseline" not in lowered
+    assert "saved" not in lowered
+    assert "credits" not in lowered
 
 
 # ----------------------------------------------------------------- tasks (§6)
@@ -122,7 +145,7 @@ def test_boundary_detection():
 
 
 def test_taskboard_lifecycle():
-    board = TaskBoard(project="acme", assignee="acme")
+    board = TaskBoard(project="acme", assignee="alex")
     task = board.begin("build the thing")
     assert task.id.startswith("PROJ-")
 
@@ -136,9 +159,9 @@ def test_taskboard_lifecycle():
     board.finish_turn()
     assert task.progress == 100
 
-    done = board.complete(saved_credits=12)
+    done = board.complete(spent_usd=12.5)
     assert done.status == "complete"
-    assert done.saved_credits == 12
+    assert done.spent_usd == 12.5
     assert board.current is None
     assert done in board.history
 
@@ -149,6 +172,49 @@ def test_task_not_completed_without_complete():
     board.finish_turn()
     assert board.current.status == "active"
     assert board.history == []
+
+
+# ---------------------------------------------------- task board honesty (§10)
+
+
+def test_board_invents_no_project_or_assignee():
+    # with nothing supplied, the board says so -- it must not fall back to a
+    # fake company name the way it used to ("acme" / "tamias")
+    board = TaskBoard()
+    task = board.begin("do the thing")
+    assert task.project == "unassigned"
+    assert task.assignee == "unassigned"
+
+
+def test_board_uses_the_supplied_task_id_for_the_first_task_only():
+    board = TaskBoard(project="acme", assignee="alex", task_id="TASK-9")
+
+    first = board.begin("first")
+    assert first.id == "TASK-9"             # the id the run was given
+
+    board.complete()
+    second = board.begin("second")
+    assert second.id != "TASK-9"            # later work auto-numbers
+    assert second.id == "PROJ-1457"
+
+
+def test_app_wires_the_cli_identity_into_the_board():
+    from tui.app import TAMIASApp
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue(), company_id="acme",
+                        task_id="PROJ-1457", assignee="alex")
+        async with app.run_test(size=(120, 32)):
+            assert app.board.project == "acme"
+            assert app.board.assignee == "alex"
+            app.board.begin("ship it")
+            assert app.board.current.id == "PROJ-1457"
+            # and the panel renders both, distinctly -- no echoed company id
+            app.refresh_task_board()
+            text = str(app.query_one("#task-board").render())
+            assert "acme" in text and "alex" in text
+
+    _run(drive())
 
 
 # ----------------------------------------------------------- headless UI (app)
@@ -166,9 +232,44 @@ def test_credits_header_is_always_visible_and_f3_opens_dashboard():
         app = TAMIASApp(queue.Queue(), queue.Queue())
         async with app.run_test(size=(120, 32)) as pilot:
             header = str(app.query_one("#credits-readout").render())
-            assert "SCR 0/150" in header
+            assert "$0.0000" in header
             await pilot.press("f3")
             assert isinstance(app.screen, CreditsDashboard)
+
+    _run(drive())
+
+
+def test_f3_dashboard_renders_only_measured_figures():
+    # D16: render the real screen against a ledger with known figures and fail
+    # on any literal metric the figures do not produce.
+    from textual.widgets import Static
+
+    from tui.app import TAMIASApp
+    from tui.credits import CreditsLedger
+    from tui.modals import CreditsDashboard
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 40)) as pilot:
+            ledger = CreditsLedger()
+            ledger.record(prompt_tokens=1200, completion_tokens=340,
+                          cost_usd=0.0789)
+            app.push_screen(CreditsDashboard(ledger))
+            await pilot.pause()
+
+            text = " ".join(str(widget.render())
+                            for widget in app.screen.query(Static))
+
+            # the recorded figures are what is shown
+            assert "$0.0789" in text
+            assert "1,540" in text            # 1200 + 340 tokens
+            assert "provider-billed USD" in text
+
+            # and none of the retired placeholder metrics can come back
+            for fabricated in ("Codex", "57.9", "off-task", "async", "80%",
+                               "PASS RATE", "MODEL USAGE", "savings",
+                               "remaining", "baseline"):
+                assert fabricated not in text, fabricated
 
     _run(drive())
 
@@ -405,12 +506,14 @@ def test_main_defaults_to_the_tui_on_an_interactive_terminal(monkeypatch):
     monkeypatch.setattr(agent, "is_interactive_terminal", lambda: True)
     monkeypatch.setattr(
         bridge, "run_tui",
-        lambda max_steps=25, company_id=None: (
-            called.update(max_steps=max_steps, company_id=company_id) or 0),
+        lambda max_steps=25, company_id=None, task_id=None, assignee=None: (
+            called.update(max_steps=max_steps, company_id=company_id,
+                          task_id=task_id, assignee=assignee) or 0),
     )
 
     assert agent.main([]) == 0
-    assert called == {"max_steps": 25, "company_id": None}
+    assert called == {"max_steps": 25, "company_id": None,
+                      "task_id": None, "assignee": None}
 
 
 def test_main_plain_flag_keeps_the_text_repl(monkeypatch):

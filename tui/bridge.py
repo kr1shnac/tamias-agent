@@ -74,10 +74,13 @@ def make_translator(agent_queue, session_id):
                 duration_sec=float(fields.get("duration_sec", 0.0)),
             ))
         elif name == "turn_end":
+            raw_cost = fields.get("cost_usd")
             agent_queue.put(TurnEnd(
                 prompt_tokens=int(fields.get("prompt_tokens", 0) or 0),
                 completion_tokens=int(fields.get("completion_tokens", 0) or 0),
                 total_duration_sec=float(fields.get("total_duration_sec", 0.0)),
+                cost_usd=None if raw_cost is None else float(raw_cost),
+                unpriced_steps=int(fields.get("unpriced_steps", 0) or 0),
             ))
 
     return on_event
@@ -162,7 +165,7 @@ def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None):
             ))
 
 
-def run_tui(max_steps=25, company_id=None):
+def run_tui(max_steps=25, company_id=None, task_id=None, assignee=None):
     """Start the agent worker on a thread, then run the Textual app."""
     from tui.app import TAMIASApp  # imported late: Textual is only needed here
 
@@ -177,7 +180,8 @@ def run_tui(max_steps=25, company_id=None):
     worker.start()
 
     try:
-        TAMIASApp(ui_queue, agent_queue, company_id=company_id).run()
+        TAMIASApp(ui_queue, agent_queue, company_id=company_id,
+                  task_id=task_id, assignee=assignee).run()
     finally:
         ui_queue.put(None)          # stop the worker once the view is gone
         worker.join(timeout=2)

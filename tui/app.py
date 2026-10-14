@@ -169,7 +169,7 @@ Screen.landing #slash-menu {
     color: #00b8ff;
 }
 
-/* Credits: always visible, colour-coded by savings rate (§5) */
+/* Spend: always visible, provider-billed USD (no savings band) (§5) */
 #credits-readout {
     width: auto;
     content-align: right middle;
@@ -283,7 +283,8 @@ class TAMIASApp(App):
     ]
 
     def __init__(self, ui_queue: queue.Queue, agent_queue: queue.Queue,
-                 company_id: str | None = None):
+                 company_id: str | None = None, task_id: str | None = None,
+                 assignee: str | None = None):
         super().__init__()
         self.ui_queue = ui_queue
         self.agent_queue = agent_queue
@@ -303,8 +304,12 @@ class TAMIASApp(App):
         self.current_effort = os.environ.get("AGENT_EFFORT_POLICY", "auto")
 
         self.ledger = CreditsLedger()
-        self.board = TaskBoard(project=company_id or "acme",
-                               assignee=company_id or "tamias")
+        # The board shows exactly what the run was told (§10): the company is
+        # the project area, the assignee is the person, and neither is invented
+        # -- an unspecified field reads "unassigned", never a fake name.
+        self.board = TaskBoard(project=company_id or "unassigned",
+                               assignee=assignee or "unassigned",
+                               task_id=task_id)
 
     # ------------------------------------------------------------------ view
     def compose(self) -> ComposeResult:
@@ -581,9 +586,8 @@ class TAMIASApp(App):
 
     def show_model_card(self, tier: str) -> None:
         rows = [
-            ("model",   tier),
-            ("savings", f"{self.ledger.savings_pct:.0f}% vs Codex"),
-            ("pass",    "57.9%"),
+            ("model", tier),
+            ("spent", f"${self.ledger.spent_usd:.4f} this session"),
         ]
         label_w = max(len(label) for label, _ in rows)
         value_w = max(len(value) for _, value in rows)
@@ -614,7 +618,7 @@ class TAMIASApp(App):
             ConfirmModal(
                 "Task complete?",
                 f"{task.id} · {task.title}\n{task.bar} {task.progress}%\n"
-                "Yes writes the savings report and closes the task.",
+                "Yes writes the task report and closes the task.",
             ),
             self._on_complete_confirmed,
         )
@@ -623,14 +627,13 @@ class TAMIASApp(App):
         if not confirmed:
             self.show_system("Task continues.")
             return
-        task = self.board.complete(saved_credits=self.ledger.saved)
+        task = self.board.complete(spent_usd=self.ledger.spent_usd)
         if task is None:
             return
         self._write_task_report(task)
         self.show_system(
-            f"[✓] {task.id} completed — saved {task.saved_credits:.0f} credits "
-            f"({self.ledger.savings_pct:.0f}%) vs Codex baseline · "
-            f"{task.elapsed_hms()} · {task.pass_rate:.1f}% pass"
+            f"[✓] {task.id} completed · {task.elapsed_hms()} · "
+            f"${self.ledger.spent_usd:.4f} spent this session (provider-billed USD)"
         )
         self.refresh_task_board()
         # a model switch only persists for the current task (§7)
@@ -652,9 +655,10 @@ class TAMIASApp(App):
                 "status": task.status,
                 "progress": task.progress,
                 "elapsed_sec": round(task.elapsed(), 1),
-                "saved_credits": round(task.saved_credits, 2),
-                "savings_pct": round(self.ledger.savings_pct, 1),
-                "pass_rate": task.pass_rate,
+                "spent_usd": round(task.spent_usd, 6),
+                "prompt_tokens": self.ledger.prompt_tokens,
+                "completion_tokens": self.ledger.completion_tokens,
+                "unpriced_steps": self.ledger.unpriced_steps,
             }
             with open(os.path.join(folder, f"{task.id}.json"), "w",
                       encoding="utf-8") as handle:
@@ -733,7 +737,9 @@ class TAMIASApp(App):
             elif isinstance(event, TurnEnd):
                 self.call_from_thread(self.end_agent_turn,
                                       event.prompt_tokens,
-                                      event.completion_tokens)
+                                      event.completion_tokens,
+                                      event.cost_usd,
+                                      event.unpriced_steps)
             elif isinstance(event, StatusUpdate):
                 self.call_from_thread(self.handle_status_update,
                                       event.message, event.is_busy)
@@ -859,8 +865,11 @@ class TAMIASApp(App):
         return "(unknown path)"
 
     def end_agent_turn(self, prompt_tokens: int = 0,
-                       completion_tokens: int = 0) -> None:
-        self.ledger.record(prompt_tokens, completion_tokens)
+                       completion_tokens: int = 0,
+                       cost_usd: float | None = None,
+                       unpriced_steps: int = 0) -> None:
+        self.ledger.record(prompt_tokens, completion_tokens, cost_usd,
+                           unpriced_steps)
         self.refresh_credits()
         self.board.note_step()
         self.board.finish_turn()

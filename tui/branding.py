@@ -55,7 +55,7 @@ _LETTERS = {
 }
 
 WORDMARK = "TAMIAS"
-TAGLINE = "bounded agentic coding · savings-first"
+TAGLINE = "bounded agentic coding · measured, never guessed"
 HINT = "type a task and press Enter  ·  press / for commands"
 QUICK = "/model    /task    /credits    /help"
 

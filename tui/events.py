@@ -56,6 +56,12 @@ class TurnEnd(TUIEvent):
     prompt_tokens: int
     completion_tokens: int
     total_duration_sec: float
+    # provider-billed USD for the turn; None when the provider reported none,
+    # so a missing cost is never mistaken for a free turn
+    cost_usd: Optional[float] = None
+    # how many API steps in the turn came back without a reported cost, so the
+    # session total can be shown as partial rather than silently complete
+    unpriced_steps: int = 0
 
 @dataclass
 class ErrorEvent(TUIEvent):
