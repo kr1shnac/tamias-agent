@@ -61,18 +61,40 @@ SECRET_ENV_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"
 #a company id is one path segment, so it can never climb out of company/work/
 COMPANY_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
-#fail loudly and early: without a key the first API call would otherwise die
-#with a less obvious error
-if not os.environ.get("OPENROUTER_API_KEY"):
-    raise SystemExit(
-        "OPENROUTER_API_KEY is not set. Put it in .env (AGENTS.md rule 1) or "
-        "export it before starting."
-    )
+#two credential sources, one client. A company run holds a gateway token in
+#TAMIAS_API_KEY and never the provider key, which stays on the gateway; a direct
+#developer run holds an OPENROUTER_API_KEY. The client is built at import only
+#when a key is present, so an offline invocation - --help, the TUI, a test -
+#never needs a credential to start; the error surfaces at the first call, where
+#it can name the missing variable.
+def resolve_api_key():
+    """The credential to send upstream: a gateway token first, else provider key."""
+    return os.environ.get("TAMIAS_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
 
-client = OpenAI(
-    base_url=BASE_URL,
-    api_key=os.environ["OPENROUTER_API_KEY"]
-)
+
+def create_client():
+    """Build the OpenAI client, or None when no credential is configured."""
+    key = resolve_api_key()
+
+    if not key:
+        return None
+
+    return OpenAI(base_url=BASE_URL, api_key=key)
+
+
+client = create_client()
+
+
+def get_client():
+    """The configured client, or a clear error naming the missing credential."""
+    if client is None:
+        raise RuntimeError(
+            "No API credential is set. Put a company gateway token in "
+            "TAMIAS_API_KEY, or a direct provider key in OPENROUTER_API_KEY "
+            "(for example in .env, AGENTS.md rule 1)."
+        )
+
+    return client
 
 history = []
 
@@ -1463,7 +1485,7 @@ def call_model(messages, tools=None, model=None):
         payload["tools"] = tools
 
     try:
-        return client.chat.completions.create(
+        return get_client().chat.completions.create(
             model=model or MODEL,
             messages=messages,
             **payload
@@ -1478,7 +1500,7 @@ def call_model(messages, tools=None, model=None):
         if not unsupported:
             raise
 
-        return client.chat.completions.create(
+        return get_client().chat.completions.create(
             model=model or MODEL,
             messages=messages,
             **({"tools": tools} if tools else {})

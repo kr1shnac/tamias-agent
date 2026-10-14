@@ -247,6 +247,54 @@ def test_defaults_are_env_overridable():
     assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
 
 
+def test_gateway_token_is_preferred_over_provider_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-company",
+                                      "OPENROUTER_API_KEY": "sk-provider"}):
+        assert agent.resolve_api_key() == "vk-company"
+
+
+def test_provider_key_is_the_fallback():
+    with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-provider"},
+                         clear=True):
+        assert agent.resolve_api_key() == "sk-provider"
+
+
+def test_no_credential_means_no_client():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert agent.resolve_api_key() is None
+        assert agent.create_client() is None
+
+
+def test_create_client_uses_the_resolved_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-company"},
+                         clear=True):
+        OPENAI_CALLS.clear()
+        built = agent.create_client()
+
+        assert built is not None
+        assert OPENAI_CALLS[-1]["api_key"] == "vk-company"
+        assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
+
+
+def test_missing_credential_errors_at_call_not_at_import():
+    saved = agent.client
+
+    try:
+        agent.client = None
+        error = None
+
+        try:
+            agent.get_client()
+        except RuntimeError as caught:
+            error = caught
+
+        assert error is not None
+        assert "TAMIAS_API_KEY" in str(error)
+    finally:
+        agent.client = saved
+
+
+
 def test_ask_default_is_25():
     args = agent.parse_args([])
 

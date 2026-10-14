@@ -15,3 +15,8 @@ live_check.db
 demo/runs/
 sbom.json
 licenses.csv
+
+# local-only scratch and reference material - kept on disk, never published
+scratch.py
+todo.txt
+claude-code-system-prompts/
