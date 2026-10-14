@@ -12,6 +12,8 @@ from openai import OpenAI
 import json
 import re
 import subprocess #run_shell
+import urllib.error
+import urllib.request
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -26,9 +28,21 @@ console = Console()
 
 load_dotenv()
 
-BASE_URL = os.environ.get("TAMIAS_BASE_URL", "https://openrouter.ai/api/v1")
+DEFAULT_PROVIDER_URL = "https://openrouter.ai/api/v1"
+BASE_URL = os.environ.get("TAMIAS_BASE_URL", DEFAULT_PROVIDER_URL)
 MODEL = os.environ.get("AGENT_MODEL", "nvidia/nemotron-3.5-lightning:free")
 EFFORT_POLICY = os.environ.get("AGENT_EFFORT_POLICY", "auto")
+
+# --- managed mode: the company gateway owns the policy ----------------------
+# A company gives an employee a gateway token (vk-...) and never the provider
+# key, so a managed run cannot reach a provider except through the gateway.
+# Managed mode makes that explicit and fail-closed: it refuses to start unless
+# the base URL is an explicit gateway, the credential is a gateway token, and a
+# policy can be fetched from the gateway. It never falls back to the provider
+# default, and never falls back to running unbounded.
+MANAGED_MODE_ENV = "TAMIAS_REQUIRE_PROXY"
+GATEWAY_TOKEN_PREFIX = "vk-"
+GATEWAY_POLICY_TIMEOUT = 5.0
 
 # --- credit-saving model routing -------------------------------------------
 # TAMIAS exists to spend as few credits as possible, so most steps should run on
@@ -394,14 +408,34 @@ def cap_result(text, limit=MAX_TOOL_RESULT_CHARS):
 
 
 # --- secrets ---------------------------------------------------------------
+# Paths the tools must never touch beyond the name denylist: the policy file a
+# run is bounded by is a fence, and a fence the agent can rewrite is not one.
+PROTECTED_PATHS = set()
+
+
+def protect_path(path):
+    """Add a path (and its realpath) to the tool denylist for this process."""
+    if not path:
+        return
+
+    PROTECTED_PATHS.add(os.path.abspath(path))
+    PROTECTED_PATHS.add(os.path.realpath(path))
+
+
 def is_sensitive_path(path):
     """True when a path names a credential file, or lives in a secrets folder.
 
     A denylist, not a proof: it stops the tools reading the keys the agent runs
-    on, which the prompt alone was not doing.
+    on, which the prompt alone was not doing. It also carries the paths this
+    process has marked off-limits (:func:`protect_path`), so a run cannot read
+    or rewrite the policy file that bounds it.
     """
     if not path:
         return False
+
+    if (os.path.abspath(path) in PROTECTED_PATHS
+            or os.path.realpath(path) in PROTECTED_PATHS):
+        return True
 
     parts = [part for part in str(path).replace("\\", "/").split("/")
              if part and part not in (".", "..")]
@@ -941,22 +975,24 @@ class PolicyProfile:
     audit_path: str = ""                             # JSONL audit trail
 
 
-def load_policy(toml_path):
-    """Read a company policy file into a PolicyProfile.
+def policy_from_dict(data, source):
+    """Build a PolicyProfile from a parsed policy table.
 
-    Returns (None, "Error: ...") on any failure so a broken policy stops the
-    run loudly instead of silently running unbounded.
+    Shared by the local-file path and the gateway-fetched path, so a served
+    policy is validated exactly like a local one. Returns (None, "Error: ...")
+    on any failure, so a broken policy stops the run loudly instead of silently
+    running unbounded.
     """
-    try:
-        with open(toml_path, "rb") as handle:
-            data = tomllib.load(handle)
-    except Exception as e:
-        return None, f"Error: could not load policy '{toml_path}': {e}"
+    if not isinstance(data, dict):
+        return None, f"Error: policy '{source}' must be a table"
 
     use_case = data.get("use_case", {})
     tools = data.get("tools", {})
     shell = data.get("run_shell", {})
     paths = data.get("paths", {})
+
+    if not isinstance(use_case, dict):
+        use_case = {}
 
     profile = PolicyProfile(
         version=str(data.get("version", "1")),
@@ -972,13 +1008,31 @@ def load_policy(toml_path):
     )
 
     if not profile.name:
-        return None, f"Error: policy '{toml_path}' needs [use_case] name"
+        return None, f"Error: policy '{source}' needs [use_case] name"
 
     # future-proofing: a policy written for a newer schema is refused, not guessed
-    if int(profile.version or "1") > 1:
-        return None, f"Error: policy '{toml_path}' version {profile.version} unsupported"
+    try:
+        version = int(profile.version or "1")
+    except (TypeError, ValueError):
+        return None, (
+            f"Error: policy '{source}' version {profile.version!r} is not a number"
+        )
+
+    if version > 1:
+        return None, f"Error: policy '{source}' version {profile.version} unsupported"
 
     return profile, None
+
+
+def load_policy(toml_path):
+    """Read a company policy file into a PolicyProfile, or (None, "Error: ...")."""
+    try:
+        with open(toml_path, "rb") as handle:
+            data = tomllib.load(handle)
+    except Exception as e:
+        return None, f"Error: could not load policy '{toml_path}': {e}"
+
+    return policy_from_dict(data, toml_path)
 
 
 #the policy active for this process; None keeps the current unbounded behaviour
@@ -994,6 +1048,83 @@ def set_active_policy(profile):
 
 def active_policy():
     return _ACTIVE_POLICY
+
+
+def _env_truthy(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def gateway_root(base_url):
+    """The gateway root from a ``/v1`` base URL: scheme://host[:port]."""
+    url = (base_url or "").rstrip("/")
+
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+
+    return url.rstrip("/")
+
+
+def fetch_policy(base_url, token, timeout=GATEWAY_POLICY_TIMEOUT):
+    """GET the signed policy manifest from the gateway (managed mode).
+
+    Returns ``(policy_table, None)`` or ``(None, "Error: ...")``. Uses the
+    stdlib HTTP client, not the provider SDK: ``/policy`` is a tamias route and
+    fetching it must not require - or touch - the provider client.
+    """
+    url = gateway_root(base_url) + "/policy"
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}"}
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return None, (
+            f"Error: the gateway refused the policy at {url} (HTTP {e.code})"
+        )
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, f"Error: could not fetch a policy from {url}: {e}"
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("policy"), dict):
+        return None, f"Error: the gateway returned no policy at {url}"
+
+    return payload["policy"], None
+
+
+def enter_managed_mode():
+    """Fetch and apply the gateway's policy, or return an "Error: ..." string.
+
+    Fail-closed at every step: a managed run must have a gateway token, an
+    explicit gateway URL, and a policy the gateway hands over. Anything else
+    stops the run rather than degrading to an unmanaged one.
+    """
+    token = resolve_api_key()
+
+    if not token:
+        return ("Error: --require-proxy needs a company gateway token in "
+                "TAMIAS_API_KEY (a provider key is not accepted here)")
+
+    if not token.startswith(GATEWAY_TOKEN_PREFIX):
+        return ("Error: --require-proxy needs a company gateway token (vk-...); "
+                "the configured credential is not one")
+
+    if BASE_URL.rstrip("/") == DEFAULT_PROVIDER_URL.rstrip("/"):
+        return (f"Error: --require-proxy refuses the direct provider URL "
+                f"{BASE_URL!r}; set TAMIAS_BASE_URL to the company gateway")
+
+    data, err = fetch_policy(BASE_URL, token)
+
+    if err:
+        return err
+
+    profile, err = policy_from_dict(data, "gateway policy")
+
+    if err:
+        return err
+
+    set_active_policy(profile)
+    return None
 
 
 def _glob_any(text, patterns):
@@ -1323,6 +1454,14 @@ def parse_args(argv=None):
         default=None,
         help="path to a company policy TOML that bounds which tools, commands "
              "and paths this run may use (also read from TAMIAS_POLICY)"
+    )
+
+    parser.add_argument(
+        "--require-proxy",
+        action="store_true",
+        help="managed mode: take the policy from the company gateway "
+             "(TAMIAS_BASE_URL) and refuse to start without one. Needs a "
+             "gateway token in TAMIAS_API_KEY (also TAMIAS_REQUIRE_PROXY=1)"
     )
 
     parser.add_argument(
@@ -1796,6 +1935,7 @@ HELP = [
         ("--plain", "force the classic text REPL"),
         ("--company-id ID", "bound work to company/work/{ID}/"),
         ("--policy FILE", "bound to a company use-case policy TOML"),
+        ("--require-proxy", "managed mode: fetch the policy from the gateway"),
         ("--task-id ID", "record the assigned task id"),
         ("--assignee NAME", "record who owns the task"),
     ]),
@@ -1908,17 +2048,41 @@ def main(argv=None):
     globals()['TASK_ID'] = args.task_id
     globals()['ASSIGNEE'] = args.assignee
 
-    # A company policy bounds this run to one use case. A broken or missing
-    # policy file refuses to start rather than silently running unbounded.
+    # Two ways to bound a run. A local policy file is the developer path. In
+    # managed mode the policy comes from the company gateway and *only* from
+    # there: the agent refuses to start without a verified policy, so a managed
+    # run cannot fall back to an unbounded one.
+    managed = args.require_proxy or _env_truthy(MANAGED_MODE_ENV)
     policy_path = args.policy or os.environ.get("TAMIAS_POLICY")
 
-    if policy_path:
+    if managed:
+        if policy_path:
+            console.print(
+                "[red]Error: --require-proxy takes the policy from the gateway; "
+                "drop --policy so the served policy is the only one[/red]"
+            )
+            return 1
+
+        err = enter_managed_mode()
+
+        if err:
+            console.print(f"[red]{err}[/red]")
+            return 1
+
+        policy = active_policy()
+        note = f"managed mode via {gateway_root(BASE_URL)}: policy {policy.name}"
+        if policy.read_only:
+            note += " (read-only)"
+        console.print(f"[dim]{note}[/dim]")
+
+    elif policy_path:
         policy, err = load_policy(policy_path)
 
         if err:
             console.print(f"[red]{err}[/red]")
             return 1
 
+        protect_path(policy_path)  # the fence must not be editable by the agent
         set_active_policy(policy)
         note = f"policy active: {policy.name}"
         if policy.read_only:

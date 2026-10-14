@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import pathlib
 import subprocess
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest.mock as mock
+import urllib.error
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -251,7 +253,8 @@ def assert_history_valid(history):
 def test_defaults_are_env_overridable():
     source = pathlib.Path(agent.__file__).read_text(encoding="utf-8")
 
-    assert 'os.environ.get("TAMIAS_BASE_URL", "https://openrouter.ai/api/v1")' in source
+    assert 'DEFAULT_PROVIDER_URL = "https://openrouter.ai/api/v1"' in source
+    assert 'BASE_URL = os.environ.get("TAMIAS_BASE_URL", DEFAULT_PROVIDER_URL)' in source
     assert 'os.environ.get("AGENT_MODEL", "nvidia/nemotron-3.5-lightning:free")' in source
     assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
 
@@ -2298,6 +2301,177 @@ def test_main_loads_policy_flag_before_running():
     agent.set_active_policy(None)
     assert code == 0
     assert active is not None and active.name == "cli-bounded"
+
+
+# ---------- managed mode (--require-proxy / D12) ----------
+
+POLICY_TABLE = {
+    "version": "1",
+    "use_case": {"name": "codefix", "read_only": True},
+    "tools": {"deny": ["run_shell"]},
+    "paths": {"deny_read": ["secrets/**"]},
+}
+
+
+def test_gateway_root_strips_a_v1_suffix():
+    assert agent.gateway_root("http://127.0.0.1:8000/v1") == "http://127.0.0.1:8000"
+    assert agent.gateway_root("http://127.0.0.1:8000/v1/") == "http://127.0.0.1:8000"
+    assert agent.gateway_root("http://gw:9000") == "http://gw:9000"
+
+
+def test_policy_from_dict_matches_the_file_profile():
+    profile, err = agent.policy_from_dict(POLICY_TABLE, "gateway policy")
+
+    assert err is None
+    assert profile.name == "codefix"
+    assert profile.read_only is True
+    assert profile.tool_deny == ["run_shell"]
+    assert profile.deny_read == ["secrets/**"]
+
+
+def test_policy_from_dict_rejects_a_missing_use_case():
+    profile, err = agent.policy_from_dict({"version": "1"}, "x")
+
+    assert profile is None and "use_case" in err
+
+
+def test_policy_from_dict_rejects_a_non_numeric_version():
+    profile, err = agent.policy_from_dict(
+        {"version": "two", "use_case": {"name": "x"}}, "x"
+    )
+
+    assert profile is None and "not a number" in err
+
+
+def test_policy_from_dict_rejects_a_newer_schema():
+    profile, err = agent.policy_from_dict(
+        {"version": "2", "use_case": {"name": "x"}}, "x"
+    )
+
+    assert profile is None and "unsupported" in err
+
+
+def test_fetch_policy_reads_the_policy_table_and_sends_the_token():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"policy": POLICY_TABLE}).encode()
+
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return FakeResponse()
+
+    with mock.patch.object(agent.urllib.request, "urlopen", fake_urlopen):
+        data, err = agent.fetch_policy("http://gw.test/v1", "vk-x")
+
+    assert err is None and data == POLICY_TABLE
+    assert seen["url"] == "http://gw.test/policy"
+    assert seen["auth"] == "Bearer vk-x"
+
+
+def test_enter_managed_mode_refuses_without_a_token():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        err = agent.enter_managed_mode()
+
+    assert err and "gateway token" in err
+
+
+def test_enter_managed_mode_refuses_a_provider_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "sk-provider"}, clear=True):
+        err = agent.enter_managed_mode()
+
+    assert err and "vk-" in err
+
+
+def test_enter_managed_mode_refuses_the_direct_provider_url():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", agent.DEFAULT_PROVIDER_URL):
+            err = agent.enter_managed_mode()
+
+    assert err and "direct provider URL" in err
+
+
+def test_enter_managed_mode_refuses_when_the_gateway_refuses():
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError("http://gw.test/policy", 404, "no", {}, None)
+
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", "http://gw.test/v1"):
+            with mock.patch.object(agent.urllib.request, "urlopen", boom):
+                err = agent.enter_managed_mode()
+
+    assert err and "HTTP 404" in err
+
+
+def test_enter_managed_mode_applies_a_served_policy():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", "http://gw.test/v1"):
+            with mock.patch.object(agent, "fetch_policy",
+                                   lambda *a, **k: (POLICY_TABLE, None)):
+                err = agent.enter_managed_mode()
+
+    active = agent.active_policy()
+    agent.set_active_policy(None)
+    assert err is None
+    assert active is not None and active.name == "codefix"
+
+
+def test_managed_mode_env_flag_is_truthy():
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "1"}, clear=True):
+        assert agent._env_truthy(agent.MANAGED_MODE_ENV) is True
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "no"}, clear=True):
+        assert agent._env_truthy(agent.MANAGED_MODE_ENV) is False
+
+
+def test_managed_main_refuses_without_a_policy():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        code = agent.main(["--require-proxy", "--task", "hi"])
+
+    assert code == 1
+
+
+def test_managed_mode_env_var_refuses_without_a_token():
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "1"}, clear=True):
+        assert agent.main(["--task", "hi"]) == 1
+
+
+def test_managed_main_refuses_a_local_policy_alongside_the_flag():
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write('[use_case]\nname = "x"\n')
+        policy_path = fh.name
+
+    try:
+        with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"},
+                             clear=True):
+            code = agent.main(["--require-proxy", "--policy", policy_path,
+                               "--task", "hi"])
+    finally:
+        os.unlink(policy_path)
+
+    assert code == 1
+
+
+def test_protected_policy_path_is_refused():
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        path = fh.name
+
+    try:
+        assert agent.is_sensitive_path(path) is False
+        agent.protect_path(path)
+        assert agent.is_sensitive_path(path) is True
+        assert agent.refuse_secret(path)
+    finally:
+        agent.PROTECTED_PATHS.discard(os.path.abspath(path))
+        agent.PROTECTED_PATHS.discard(os.path.realpath(path))
+        os.unlink(path)
 
 
 def _run_all():

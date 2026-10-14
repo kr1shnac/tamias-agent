@@ -118,6 +118,35 @@ deny_read   = ["company/work/acme/hr/**", "**/*.pem"]
 start** (exit 1) rather than silently running unbounded. Every gate decision is
 in `agent.POLICY_AUDIT` and, when `[audit] path` is set, appended as JSONL.
 
+### Managed mode — the policy the employee cannot edit
+
+A local policy file is only as trustworthy as the file. In a company deployment
+the employee holds a **gateway token** (`vk-…`) and never the provider key, so a
+run cannot reach a model except through the Tamias gateway. Managed mode makes
+that explicit and fail-closed:
+
+```bash
+TAMIAS_BASE_URL=http://gateway.internal:8000/v1 \
+TAMIAS_API_KEY=vk-… \
+.venv/bin/python agent.py --require-proxy --company-id acme --task "…"
+```
+
+The agent then fetches its policy from the gateway (`GET /policy`) instead of
+reading a local file. It **refuses to start** unless all of these hold, so a
+managed run can never silently degrade to an unmanaged one:
+
+- a gateway token is present (`vk-…`; a provider key is refused);
+- `TAMIAS_BASE_URL` is an explicit gateway, not the direct provider default;
+- the gateway serves a policy, and it parses.
+
+`--require-proxy` and `--policy` together are refused: the served policy must be
+the only one. `TAMIAS_REQUIRE_PROXY=1` is the env-var form.
+
+The gateway verifies the manifest's Ed25519 signature before serving it
+(`tamias admin manifest`, [`docs/MANIFEST.md`](../../tamias/docs/MANIFEST.md));
+the agent trusts the authenticated gateway response over its (loopback or TLS)
+hop. The agent does not itself check the signature — that is the gateway's job.
+
 ### How the agent enforces it (each maps to code)
 
 Implemented in `agent.py` (2026-10-13, committed):
@@ -139,9 +168,12 @@ Implemented in `agent.py` (2026-10-13, committed):
    `POLICY_AUDIT`; a `[audit] path =` JSONL writer is wired in `policy_audit`.
    Each row: `ts, use_case, tool, decision, reason, args` — the SIEM-ready
    record companies ask for ([9][12]).
-7. **Policy can't be edited by the agent** — the policy file is outside the
-   fence, and `is_sensitive_path`-style rules refuse any tool path that touches
-   it (same mechanism as `.env` today).
+7. ✅ **Policy can't be edited by the agent** — a policy path is added to a
+   process-wide denylist (`protect_path` → `PROTECTED_PATHS`) that
+   `is_sensitive_path` consults, so the same rules that protect `.env` also
+   protect the policy file that bounds the run. Pinned by a test.
+8. ✅ **Managed mode** (`--require-proxy`) — the policy is fetched from the
+   gateway (`GET /policy`) and a run refuses to start without one (see above).
 
 ### Honest limits
 
@@ -168,9 +200,11 @@ and committed** (`f76489a` + policy commit). The `--policy FILE` flag (and
 5. ⏳ `ask` escalation event + JSONL audit trail — the *in-memory* gate audit
    (`POLICY_AUDIT`) is done; the `[audit] path =` JSONL writer is implemented in
    `policy_audit`; wiring `ask` to the interactive UI is open.
-6. Policy-file self-protection test (agent cannot read/edit its own policy).
+6. ✅ Policy-file self-protection test (agent cannot read/edit its own policy).
 7. Demo: `--company-id acme` + a policy whose `deny` blocks `rm`/`curl` — show a
    command getting refused *and* the audit row being written.
+8. ✅ Managed mode (`--require-proxy`): fetch the signed policy from the gateway
+   (`GET /policy`) and refuse to start without one.
 
 Everything is testable with no network and no API key, so a company can evaluate
 "our agent only for *our* use case" before any live run.
