@@ -148,6 +148,7 @@ def _install_stubs():
 _install_stubs()
 
 import agent  # noqa: E402  (import after the stubs are in place)
+import bench  # noqa: E402  (harness + maths; no rich/openai)
 import brief  # noqa: E402  (pure module: no rich/openai)
 import context_index  # noqa: E402  (pure module: offline index of D14)
 
@@ -3036,6 +3037,173 @@ def test_citations_for_is_empty_for_an_empty_query():
     with tempfile.TemporaryDirectory() as root:
         assert context_index.citations_for("", root) == []
         assert context_index.citations_for("   ", root) == []
+
+
+# ---------- D17: the benchmark harness ----------
+
+def _paired_fixture(base_cost, base_pass, cand_cost, cand_pass, n=10):
+    results = []
+    for i in range(n):
+        results.append(bench.TaskResult(f"t{i}", "baseline", i < base_pass,
+                                        base_cost))
+        results.append(bench.TaskResult(f"t{i}", "candidate", i < cand_pass,
+                                        cand_cost))
+    return results
+
+
+def test_cost_per_success_divides_by_successes_not_runs():
+    results = [
+        bench.TaskResult("t1", "a", True, 1.0),
+        bench.TaskResult("t2", "a", False, 1.0),
+        bench.TaskResult("t3", "a", True, 1.0),
+        bench.TaskResult("t4", "a", False, 1.0),
+    ]
+    summary = bench.summarize(results)[0]
+
+    assert summary.passed == 2
+    assert summary.total_usd == 4.0
+    assert summary.cost_per_success == 2.0   # 4 USD / 2 successes, not 4 / 4
+
+
+def test_an_arm_that_passes_nothing_has_infinite_cost_per_success():
+    results = [bench.TaskResult("t1", "a", False, 0.5)]
+    summary = bench.summarize(results)[0]
+
+    assert summary.cost_per_success == float("inf")
+
+
+def test_paired_bootstrap_sees_a_real_saving():
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.5, cand_pass=10)
+
+    ci = bench.paired_bootstrap(results, "baseline", "candidate",
+                                iterations=300, seed=0)
+
+    assert round(ci["improvement"], 3) == 0.5   # half the price, same output
+    assert ci["improvement_ci"][0] > 0
+    assert ci["pass_drop"] == 0.0
+
+
+def test_the_gate_promotes_a_clear_saving_at_equal_quality():
+    results = _paired_fixture(1.0, 10, 0.5, 10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is True
+    assert decision.improvement >= bench.GATE_MIN_IMPROVEMENT
+
+
+def test_the_gate_refuses_a_saving_bought_with_accuracy():
+    # 40% cheaper, but it drops 20 points of pass rate - not a win
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.6, cand_pass=8)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+    assert "pass-rate" in decision.reason
+
+
+def test_the_gate_refuses_a_saving_too_small_to_matter():
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.95, cand_pass=10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+    assert decision.improvement < bench.GATE_MIN_IMPROVEMENT
+
+
+def test_the_gate_refuses_when_no_saving_is_established():
+    # identical arms: the point estimate is 0 and the interval straddles 0
+    results = _paired_fixture(1.0, 10, 1.0, 10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+
+
+def test_run_benchmark_randomizes_arm_order_but_runs_every_pair():
+    tasks = [bench.Task(f"t{i}", "do it") for i in range(4)]
+    arms = [bench.Arm("a", "m"), bench.Arm("b", "m"), bench.Arm("c", "m")]
+
+    calls = []
+
+    def runner(arm, task):
+        calls.append((task.id, arm.name))
+        return bench.TaskResult(task.id, arm.name, True, 1.0)
+
+    results = bench.run_benchmark(tasks, arms, runner, seed=7)
+
+    assert len(results) == 12                       # 3 arms x 4 tasks
+    per_task = {}
+    for task_id, arm_name in calls:
+        per_task.setdefault(task_id, []).append(arm_name)
+    for names in per_task.values():
+        assert sorted(names) == ["a", "b", "c"]     # every arm ran
+        assert len(names) == len(set(names))        # exactly once
+    # and the order is seeded, so it is reproducible
+    again = []
+    bench.run_benchmark(tasks, arms,
+                        lambda arm, task: (again.append((task.id, arm.name))
+                                           or bench.TaskResult(task.id, arm.name,
+                                                               True, 1.0)),
+                        seed=7)
+    assert again == calls
+
+
+def test_parse_cost_reads_the_runs_summary_line():
+    output = ("some noise\n"
+              "steps: 3 · prompt tokens: 10 · completion tokens: 4 · "
+              "compactions: 0 · spent: $0.0123\n")
+
+    assert bench.LiveRunner.parse_cost(output) == 0.0123
+    assert bench.LiveRunner.parse_cost("no summary here") == 0.0
+
+
+def test_the_external_arm_is_reported_as_not_run_not_as_a_failure():
+    runner = bench.LiveRunner()
+    result = runner(bench.Arm("external-codex", "external:codex"),
+                    bench.Task("t1", "do it"))
+
+    assert result.passed is False
+    assert "not wired" in result.note
+
+
+def test_summarize_orders_arms_as_given():
+    arms = [bench.Arm("first", "m"), bench.Arm("second", "m")]
+    results = [bench.TaskResult("t1", "second", True, 1.0),
+               bench.TaskResult("t1", "first", True, 1.0)]
+
+    assert [s.arm for s in bench.summarize(results, arms)] == ["first", "second"]
+
+
+def test_live_runner_env_carries_the_arm_configuration():
+    runner = bench.LiveRunner()
+    arm = bench.Arm("tamias-full", "base/model", "auto", True,
+                    tiers=("free/m", "mid/m", "prem/m"))
+
+    env = runner._env_for(arm)
+
+    assert env["AGENT_MODEL"] == "base/model"
+    assert env["AGENT_EFFORT_POLICY"] == "auto"
+    assert env["AGENT_BRIEF"] == "1"
+    assert env["AGENT_MODEL_FREE"] == "free/m"
+    assert env["AGENT_MODEL_MID"] == "mid/m"
+    assert env["AGENT_MODEL_PREMIUM"] == "prem/m"
+
+    # a static arm sets no tiers and no brief
+    plain = runner._env_for(bench.Arm("plain", "m", "static", False))
+    assert "AGENT_BRIEF" not in plain
+    assert "AGENT_MODEL_FREE" not in plain
 
 
 def _run_all():
