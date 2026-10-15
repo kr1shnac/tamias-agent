@@ -1255,48 +1255,6 @@ def test_assistant_content_is_never_left_null():
         assert isinstance(message["content"], str)
 
 
-def test_tui_boots_and_streams_events():
-    import asyncio
-    import queue
-    import sys
-
-    # test_agent stubs sys.modules["rich"] (and rich.*) with non-package fakes
-    # for offline testing. The TUI imports real rich submodules, so temporarily
-    # restore the installed package around this test.
-    saved = {name: sys.modules.pop(name)
-             for name in list(sys.modules)
-             if name == "rich" or name.startswith("rich.")}
-
-    from tui.app import TAMIASApp
-    from tui.events import TurnStart, MessageDelta, ToolStart, ToolEnd
-
-    try:
-        async def drive():
-            ui_queue = queue.Queue()
-            agent_queue = queue.Queue()
-            app = TAMIASApp(ui_queue, agent_queue)
-            async with app.run_test(size=(120, 32)):
-                agent_queue.put({"type": "init", "workspace": "x", "model": "CHECK_MODEL"})
-                agent_queue.put(TurnStart(user_prompt="hi", session_id="s"))
-                agent_queue.put(MessageDelta(content="streaming text", model="m"))
-                agent_queue.put(ToolStart(tool_call_id="t1", tool_name="grep",
-                                arguments='{"Query": "password"}'))
-                await asyncio.sleep(0.6)
-
-                model_disp = str(app.query_one("#model-display").render())
-                assert "CHECK_MODEL" in model_disp  # dict events are reachable
-                assert app.current_agent_text == "streaming text"  # deltas append
-                assert "t1" in app.active_tools  # tools keyed by call id
-
-                agent_queue.put(ToolEnd(tool_call_id="t1", result="ok",
-                              success=True, duration_sec=1.5))
-                await asyncio.sleep(0.6)
-                assert "t1" not in app.active_tools  # ToolEnd resolves by call id
-
-        asyncio.run(drive())
-    finally:
-        sys.modules.update(saved)
-
 
 # ---------- agent -> UI event stream (bridge) ----------
 
@@ -2418,7 +2376,9 @@ def test_a_hard_deny_beats_an_ask():
 def test_an_ask_gated_call_is_not_audited_as_a_plain_allow():
     profile = _ask_profile()
 
-    with _with_policy(profile), _with_ask_handler(lambda *a: True):
+    with _with_policy(profile), _with_ask_handler(lambda *a: True), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
         agent.dispatch_tool("read_file", {"file_path": "a.txt"})
         agent.dispatch_tool("write_file", {"file_path": "b.txt", "content": "x"})
         decisions = [row["decision"] for row in agent.POLICY_AUDIT]

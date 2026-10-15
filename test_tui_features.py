@@ -5,8 +5,10 @@ tests; these exercise the real Textual widgets headlessly.
 """
 
 import asyncio
+import contextlib
 import queue
 import sys
+from unittest import mock
 
 import pytest
 
@@ -16,19 +18,26 @@ from tui.tasks import TaskBoard, is_boundary_violation, progress_bar
 
 @pytest.fixture(autouse=True)
 def _real_rich():
-    """test_agent.py stubs the rich package process-wide for offline core tests.
+    """Drop test_agent.py's process-wide rich stubs so Textual uses real rich.
 
-    When both files run in one pytest process those fakes would break Textual's
-    rendering. Temporarily drop the stubs so the real package loads, then put
-    them back for any later core tests.
+    test_agent.py installs non-package fakes in ``sys.modules`` so the core runs
+    offline. Those fakes must be gone before any Textual import. We do *not*
+    restore them afterwards: ``agent.py`` already captured its fake references
+    when it was imported, and putting the fakes back would clobber the real
+    ``rich`` modules that ``textual`` now holds - so the next drop would build a
+    second ``rich.style.Style`` class and Rich's own ``isinstance(name, Style)``
+    guard would fail intermittently mid-render
+    (``'Style' object has no attribute 'strip'``). Dropping them once is enough;
+    a real package has ``__path__``, the stubs do not.
     """
-    saved = {name: sys.modules.pop(name)
-             for name in list(sys.modules)
-             if name == "rich" or name.startswith("rich.")}
-    try:
-        yield
-    finally:
-        sys.modules.update(saved)
+    loaded = sys.modules.get("rich")
+
+    if loaded is not None and getattr(loaded, "__path__", None) is None:
+        for name in [name for name in sys.modules
+                     if name == "rich" or name.startswith("rich.")]:
+            del sys.modules[name]
+
+    yield
 
 # ------------------------------------------------------- spend / USD (§5, D7)
 
@@ -224,6 +233,34 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@contextlib.asynccontextmanager
+async def _no_screen_wait():
+    """Neutralise Textual's ``Pilot._wait_for_screen`` for one interaction.
+
+    Pressing a key that dismisses a modal can make ``Pilot._wait_for_screen``
+    schedule a decrement callback on the unmounting modal and lose it, then
+    stall for its 30s timeout - an intermittent harness hang, not app
+    behaviour. The key is still delivered (``App._press_keys`` does its own
+    idle waits), so we skip the fragile screen-idle wait and let the event loop
+    settle with a real sleep instead.
+    """
+    from textual.pilot import Pilot
+
+    async def ready(self, timeout=30.0):
+        return True
+
+    with mock.patch.object(Pilot, "_wait_for_screen", ready):
+        yield
+
+
+async def _press(pilot, key, settle=0.15):
+    """Deliver a key that may dismiss a modal, then let the loop settle."""
+    async with _no_screen_wait():
+        await pilot.press(key)
+
+    await asyncio.sleep(settle)
+
+
 def test_credits_header_is_always_visible_and_f3_opens_dashboard():
     from tui.app import TAMIASApp
     from tui.modals import CreditsDashboard
@@ -303,14 +340,14 @@ def test_completion_requires_the_confirmation_modal():
             await pilot.pause()
             assert isinstance(app.screen, ConfirmModal)
 
-            await pilot.press("n")            # decline -> task continues
-            await pilot.pause()
+            await _press(pilot, "n")          # decline -> task continues
             assert app.board.current is not None
 
             app.action_complete_task()
             await pilot.pause()
-            await pilot.press("y")            # confirm -> task completes
-            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+
+            await _press(pilot, "y")          # confirm -> task completes
             assert app.board.current is None
             assert app.board.history[-1].status == "complete"
 
@@ -592,6 +629,44 @@ def test_main_plain_flag_keeps_the_text_repl(monkeypatch):
     assert "tui" not in opened
 
 
+# ------------------------------------------------ live event plumbing (§7-§9)
+
+
+def test_tui_boots_and_streams_events():
+    """The bridge's event dataclasses reach the live widgets.
+
+    Moved here from test_agent.py: it drives a real Textual app, which needs
+    the real rich package that the offline core tests fake.
+    """
+    from tui.app import TAMIASApp
+    from tui.events import TurnStart, MessageDelta, ToolStart, ToolEnd
+
+    async def drive():
+        ui_queue = queue.Queue()
+        agent_queue = queue.Queue()
+        app = TAMIASApp(ui_queue, agent_queue)
+        async with app.run_test(size=(120, 32)):
+            agent_queue.put({"type": "init", "workspace": "x",
+                             "model": "CHECK_MODEL"})
+            agent_queue.put(TurnStart(user_prompt="hi", session_id="s"))
+            agent_queue.put(MessageDelta(content="streaming text", model="m"))
+            agent_queue.put(ToolStart(tool_call_id="t1", tool_name="grep",
+                                      arguments='{"Query": "password"}'))
+            await asyncio.sleep(0.6)
+
+            model_disp = str(app.query_one("#model-display").render())
+            assert "CHECK_MODEL" in model_disp      # dict events are reachable
+            assert app.current_agent_text == "streaming text"   # deltas append
+            assert "t1" in app.active_tools          # tools keyed by call id
+
+            agent_queue.put(ToolEnd(tool_call_id="t1", result="ok",
+                                    success=True, duration_sec=1.5))
+            await asyncio.sleep(0.6)
+            assert "t1" not in app.active_tools      # ToolEnd resolves by id
+
+    _run(drive())
+
+
 # ------------------------------------- policy ask escalation (policy item 5)
 
 
@@ -650,8 +725,7 @@ def test_the_app_confirms_an_ask_gated_call_through_a_modal():
             app.confirm_tool_ask("write_file", '{"file_path": "x"}', "ask-gated")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmModal)
-            await pilot.press("y")
-            await pilot.pause()
+            await _press(pilot, "y")
             assert gate.answers == [True]
 
     _run(drive())
@@ -675,8 +749,7 @@ def test_the_app_confirms_an_ask_gated_call_can_be_refused():
             app.confirm_tool_ask("write_file", '{"file_path": "x"}', "ask-gated")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmModal)
-            await pilot.press("n")
-            await pilot.pause()
+            await _press(pilot, "n")
             assert gate.answers == [False]
 
     _run(drive())

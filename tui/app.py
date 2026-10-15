@@ -3,11 +3,11 @@ import queue
 import re
 import sys
 import json
+import threading
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, Horizontal, ScrollableContainer
 from textual.widgets import Static, Input
-from textual import work
 from rich.text import Text
 from rich.markdown import Markdown as RichMarkdown
 
@@ -336,7 +336,13 @@ class TAMIASApp(App):
                         id="user-input")
 
     def on_mount(self) -> None:
-        self.listen_to_agent()
+        # a plain daemon thread, not a Textual thread worker: a worker lives on
+        # the event loop's default executor, and asyncio.run()'s shutdown joins
+        # that executor - so a listener still looping at teardown hangs the loop
+        # close. A daemon thread is abandoned instead, and stops on unmount.
+        self._listener = threading.Thread(
+            target=self.listen_to_agent, daemon=True, name="tamias-listener")
+        self._listener.start()
         self.query_one(Input).focus()
         self.set_interval(0.1, self.tick_spinners)
         self._apply_responsive(self.size.width)
@@ -757,9 +763,15 @@ class TAMIASApp(App):
             self.query_one(Input).focus()
 
     # --------------------------------------------------------------- agent in
-    @work(thread=True)
     def listen_to_agent(self) -> None:
-        while self.listening:
+        """Read agent events off the queue until the app stops.
+
+        Runs on a plain daemon thread (started in on_mount), not a Textual
+        thread worker: a worker lives on the event loop's default executor, and
+        asyncio.run()'s shutdown joins that executor, so a listener still
+        looping at teardown hangs the loop close. A daemon thread is abandoned.
+        """
+        while self.listening and self.is_running:
             try:
                 event = self.agent_queue.get(timeout=0.2)
             except queue.Empty:
@@ -770,45 +782,52 @@ class TAMIASApp(App):
             if event is None:
                 break
 
-            if isinstance(event, dict):
-                kind = event.get("type")
-                if kind == "clear":
-                    self.call_from_thread(self.clear_transcript)
-                elif kind in ("init", "model_update"):
-                    self.call_from_thread(self.update_model_display,
-                                         event.get("model", ""))
-                continue
+            try:
+                self._dispatch_agent_event(event)
+            except RuntimeError:
+                # the app stopped under us; nothing left to render
+                break
 
-            if isinstance(event, TurnStart):
-                self.call_from_thread(self.start_agent_turn, event.user_prompt,
-                                      event.session_id)
-            elif isinstance(event, MessageDelta):
-                self.call_from_thread(self.append_agent_text, event.content)
-            elif isinstance(event, ToolStart):
-                self.call_from_thread(self.start_tool, event.tool_call_id,
-                                      event.tool_name, event.arguments)
-            elif isinstance(event, ToolProgress):
-                self.call_from_thread(self.progress_tool, event.tool_call_id,
-                                      event.output_chunk)
-            elif isinstance(event, ToolEnd):
-                self.call_from_thread(self.end_tool, event.tool_call_id,
-                                      event.result, event.success,
-                                      event.duration_sec)
-            elif isinstance(event, ToolAsk):
-                self.call_from_thread(self.confirm_tool_ask, event.tool_name,
-                                      event.arguments, event.reason)
-            elif isinstance(event, TurnEnd):
-                self.call_from_thread(self.end_agent_turn,
-                                      event.prompt_tokens,
-                                      event.completion_tokens,
-                                      event.cost_usd,
-                                      event.unpriced_steps)
-            elif isinstance(event, StatusUpdate):
-                self.call_from_thread(self.handle_status_update,
-                                      event.message, event.is_busy)
-            elif isinstance(event, ErrorEvent):
-                self.call_from_thread(self.handle_error,
-                                      event.message, event.fatal)
+    def _dispatch_agent_event(self, event) -> None:
+        if isinstance(event, dict):
+            kind = event.get("type")
+            if kind == "clear":
+                self.call_from_thread(self.clear_transcript)
+            elif kind in ("init", "model_update"):
+                self.call_from_thread(self.update_model_display,
+                                     event.get("model", ""))
+            return
+
+        if isinstance(event, TurnStart):
+            self.call_from_thread(self.start_agent_turn, event.user_prompt,
+                                  event.session_id)
+        elif isinstance(event, MessageDelta):
+            self.call_from_thread(self.append_agent_text, event.content)
+        elif isinstance(event, ToolStart):
+            self.call_from_thread(self.start_tool, event.tool_call_id,
+                                  event.tool_name, event.arguments)
+        elif isinstance(event, ToolProgress):
+            self.call_from_thread(self.progress_tool, event.tool_call_id,
+                                  event.output_chunk)
+        elif isinstance(event, ToolEnd):
+            self.call_from_thread(self.end_tool, event.tool_call_id,
+                                  event.result, event.success,
+                                  event.duration_sec)
+        elif isinstance(event, ToolAsk):
+            self.call_from_thread(self.confirm_tool_ask, event.tool_name,
+                                  event.arguments, event.reason)
+        elif isinstance(event, TurnEnd):
+            self.call_from_thread(self.end_agent_turn,
+                                  event.prompt_tokens,
+                                  event.completion_tokens,
+                                  event.cost_usd,
+                                  event.unpriced_steps)
+        elif isinstance(event, StatusUpdate):
+            self.call_from_thread(self.handle_status_update,
+                                  event.message, event.is_busy)
+        elif isinstance(event, ErrorEvent):
+            self.call_from_thread(self.handle_error,
+                                  event.message, event.fatal)
 
     # ------------------------------------------------------------ transcript
     def clear_transcript(self) -> None:
