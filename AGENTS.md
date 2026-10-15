@@ -12,9 +12,14 @@ for every claim).
 
 ## This repo's role
 
-- `agent.py` (1267 lines) + `tui/` — the terminal agent that will be demoed
+- `agent.py` (~2.4k lines) + `tui/` — the terminal agent that is demoed
   **through** the Tamias proxy on port 8000.
-- `test_agent.py` (1105 lines).
+- `test_agent.py` (~3.2k lines) + `test_tui_features.py` (~600 lines) — the two
+  suites, run separately (one process hangs); see "Run it".
+- `brief.py` — the offline brief compiler (D13, `docs/BRIEF.md`).
+- `context_index.py` — the offline symbol/name/content index (D14,
+  `docs/CONTEXT-INDEX.md`).
+- `bench.py` — the cost-per-success benchmark harness (D17, `docs/BENCHMARK.md`).
 - Not part of the published `tamias` package. It is a **demo dependency**.
 
 ## Hard rules specific to this repo
@@ -25,7 +30,9 @@ for every claim).
 3. **Live rehearsal rule:** Tier B (live agent through the proxy) is shown only
    after **two consecutive passes**. Free models 429. If it fails twice, drop to
    the offline act and say so honestly — never claim a run you did not do.
-4. This repo has **no git remote**. Do not invent one. Do not push it.
+4. **Do not push.** The repo *does* have a remote (`github-https` →
+   github.com/kr1shnac/tamias-agent), but nothing has been pushed. Do not push,
+   retag or force anything without explicit instruction.
 
 ## Run it
 
