@@ -44,6 +44,60 @@ MANAGED_MODE_ENV = "TAMIAS_REQUIRE_PROXY"
 GATEWAY_TOKEN_PREFIX = "vk-"
 GATEWAY_POLICY_TIMEOUT = 5.0
 
+# --- ceilings: a company limit this run refuses to cross ---------------------
+# The gateway enforces the authoritative spend cap server-side; these are the
+# agent's own read of the same fence, checked before a call is sent so an
+# over-large prompt is never sent at all. Zero means "no ceiling".
+CEILING_ENV_TOKENS = "TAMIAS_MAX_PROMPT_TOKENS"
+CEILING_ENV_COST = "TAMIAS_MAX_TASK_COST_USD"
+CHARS_PER_TOKEN = 4  # deliberately conservative; over-counts code and JSON
+
+
+def _int_env(name):
+    try:
+        return max(0, int(os.environ.get(name, "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_env(name):
+    try:
+        return max(0.0, float(os.environ.get(name, "0")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+MAX_PROMPT_TOKENS = _int_env(CEILING_ENV_TOKENS)
+MAX_TASK_COST_USD = _float_env(CEILING_ENV_COST)
+
+
+def apply_ceilings(max_prompt_tokens=None, max_task_cost=None):
+    """Install this run's ceilings, from flags when given, else the environment."""
+    global MAX_PROMPT_TOKENS, MAX_TASK_COST_USD
+
+    MAX_PROMPT_TOKENS = (int(max_prompt_tokens) if max_prompt_tokens
+                         else _int_env(CEILING_ENV_TOKENS))
+    MAX_TASK_COST_USD = (float(max_task_cost) if max_task_cost
+                         else _float_env(CEILING_ENV_COST))
+
+
+def estimate_prompt_tokens(messages):
+    """A rough pre-flight size of a request, in tokens.
+
+    An estimate for a ceiling only - it is never reported as measured usage.
+    Four characters per token over-counts code and JSON, so the number errs
+    toward refusing a call rather than quietly overspending.
+    """
+    chars = 0
+
+    for message in messages:
+        chars += len(str(message.get("content") or ""))
+
+        for call in message.get("tool_calls") or []:
+            chars += len(str(call.get("function", {}).get("arguments", "")))
+
+    return chars // CHARS_PER_TOKEN
+
 # --- credit-saving model routing -------------------------------------------
 # TAMIAS exists to spend as few credits as possible, so most steps should run on
 # the cheapest model that can do the job and only genuinely hard steps deserve a
@@ -1562,6 +1616,22 @@ def parse_args(argv=None):
     )
 
     parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="refuse to send a step whose estimated prompt is larger than this "
+             "(also TAMIAS_MAX_PROMPT_TOKENS)"
+    )
+
+    parser.add_argument(
+        "--max-task-cost",
+        type=float,
+        default=None,
+        help="stop the task once provider-billed spend reaches this many USD "
+             "(also TAMIAS_MAX_TASK_COST_USD)"
+    )
+
+    parser.add_argument(
         "--tui",
         action="store_true",
         help="launch the Textual terminal UI instead of the plain REPL"
@@ -1914,6 +1984,24 @@ def run_turn(user_input, max_steps, stats, on_event=None):
                  unpriced_steps=stats.get("unpriced_steps", 0))
             return "cap"
 
+        if MAX_TASK_COST_USD and stats.get("cost_usd", 0.0) >= MAX_TASK_COST_USD:
+            # stop before the *next* call: the spend already happened, and a
+            # finished answer above was already delivered, so nothing is thrown
+            # away here - we just refuse to start another step
+            print_error(
+                "cost ceiling",
+                f"spent ${stats['cost_usd']:.4f}, at or past the "
+                f"${MAX_TASK_COST_USD:.4f} limit", style="yellow"
+            )
+            emit("status", message="cost ceiling reached", is_busy=False)
+            emit("turn_end",
+                 prompt_tokens=stats["prompt_tokens"],
+                 completion_tokens=stats["completion_tokens"],
+                 total_duration_sec=time.perf_counter() - turn_started,
+                 cost_usd=stats.get("cost_usd"),
+                 unpriced_steps=stats.get("unpriced_steps", 0))
+            return "spent"
+
         #fold the history before it costs more than the model can take
         if step and maybe_compact(client, stats):
             #the handover note is now the newest message, so a rollback has to
@@ -1935,12 +2023,31 @@ def run_turn(user_input, max_steps, stats, on_event=None):
 
         emit("status", message="thinking…", is_busy=True)
 
+        messages = [{"role": "system", "content": build_system_prompt()}] + list(history)
+        estimated = estimate_prompt_tokens(messages)
+
+        if MAX_PROMPT_TOKENS and estimated > MAX_PROMPT_TOKENS:
+            # pre-flight: refuse before the call is sent, not after it is billed
+            del history[checkpoint:]
+            print_error(
+                "prompt ceiling",
+                f"estimated {estimated} prompt tokens exceeds the ceiling "
+                f"{MAX_PROMPT_TOKENS}", style="yellow"
+            )
+            emit("status", message=f"prompt ceiling reached (~{estimated} tokens)",
+                 is_busy=False)
+            emit("turn_end",
+                 prompt_tokens=stats["prompt_tokens"],
+                 completion_tokens=stats["completion_tokens"],
+                 total_duration_sec=time.perf_counter() - turn_started,
+                 cost_usd=stats.get("cost_usd"),
+                 unpriced_steps=stats.get("unpriced_steps", 0))
+            return "ceiling"
+
         try:
             with console.status("[dim]thinking…[/dim]"):
                 response = call_model(
-                    messages=[
-                        {"role": "system", "content": build_system_prompt()}
-                    ] + history,
+                    messages=messages,
                     tools=TOOLS,
                     model=chosen_model
                 )
@@ -2076,7 +2183,7 @@ def run_task(task, max_steps, on_event=None):
         f"spent: {money}[/dim]"
     )
 
-    return 1 if outcome in ("error", "cap") else 0
+    return 1 if outcome in ("error", "cap", "ceiling", "spent") else 0
 
 
 #what can I type - the tool list comes straight from TOOLS so it never drifts
@@ -2096,6 +2203,8 @@ HELP = [
         ("--company-id ID", "bound work to company/work/{ID}/"),
         ("--policy FILE", "bound to a company use-case policy TOML"),
         ("--require-proxy", "managed mode: fetch the policy from the gateway"),
+        ("--max-prompt-tokens N", "refuse an over-large prompt before sending"),
+        ("--max-task-cost USD", "stop the task at a spend ceiling"),
         ("--task-id ID", "record the assigned task id"),
         ("--assignee NAME", "record who owns the task"),
     ]),
@@ -2207,6 +2316,8 @@ def main(argv=None):
     globals()['COMPANY_ID'] = args.company_id
     globals()['TASK_ID'] = args.task_id
     globals()['ASSIGNEE'] = args.assignee
+
+    apply_ceilings(args.max_prompt_tokens, args.max_task_cost)
 
     # Two ways to bound a run. A local policy file is the developer path. In
     # managed mode the policy comes from the company gateway and *only* from

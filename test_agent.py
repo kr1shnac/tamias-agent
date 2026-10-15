@@ -2732,6 +2732,103 @@ def test_the_compaction_call_is_metered():
     assert stats["completion_tokens"] == 50
 
 
+# ---------- A12: pre-flight token ceiling + running cost ceiling ----------
+
+
+def test_estimate_prompt_tokens_counts_content_and_tool_arguments():
+    assert agent.estimate_prompt_tokens(
+        [{"role": "user", "content": "x" * 40}]) == 10
+    assert agent.estimate_prompt_tokens(
+        [{"role": "assistant", "content": "",
+          "tool_calls": [{"function": {"arguments": "y" * 40}}]}]) == 10
+    assert agent.estimate_prompt_tokens([]) == 0
+
+
+def test_ceilings_read_the_environment_then_flags():
+    with mock.patch.dict(os.environ, {"TAMIAS_MAX_PROMPT_TOKENS": "500",
+                                      "TAMIAS_MAX_TASK_COST_USD": "0.5"}):
+        agent.apply_ceilings()
+        assert agent.MAX_PROMPT_TOKENS == 500
+        assert agent.MAX_TASK_COST_USD == 0.5
+
+        agent.apply_ceilings(123, 1.25)
+        assert agent.MAX_PROMPT_TOKENS == 123
+        assert agent.MAX_TASK_COST_USD == 1.25
+
+    agent.apply_ceilings(0, 0)  # back to "no ceiling" for the rest of the run
+
+
+def test_prompt_ceiling_refuses_before_the_call_is_sent():
+    client = FakeClient([response("should never be called")])
+    reset(client)
+    agent.history.append({"role": "user", "content": "x" * 4000})
+
+    saved = agent.MAX_PROMPT_TOKENS
+    agent.MAX_PROMPT_TOKENS = 100
+    try:
+        outcome = agent.run_turn("do a thing", 25, agent.new_stats())
+    finally:
+        agent.MAX_PROMPT_TOKENS = saved
+
+    assert outcome == "ceiling"
+    assert client.calls == []       # nothing was billed
+    # the turn is rolled back exactly like the step cap; what was there before
+    # the turn is kept
+    assert len(agent.history) == 1
+    assert "do a thing" not in agent.history[0]["content"]
+
+
+def test_cost_ceiling_stops_before_the_next_step():
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 cost=0.05),
+        response("unreached"),
+    ])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        outcome = agent.run_turn("look around", 25, agent.new_stats())
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+    assert outcome == "spent"
+    assert len(client.calls) == 1   # the second call was refused
+
+
+def test_a_finished_answer_is_still_delivered_at_the_ceiling():
+    # the ceiling stops the next call; an answer already produced is not lost
+    client = FakeClient([response("here is your answer", cost=0.99)])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        outcome = agent.run_turn("quick one", 25, agent.new_stats())
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+    assert outcome == "done"
+    assert any("here is your answer" in line for line in PRINTED)
+
+
+def test_run_task_exits_nonzero_when_a_ceiling_trips():
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 cost=0.05),
+        response("unreached"),
+    ])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        assert agent.run_task("do it", 25) == 1
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+
 def _run_all():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]
