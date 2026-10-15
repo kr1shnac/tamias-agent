@@ -24,6 +24,8 @@ from rich.align import Align
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from brief import compile_brief, format_brief, retrieve_citations
+
 console = Console()
 
 load_dotenv()
@@ -43,6 +45,11 @@ EFFORT_POLICY = os.environ.get("AGENT_EFFORT_POLICY", "auto")
 MANAGED_MODE_ENV = "TAMIAS_REQUIRE_PROXY"
 GATEWAY_TOKEN_PREFIX = "vk-"
 GATEWAY_POLICY_TIMEOUT = 5.0
+
+# --- brief compiler (D13) ----------------------------------------------------
+# Off by default: turning a terse ask into an elaborated brief changes what the
+# model is shown, so it is opt-in until the benchmark says it helps.
+BRIEF_ENV = "AGENT_BRIEF"
 
 # --- ceilings: a company limit this run refuses to cross ---------------------
 # The gateway enforces the authoritative spend cap server-side; these are the
@@ -1632,6 +1639,13 @@ def parse_args(argv=None):
     )
 
     parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="compile a terse task into an elaborated, assumption-listing brief "
+             "before it runs (also AGENT_BRIEF=1)"
+    )
+
+    parser.add_argument(
         "--tui",
         action="store_true",
         help="launch the Textual terminal UI instead of the plain REPL"
@@ -2366,6 +2380,17 @@ def main(argv=None):
         assignment = assignment_line()  # name the assignment before any work
         if assignment:
             console.print(f"[dim]{assignment}[/dim]")
+
+        # The brief compiler (D13) runs only down the --task path: it changes
+        # what the model is shown, so it is opt-in and its assumptions are shown
+        # to the operator before any credits are spent.
+        if args.brief or _env_truthy(BRIEF_ENV):
+            compiled = compile_brief(args.task, citations=retrieve_citations(args.task))
+            console.print(Panel(Text(format_brief(compiled), style="dim"),
+                                title=Text("brief", style="bold cyan"),
+                                border_style="cyan"))
+            args.task = compiled.elaborated
+
         return run_task(args.task, args.max_steps)
 
     # The designed frontend is the Textual TUI. It is the default on an

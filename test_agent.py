@@ -148,6 +148,7 @@ def _install_stubs():
 _install_stubs()
 
 import agent  # noqa: E402  (import after the stubs are in place)
+import brief  # noqa: E402  (pure module: os/re/dataclasses only)
 
 
 # ---------- fakes ----------
@@ -2827,6 +2828,93 @@ def test_run_task_exits_nonzero_when_a_ceiling_trips():
         assert agent.run_task("do it", 25) == 1
     finally:
         agent.MAX_TASK_COST_USD = saved
+
+
+# ---------- D13: the brief compiler ----------
+
+def test_a_terse_brief_is_high_ambiguity_with_assumptions():
+    compiled = brief.compile_brief("fix it")
+
+    assert compiled.risk_band == "high"
+    assert compiled.needs_clarification is True
+    assert compiled.assumptions                      # it states what it assumes
+    assert compiled.questions                        # and what only the user knows
+    assert "fix it" in compiled.elaborated           # the verbatim ask survives
+
+
+def test_a_specific_brief_is_low_ambiguity():
+    compiled = brief.compile_brief(
+        "add a --json flag to agent.py so a run prints a summary; "
+        "run pytest test_agent.py to verify"
+    )
+
+    assert compiled.ambiguity_score == 0.0
+    assert compiled.risk_band == "low"
+    assert compiled.needs_clarification is False
+    assert compiled.assumptions == []                # nothing to assume
+
+
+def test_the_compiler_never_invents_a_citation():
+    compiled = brief.compile_brief("rewrite everything")
+
+    assert compiled.citations == []
+    assert "none retrieved yet" in compiled.elaborated
+
+
+def test_the_compiler_keeps_caller_citations():
+    compiled = brief.compile_brief("fix agent.py", citations=["agent.py:10", ""])
+
+    assert compiled.citations == ["agent.py:10"]     # blank dropped, real kept
+    assert "agent.py:10" in compiled.elaborated
+
+
+def test_a_high_ambiguity_brief_prints_its_open_questions():
+    rendered = brief.format_brief(brief.compile_brief("clean this up"))
+
+    assert "OPEN QUESTIONS" in rendered
+    assert "risk high" in rendered
+
+
+def test_key_terms_skips_stopwords_and_short_words():
+    terms = brief.key_terms("fix the select_model escalation in agent.py")
+
+    assert "select_model" in terms
+    assert "the" not in terms
+    assert "fix" not in terms          # a stopword: too common to cite
+    assert terms[0] == "select_model"  # most specific first
+
+
+def test_retrieve_citations_finds_a_real_file_and_line():
+    with tempfile.TemporaryDirectory() as root:
+        with open(os.path.join(root, "widget_router.py"), "w") as handle:
+            handle.write("def resolve_widget_router():\n    return 1\n")
+        with open(os.path.join(root, "notes.md"), "w") as handle:
+            handle.write("the widget_router is documented here\n")
+
+        found = brief.retrieve_citations("resolve the widget_router problem",
+                                         root=root)
+
+    assert "widget_router.py" in found               # a name match
+    assert any("widget_router" in hit for hit in found)
+
+
+def test_retrieve_citations_cites_nothing_when_nothing_matches():
+    with tempfile.TemporaryDirectory() as root:
+        with open(os.path.join(root, "a.py"), "w") as handle:
+            handle.write("print('nothing to see')\n")
+
+        assert brief.retrieve_citations("zzzzz qqqqq wvvvv", root=root) == []
+
+
+def test_retrieve_citations_skips_vcs_and_cache_dirs():
+    with tempfile.TemporaryDirectory() as root:
+        for skipped in (".git", "__pycache__", ".venv"):
+            folder = os.path.join(root, skipped)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "needle_target.py"), "w") as handle:
+                handle.write("needle_target\n")
+
+        assert brief.retrieve_citations("needle_target", root=root) == []
 
 
 def _run_all():
