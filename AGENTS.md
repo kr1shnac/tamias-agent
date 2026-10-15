@@ -14,8 +14,8 @@ for every claim).
 
 - `agent.py` (~2.4k lines) + `tui/` — the terminal agent that is demoed
   **through** the Tamias proxy on port 8000.
-- `test_agent.py` (~3.2k lines) + `test_tui_features.py` (~600 lines) — the two
-  suites, run separately (one process hangs); see "Run it".
+- `test_agent.py` (~3.2k lines) + `test_tui_features.py` (~700 lines) — the two
+  suites; see "Run it".
 - `brief.py` — the offline brief compiler (D13, `docs/BRIEF.md`).
 - `context_index.py` — the offline symbol/name/content index (D14,
   `docs/CONTEXT-INDEX.md`).
@@ -38,6 +38,10 @@ for every claim).
 
 ```bash
 cd /home/krish/Desktop/tamias-agent
-.venv/bin/python -m pytest test_agent.py -q        # suite
-.venv/bin/python agent.py --task "..."             # non-interactive
+.venv/bin/python -m pytest test_agent.py test_tui_features.py -q   # 239 tests
+.venv/bin/python agent.py --task "..."                             # non-interactive
 ```
+
+Both files can run in one pytest process. `test_agent.py` fakes `rich` for the
+offline core tests; `test_tui_features.py` needs the real `rich` for Textual, and
+its `_real_rich` fixture drops the fakes so the two can share a process.
