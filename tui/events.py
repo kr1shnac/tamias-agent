@@ -51,6 +51,17 @@ class ToolEnd(TUIEvent):
     duration_sec: float
 
 @dataclass
+class ToolAsk(TUIEvent):
+    """Emitted when a tool call needs a human yes/no before it can run.
+
+    The agent worker is blocked until the view answers; with no view (or a
+    timeout) the answer is no, so an ask only ever fails closed.
+    """
+    tool_name: str
+    arguments: str   # JSON string of arguments
+    reason: str
+
+@dataclass
 class TurnEnd(TUIEvent):
     """Emitted when the agent finishes its response loop."""
     prompt_tokens: int

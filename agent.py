@@ -1056,6 +1056,7 @@ class PolicyProfile:
     allow_write: list = field(default_factory=list)  # glob scope for writes
     deny_read: list = field(default_factory=list)    # glob scope for reads
     model_allow: list = field(default_factory=list)  # empty = any model
+    tool_ask: list = field(default_factory=list)     # empty = nothing asks
     audit_path: str = ""                             # JSONL audit trail
 
 
@@ -1079,6 +1080,17 @@ def policy_from_dict(data, source):
     if not isinstance(use_case, dict):
         use_case = {}
 
+    # a malformed table must not crash the loader; the profile's own validation
+    # (and the missing name) still stops a broken policy loudly
+    if not isinstance(tools, dict):
+        tools = {}
+
+    if not isinstance(shell, dict):
+        shell = {}
+
+    if not isinstance(paths, dict):
+        paths = {}
+
     # accept both the documented `models = [...]` list and a `[models] allow`
     # table; anything else means "no model allowlist", never a silent fence
     if isinstance(models, dict):
@@ -1099,6 +1111,7 @@ def policy_from_dict(data, source):
         allow_write=[str(g) for g in paths.get("allow_write", [])],
         deny_read=[str(g) for g in paths.get("deny_read", [])],
         model_allow=[str(m) for m in model_allow],
+        tool_ask=[str(t) for t in tools.get("ask", [])],
         audit_path=str(data.get("audit", {}).get("path", "")),
     )
 
@@ -1295,6 +1308,31 @@ def policy_check(tool_name, args):
     return None
 
 
+def policy_ask(tool_name, args):
+    """An ask-reason when the policy wants a human to confirm, else None.
+
+    Deny always wins: this is only consulted after :func:`policy_check` has
+    cleared the call, so an ask-listed tool that is also hard-denied stays
+    denied. A call that asks is neither allowed nor refused until someone
+    answers - and with no one to ask, the answer is no (see :data:`ASK_HANDLER`).
+    """
+    policy = _ACTIVE_POLICY
+    if policy is None or not policy.tool_ask:
+        return None
+
+    if tool_name in policy.tool_ask:
+        return (f"tool '{tool_name}' is ask-gated for use case "
+                f"'{policy.name}'")
+
+    return None
+
+
+#how an ask is answered. None (the default, and every headless run) means no one
+#can confirm, so an ask-gated call is denied - fail closed, never fail open. The
+#interactive TUI sets this to a callable(tool_name, args, reason) -> bool.
+ASK_HANDLER = None
+
+
 def policy_audit(tool_name, args, decision, reason):
     """Record the gate decision; append JSONL when the policy asks for a trail."""
     policy = _ACTIVE_POLICY
@@ -1305,7 +1343,7 @@ def policy_audit(tool_name, args, decision, reason):
         "ts": time.time(),
         "use_case": policy.name,
         "tool": tool_name,
-        "decision": decision,  # "allow" | "deny"
+        "decision": decision,  # "allow" | "deny" | "ask-allowed" | "ask-denied"
         "reason": reason or "",
         "args": {k: v for k, v in args.items()},
     }
@@ -1320,18 +1358,38 @@ def policy_audit(tool_name, args, decision, reason):
             pass
 
 
-def _policy_blocked(tool_name, args):
-    """Gate used by the dispatcher: returns the deny string or None."""
-    reason = policy_check(tool_name, args)
-    policy_audit(tool_name, args, "deny" if reason else "allow", reason)
-    return reason
+def _policy_gate(tool_name, args):
+    """Gate used by the dispatcher: returns ``(block_reason, ask_reason)``.
+
+    Deny wins over ask: a hard-denied call never reaches the ask path. A call
+    that is neither denied nor ask-gated is audited ``allow`` here, once.
+    """
+    blocked = policy_check(tool_name, args)
+
+    if blocked:
+        policy_audit(tool_name, args, "deny", blocked)
+        return blocked, None
+
+    ask = policy_ask(tool_name, args)
+    if not ask:
+        policy_audit(tool_name, args, "allow", None)
+
+    return None, ask
 
 
 def dispatch_tool(tool_name, args):
     #the policy gate sits in front of every tool, before any action runs
-    blocked = _policy_blocked(tool_name, args)
+    blocked, ask = _policy_gate(tool_name, args)
     if blocked:
         return blocked
+
+    if ask:
+        # fail closed: with no one to ask, the answer is no
+        allowed = bool(ASK_HANDLER(tool_name, args, ask)) if ASK_HANDLER else False
+        policy_audit(tool_name, args,
+                     "ask-allowed" if allowed else "ask-denied", ask)
+        if not allowed:
+            return f"Error: policy ask denied - {ask}"
 
     if tool_name == "run_shell":
         return run_shell(args["command"])

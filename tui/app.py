@@ -13,7 +13,7 @@ from rich.markdown import Markdown as RichMarkdown
 
 from tui.branding import Hero
 from tui.events import (
-    TurnStart, MessageDelta, ToolStart, ToolProgress, ToolEnd, TurnEnd,
+    TurnStart, MessageDelta, ToolStart, ToolProgress, ToolEnd, ToolAsk, TurnEnd,
     StatusUpdate, ErrorEvent,
 )
 from tui.credits import CreditsLedger
@@ -285,11 +285,12 @@ class TAMIASApp(App):
 
     def __init__(self, ui_queue: queue.Queue, agent_queue: queue.Queue,
                  company_id: str | None = None, task_id: str | None = None,
-                 assignee: str | None = None):
+                 assignee: str | None = None, ask_gate=None):
         super().__init__()
         self.ui_queue = ui_queue
         self.agent_queue = agent_queue
         self.company_id = company_id
+        self.ask_gate = ask_gate
         self.current_agent_turn = None
         self.current_agent_text = ""
         self.active_tools: dict[str, ToolCard] = {}
@@ -649,6 +650,29 @@ class TAMIASApp(App):
             self._on_complete_confirmed,
         )
 
+    def confirm_tool_ask(self, tool_name: str, arguments: str,
+                         reason: str) -> None:
+        """Ask the human to allow a policy ask-gated tool call, once.
+
+        The agent worker is blocked on the gate while this modal is up; the
+        dismiss callback releases it. With no gate attached (or on cancel) the
+        answer is no, so the call is denied, never silently run.
+        """
+        def answered(allowed: bool | None) -> None:
+            if self.ask_gate is not None:
+                self.ask_gate.resolve(bool(allowed))
+            self.show_system(
+                f"{tool_name}: {'allowed once' if allowed else 'denied'}")
+
+        self.push_screen(
+            ConfirmModal(
+                f"Allow tool '{tool_name}'?",
+                f"{reason}\n{arguments}\n"
+                "Yes runs it once; No (or esc) refuses this call.",
+            ),
+            answered,
+        )
+
     def _on_complete_confirmed(self, confirmed: bool) -> None:
         if not confirmed:
             self.show_system("Task continues.")
@@ -770,6 +794,9 @@ class TAMIASApp(App):
                 self.call_from_thread(self.end_tool, event.tool_call_id,
                                       event.result, event.success,
                                       event.duration_sec)
+            elif isinstance(event, ToolAsk):
+                self.call_from_thread(self.confirm_tool_ask, event.tool_name,
+                                      event.arguments, event.reason)
             elif isinstance(event, TurnEnd):
                 self.call_from_thread(self.end_agent_turn,
                                       event.prompt_tokens,

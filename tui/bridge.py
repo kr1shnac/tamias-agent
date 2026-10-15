@@ -18,6 +18,7 @@ No Textual import happens at module load, so this module stays cheap to import
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import threading
@@ -27,6 +28,7 @@ import agent as core
 from tui.events import (
     MessageDelta,
     StatusUpdate,
+    ToolAsk,
     ToolEnd,
     ToolStart,
     TurnEnd,
@@ -35,6 +37,40 @@ from tui.events import (
 
 # commands the view may forward that the bridge answers itself, never the model
 COMMANDS = ("/clear", "/compact", "/help", "/quit")
+
+
+class AskGate:
+    """A one-at-a-time yes/no bridge from the agent worker to the view.
+
+    The worker thread blocks in :meth:`ask` until the view calls
+    :meth:`resolve` (or the timeout fires). With no answer the result is
+    ``False``: an ask can never wedge a run open, it only ever fails closed.
+    """
+
+    TIMEOUT_SEC = 300.0
+
+    def __init__(self, agent_queue):
+        self.agent_queue = agent_queue
+        self._event = threading.Event()
+        self._answer = False
+
+    def ask(self, tool_name, args, reason):
+        """Called from the agent worker thread; blocks for the view's answer."""
+        self._answer = False
+        self._event.clear()
+        self.agent_queue.put(ToolAsk(
+            tool_name=tool_name,
+            arguments=json.dumps(args, default=str),
+            reason=reason,
+        ))
+
+        answered = self._event.wait(timeout=self.TIMEOUT_SEC)
+        return bool(answered and self._answer)
+
+    def resolve(self, allowed):
+        """Called from the view thread with the human's answer."""
+        self._answer = bool(allowed)
+        self._event.set()
 
 
 def make_translator(agent_queue, session_id):
@@ -101,7 +137,8 @@ def _silence_console():
     core.console = Console(file=_NULL_STREAM, force_terminal=False)
 
 
-def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None):
+def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None,
+                 ask_gate=None):
     """Consume user turns from ``ui_queue`` and drive the agent core.
 
     Emits ``tui.events`` onto ``agent_queue``. Runs until it sees ``None``
@@ -110,6 +147,11 @@ def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None):
     if company_id:
         core.COMPANY_ID = company_id
     _silence_console()
+
+    # ask-gated policy calls block on the gate; with no gate the core keeps its
+    # own default (no one to ask), which denies fail-closed
+    if ask_gate is not None:
+        core.ASK_HANDLER = ask_gate.ask
 
     session_id = uuid.uuid4().hex[:12]
     emit = make_translator(agent_queue, session_id)
@@ -181,17 +223,19 @@ def run_tui(max_steps=25, company_id=None, task_id=None, assignee=None):
 
     ui_queue = queue.Queue()
     agent_queue = queue.Queue()
+    ask_gate = AskGate(agent_queue)
 
     worker = threading.Thread(
         target=agent_worker,
-        args=(ui_queue, agent_queue, max_steps, company_id),
+        args=(ui_queue, agent_queue, max_steps, company_id, ask_gate),
         daemon=True,
     )
     worker.start()
 
     try:
         TAMIASApp(ui_queue, agent_queue, company_id=company_id,
-                  task_id=task_id, assignee=assignee).run()
+                  task_id=task_id, assignee=assignee,
+                  ask_gate=ask_gate).run()
     finally:
         ui_queue.put(None)          # stop the worker once the view is gone
         worker.join(timeout=2)

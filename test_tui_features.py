@@ -590,3 +590,93 @@ def test_main_plain_flag_keeps_the_text_repl(monkeypatch):
 
     assert agent.main(["--plain"]) == 0
     assert "tui" not in opened
+
+
+# ------------------------------------- policy ask escalation (policy item 5)
+
+
+def test_ask_gate_blocks_the_worker_until_the_view_answers():
+    import threading
+
+    from tui.bridge import AskGate
+
+    agent_queue = queue.Queue()
+    gate = AskGate(agent_queue)
+    outcome = {}
+
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault(
+            "allowed", gate.ask("write_file", {"file_path": "x"}, "ask-gated")))
+    worker.start()
+
+    request = agent_queue.get(timeout=2)      # the view sees the request
+    assert request.tool_name == "write_file"
+    assert "ask-gated" in request.reason
+    assert "file_path" in request.arguments
+
+    gate.resolve(True)                        # the human says yes
+    worker.join(timeout=2)
+    assert outcome["allowed"] is True
+
+
+def test_ask_gate_fails_closed_when_nobody_answers():
+    from tui.bridge import AskGate
+
+    gate = AskGate(queue.Queue())
+    original = AskGate.TIMEOUT_SEC
+    AskGate.TIMEOUT_SEC = 0.05
+
+    try:
+        assert gate.ask("write_file", {}, "ask-gated") is False
+    finally:
+        AskGate.TIMEOUT_SEC = original
+
+
+def test_the_app_confirms_an_ask_gated_call_through_a_modal():
+    from tui.app import TAMIASApp
+    from tui.modals import ConfirmModal
+
+    class FakeGate:
+        def __init__(self):
+            self.answers = []
+
+        def resolve(self, allowed):
+            self.answers.append(bool(allowed))
+
+    async def drive():
+        gate = FakeGate()
+        app = TAMIASApp(queue.Queue(), queue.Queue(), ask_gate=gate)
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.confirm_tool_ask("write_file", '{"file_path": "x"}', "ask-gated")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("y")
+            await pilot.pause()
+            assert gate.answers == [True]
+
+    _run(drive())
+
+
+def test_the_app_confirms_an_ask_gated_call_can_be_refused():
+    from tui.app import TAMIASApp
+    from tui.modals import ConfirmModal
+
+    class FakeGate:
+        def __init__(self):
+            self.answers = []
+
+        def resolve(self, allowed):
+            self.answers.append(bool(allowed))
+
+    async def drive():
+        gate = FakeGate()
+        app = TAMIASApp(queue.Queue(), queue.Queue(), ask_gate=gate)
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.confirm_tool_ask("write_file", '{"file_path": "x"}', "ask-gated")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("n")
+            await pilot.pause()
+            assert gate.answers == [False]
+
+    _run(drive())

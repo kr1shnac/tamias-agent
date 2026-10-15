@@ -89,6 +89,7 @@ models      = ["nvidia/nemotron-3.5-lightning:free"]
 [tools]                                # allowlist: absent = tool disabled
 allow = ["read_file", "search_in_files", "edit_file", "write_file", "run_shell", "update_plan"]
 deny  = ["run_shell"]                  # policy wins over allow (hard deny)
+ask   = ["write_file"]                 # needs a human yes/no (headless = no)
 
 [run_shell]                            # command-family scope (pattern rules)
 allow = ["git status", "git diff", "git add", "python3 -m pytest", "grep "]
@@ -161,9 +162,14 @@ Implemented in `agent.py` (2026-10-13, committed):
    `refuse_secret`.
 4. ✅ **Read-only mode** — when `read_only = true`, every write/edit/create and
    the shell return the policy error. One flag, high value (plan-agent).
-5. ⏳ **Escalation (ask)** — when a call matches neither allow nor hard deny,
-   emit an `ask` event to the UI bridge; interactive run shows a confirm,
-   headless run denies. *(not yet built)*
+5. ✅ **Escalation (ask)** — a policy `[tools] ask = [...]` list names calls that
+   need a human yes/no rather than a blanket allow or deny. Deny still wins: an
+   ask-listed call that is also denied stays denied. When a call asks, the
+   dispatcher emits a `ToolAsk` event; the interactive TUI shows a confirm
+   (`tui.bridge.AskGate` blocks the worker until the human answers), and a
+   **headless run denies** — with no one to ask, the answer is no (`ASK_HANDLER`
+   unset → fail closed). Every outcome is audited as `ask-allowed` /
+   `ask-denied`.
 6. ✅ **Audit trail** — every gate decision (allowed / denied) appended to
    `POLICY_AUDIT`; a `[audit] path =` JSONL writer is wired in `policy_audit`.
    Each row: `ts, use_case, tool, decision, reason, args` — the SIEM-ready
@@ -194,18 +200,19 @@ Implemented in `agent.py` (2026-10-13, committed):
 
 ## 5. Suggested build order (all offline-testable)
 
-Status as of 2026-10-13: steps 1–4 and the in-memory audit half of 5 are **done
-and committed** (`f76489a` + policy commit). The `--policy FILE` flag (and
-`TAMIAS_POLICY`) loads a profile in `main()`; the gate runs inside
-`dispatch_tool`, so every path into every tool passes it.
+Status as of 2026-10-15: steps 1–8 are **done and committed**. The
+`--policy FILE` flag (and `TAMIAS_POLICY`) loads a profile in `main()`; the gate
+runs inside `dispatch_tool`, so every path into every tool passes it. Step 5's
+`ask` escalation (below) closed the last open item.
 
 1. ✅ `PolicyProfile` dataclass + TOML loader (`tui`-free, pure `agent.py`).
 2. ✅ Dispatch gate: tool allow / hard deny + `read_only` flag (first tests).
 3. ✅ `run_shell` command-family allow/deny patterns.
 4. ✅ Filesystem glob scope (`allow_write` / `deny_read`) beside `refuse_secret`.
-5. ⏳ `ask` escalation event + JSONL audit trail — the *in-memory* gate audit
-   (`POLICY_AUDIT`) is done; the `[audit] path =` JSONL writer is implemented in
-   `policy_audit`; wiring `ask` to the interactive UI is open.
+5. ✅ `ask` escalation + JSONL audit trail — the *in-memory* gate audit
+   (`POLICY_AUDIT`) and the `[audit] path =` JSONL writer are done, and the
+   `[tools] ask` list now escalates a call to the interactive confirm (headless
+   denies, fail-closed).
 6. ✅ Policy-file self-protection test (agent cannot read/edit its own policy).
 7. Demo: `--company-id acme` + a policy whose `deny` blocks `rm`/`curl` — show a
    command getting refused *and* the audit row being written.

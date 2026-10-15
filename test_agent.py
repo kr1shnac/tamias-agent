@@ -2290,6 +2290,165 @@ def test_policy_inactive_by_default_passes_everything_through():
     assert agent.POLICY_AUDIT == []
 
 
+# ---------- ask escalation (policy item 5) ----------
+
+@contextlib.contextmanager
+def _with_ask_handler(handler):
+    """Set agent.ASK_HANDLER for the duration, restoring whatever was there."""
+    saved = agent.ASK_HANDLER
+    agent.ASK_HANDLER = handler
+
+    try:
+        yield
+    finally:
+        agent.ASK_HANDLER = saved
+
+
+def _ask_profile():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "careful"
+
+        [tools]
+        allow = ["read_file", "write_file"]
+        ask = ["write_file"]
+        """
+    )
+    assert err is None
+    return profile
+
+
+def test_policy_parses_the_ask_list():
+    profile = _ask_profile()
+
+    assert profile.tool_ask == ["write_file"]
+
+
+def test_policy_ask_fires_only_for_an_unblocked_ask_gated_tool():
+    profile = _ask_profile()
+
+    with _with_policy(profile):
+        assert agent.policy_ask("write_file", {"file_path": "x"}) is not None
+        assert agent.policy_ask("read_file", {"file_path": "x"}) is None
+
+
+def test_a_headless_ask_is_denied_fail_closed():
+    # no ASK_HANDLER: no one can confirm, so the call must not run
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(None), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert out.startswith("Error: policy ask denied")
+    assert audit[-1]["decision"] == "ask-denied"
+    assert written is False
+
+
+def test_an_ask_answered_yes_runs_and_is_audited():
+    profile = _ask_profile()
+    seen = []
+
+    def handler(tool_name, args, reason):
+        seen.append((tool_name, reason))
+        return True
+
+    with _with_policy(profile), _with_ask_handler(handler), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert "written completely" in out
+    assert written is True
+    assert seen and seen[0][0] == "write_file"
+    assert audit[-1]["decision"] == "ask-allowed"
+
+
+def test_an_ask_answered_no_is_denied_and_not_run():
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(lambda *a: False), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert out.startswith("Error: policy ask denied")
+    assert audit[-1]["decision"] == "ask-denied"
+    assert written is False
+
+
+def test_a_hard_deny_beats_an_ask():
+    # deny wins: an ask-gated call that is also denied never reaches the handler
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "both"
+
+        [tools]
+        deny = ["write_file"]
+        ask = ["write_file"]
+        """
+    )
+    assert err is None
+
+    def handler(*args):
+        raise AssertionError("a denied call must never be asked")
+
+    with _with_policy(profile), _with_ask_handler(handler), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "hard-denied" in out
+
+
+def test_an_ask_gated_call_is_not_audited_as_a_plain_allow():
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(lambda *a: True):
+        agent.dispatch_tool("read_file", {"file_path": "a.txt"})
+        agent.dispatch_tool("write_file", {"file_path": "b.txt", "content": "x"})
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    # the read is a plain allow; the ask-gated write is not
+    assert decisions == ["allow", "ask-allowed"]
+
+
+def test_policy_from_dict_parses_a_tools_ask_list():
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"},
+         "tools": {"ask": ["run_shell"]}},
+        "x",
+    )
+
+    assert err is None
+    assert profile.tool_ask == ["run_shell"]
+
+
+def test_policy_from_dict_survives_a_malformed_tools_table():
+    # tools written as a list must not crash the loader
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"}, "tools": ["read_file"]}, "x"
+    )
+
+    assert err is None
+    assert profile.tool_allow == []
+    assert profile.tool_ask == []
+
+
 def test_main_loads_policy_flag_before_running():
     profile_toml = """
         [use_case]
