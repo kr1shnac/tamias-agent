@@ -1,6 +1,7 @@
 import os
 import queue
 import re
+import sys
 import json
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -512,11 +513,28 @@ class TAMIASApp(App):
         menu = self.query_one("#slash-menu", SlashMenu)
         text = value.lstrip()
         if text.startswith("/model "):
-            menu.show_models(text[len("/model "):])
+            menu.show_models(text[len("/model "):], allowed=self._model_allowlist())
         elif text.startswith("/") and " " not in text:
             menu.show_commands(text)
         else:
             menu.close()
+
+    def _model_allowlist(self):
+        """The active policy's model allowlist, when the core is loaded.
+
+        The core (agent.py) is imported by the worker thread, not the UI, so a
+        missing module simply means "no policy yet" and the menu is unfiltered;
+        the worker still refuses an out-of-policy /model, so the fence holds.
+        """
+        core = sys.modules.get("agent")
+
+        if core is None:
+            return []
+
+        try:
+            return core.allowed_models()
+        except Exception:
+            return []
 
     def _close_slash(self) -> None:
         self.query_one("#slash-menu", SlashMenu).close()
@@ -562,13 +580,21 @@ class TAMIASApp(App):
     def _open_model_picker(self) -> None:
         self._close_slash()
         from tui.model_picker import ModelPicker
-        self.push_screen(ModelPicker(), self._on_model_picked)
+        self.push_screen(ModelPicker(allowed=self._model_allowlist()),
+                         self._on_model_picked)
 
     def _on_model_picked(self, selected_model: str) -> None:
         if selected_model:
             self._choose_model(selected_model)
 
     def _choose_model(self, model_id: str) -> None:
+        allowed = self._model_allowlist()
+
+        if allowed and model_id.strip() not in allowed:
+            self.show_system(
+                f"model `{model_id}` is outside this policy's model allowlist")
+            return
+
         self.current_model = model_id
         self.ui_queue.put(f"/model {model_id}")
         self.query_one("#model-display").update(self._model_chip())
@@ -667,10 +693,20 @@ class TAMIASApp(App):
             self.show_system(f"could not write task report: {error}")
 
     def action_cycle_model(self) -> None:
-        names = [name for name, _ in MODEL_TIERS]
+        allowed = self._model_allowlist()
+        tiers = [(name, model) for name, model in MODEL_TIERS
+                 if not allowed or model in allowed]
+
+        if not tiers:
+            self.show_system("no tier model is in this policy's model allowlist")
+            return
+
+        names = [name for name, _ in tiers]
         current = self._tier_of(self.current_model) or "free"
+        if current not in names:
+            current = names[0]
         nxt = names[(names.index(current) + 1) % len(names)]
-        self._choose_model(dict(MODEL_TIERS)[nxt])
+        self._choose_model(dict(tiers)[nxt])
 
     def action_help(self) -> None:
         self._close_slash()

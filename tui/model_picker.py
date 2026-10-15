@@ -29,9 +29,40 @@ MODELS = [
     ("Llama 3 70B", "meta-llama/llama-3-70b-instruct"),
 ]
 
+
+def is_free(model_id):
+    """A `:free` variant bills $0.00; anything else is billed at real rates."""
+    return str(model_id).endswith(":free")
+
+
+def cost_label(model_id):
+    """A short price marker so the choice is never a blind one."""
+    return "free" if is_free(model_id) else "paid"
+
+
+def listed_models(allowed=None):
+    """The catalogue entries a picker may offer.
+
+    ``allowed`` is the active policy's model allowlist; an empty or absent list
+    means every entry is offered. A policy that names models narrows the menu to
+    exactly those, so a company can fence routing the way it fences tools.
+    """
+    entries = list(MODELS)
+
+    if allowed:
+        allowed = {m.strip() for m in allowed}
+        entries = [(name, model) for name, model in entries if model in allowed]
+
+    return entries
+
+
 class ModelPicker(ModalScreen[str]):
     BINDINGS = [("escape", "dismiss_modal", "Cancel")]
-    
+
+    def __init__(self, allowed=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.allowed = allowed
+
     CSS = """
     ModelPicker {
         align: center middle;
@@ -61,14 +92,18 @@ class ModelPicker(ModalScreen[str]):
     """
     
     def compose(self) -> ComposeResult:
+        self.entries = listed_models(self.allowed)
+
         with Vertical(id="picker-dialog"):
             yield Static("Select an LLM Model", id="picker-title")
-            options = [name for name, _ in MODELS]
+            options = [
+                f"{name} · {cost_label(model)}" for name, model in self.entries
+            ]
             yield OptionList(*options, id="model-list")
             
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         index = event.option_index
-        model_id = MODELS[index][1]
+        model_id = self.entries[index][1]
         self.dismiss(model_id)
 
     def action_dismiss_modal(self) -> None:

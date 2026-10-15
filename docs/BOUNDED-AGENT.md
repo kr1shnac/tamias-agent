@@ -174,6 +174,12 @@ Implemented in `agent.py` (2026-10-13, committed):
    protect the policy file that bounds the run. Pinned by a test.
 8. ✅ **Managed mode** (`--require-proxy`) — the policy is fetched from the
    gateway (`GET /policy`) and a run refuses to start without one (see above).
+9. ✅ **Model allowlist** — a policy `models = [...]` list (or `[models] allow`)
+   narrows the TUI model picker and `/model` to exactly those ids, so routing is
+   fenced the way tools are. An absent list means any model. The gateway still
+   enforces its own per-key allowlist; this stops the agent from offering a
+   choice the company would refuse, and the picker now marks each entry
+   `free`/`paid` so the choice is never a blind one.
 
 ### Honest limits
 

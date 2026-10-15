@@ -68,17 +68,20 @@ class SlashMenu(Static):
         self._paint()
         return True
 
-    def show_models(self, partial: str) -> bool:
-        from tui.model_picker import MODELS
+    def show_models(self, partial: str, allowed=None) -> bool:
+        from tui.model_picker import cost_label, listed_models
 
         query = partial.strip().lower()
-        matches = [(label, model) for label, model in MODELS
+        matches = [(label, model) for label, model in listed_models(allowed)
                    if not query or query in model.lower() or query in label.lower()]
         if not matches:
             self.close()
             return False
         self.mode = "models"
-        self.rows = [(model, model, label, False) for label, model in matches]
+        self.rows = [
+            (f"{label} · {cost_label(model)}", model, label, False)
+            for label, model in matches
+        ]
         self.highlight = 0
         self._paint()
         return True

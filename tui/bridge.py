@@ -150,7 +150,17 @@ def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None):
             parts = text.split(None, 1)
 
             if len(parts) == 2 and parts[1].strip():
-                core.MODEL = parts[1].strip()
+                requested = parts[1].strip()
+
+                if not core.model_allowed(requested):
+                    agent_queue.put(StatusUpdate(
+                        message=(f"Error: model '{requested}' is outside this "
+                                 "policy's model allowlist"),
+                        is_busy=False,
+                    ))
+                    continue
+
+                core.MODEL = requested
                 agent_queue.put({"type": "model_update", "model": core.MODEL})
             continue
 

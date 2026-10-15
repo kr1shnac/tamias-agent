@@ -2362,6 +2362,68 @@ def test_policy_from_dict_rejects_a_newer_schema():
     assert profile is None and "unsupported" in err
 
 
+def test_policy_parses_a_model_allowlist():
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": {"allow": ["free/x", "mid/x"]}},
+        "x",
+    )
+
+    assert err is None
+    assert profile.model_allow == ["free/x", "mid/x"]
+
+
+def test_policy_parses_the_documented_top_level_models_list():
+    # the BOUNDED-AGENT.md example writes `models = [...]`, so that shape must
+    # narrow the allowlist too - a doc/code mismatch here fails open silently
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": ["nvidia/nemotron-3.5-lightning:free"]},
+        "x",
+    )
+
+    assert err is None
+    assert profile.model_allow == ["nvidia/nemotron-3.5-lightning:free"]
+
+
+def test_no_model_allowlist_allows_any_model():
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"}}, "x"
+    )
+    agent.set_active_policy(profile)
+
+    try:
+        assert agent.allowed_models() == []
+        assert agent.model_allowed("anything/at-all") is True
+    finally:
+        agent.set_active_policy(None)
+
+
+def test_model_allowlist_refuses_a_model_outside_it():
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": {"allow": ["free/x"]}},
+        "x",
+    )
+    agent.set_active_policy(profile)
+
+    try:
+        assert agent.allowed_models() == ["free/x"]
+        assert agent.model_allowed("free/x") is True
+        assert agent.model_allowed("premium/x") is False
+        assert agent.model_allowed("") is False
+    finally:
+        agent.set_active_policy(None)
+
+
+def test_model_allowed_without_a_policy_is_permissive():
+    agent.set_active_policy(None)
+    assert agent.model_allowed("whatever/x") is True
+
+
 def test_fetch_policy_reads_the_policy_table_and_sends_the_token():
     class FakeResponse:
         def __enter__(self):

@@ -990,6 +990,7 @@ class PolicyProfile:
     shell_deny: list = field(default_factory=list)
     allow_write: list = field(default_factory=list)  # glob scope for writes
     deny_read: list = field(default_factory=list)    # glob scope for reads
+    model_allow: list = field(default_factory=list)  # empty = any model
     audit_path: str = ""                             # JSONL audit trail
 
 
@@ -1008,9 +1009,19 @@ def policy_from_dict(data, source):
     tools = data.get("tools", {})
     shell = data.get("run_shell", {})
     paths = data.get("paths", {})
+    models = data.get("models", {})
 
     if not isinstance(use_case, dict):
         use_case = {}
+
+    # accept both the documented `models = [...]` list and a `[models] allow`
+    # table; anything else means "no model allowlist", never a silent fence
+    if isinstance(models, dict):
+        model_allow = models.get("allow", [])
+    elif isinstance(models, list):
+        model_allow = models
+    else:
+        model_allow = []
 
     profile = PolicyProfile(
         version=str(data.get("version", "1")),
@@ -1022,6 +1033,7 @@ def policy_from_dict(data, source):
         shell_deny=[str(p) for p in shell.get("deny", [])],
         allow_write=[str(g) for g in paths.get("allow_write", [])],
         deny_read=[str(g) for g in paths.get("deny_read", [])],
+        model_allow=[str(m) for m in model_allow],
         audit_path=str(data.get("audit", {}).get("path", "")),
     )
 
@@ -1066,6 +1078,30 @@ def set_active_policy(profile):
 
 def active_policy():
     return _ACTIVE_POLICY
+
+
+def allowed_models():
+    """The active policy's model allowlist, or [] when it allows any model."""
+    policy = _ACTIVE_POLICY
+
+    return list(policy.model_allow) if policy else []
+
+
+def model_allowed(model_id):
+    """True when model_id may run under the active policy.
+
+    An empty allowlist means "any model" - the pre-policy behaviour. A policy
+    that names models narrows the picker and ``/model`` to exactly those, so a
+    company fences routing the same way it fences tools. The gateway still
+    enforces its own per-key allowlist; this keeps the agent from offering a
+    choice the company would refuse.
+    """
+    allow = allowed_models()
+
+    if not allow:
+        return True
+
+    return (model_id or "").strip() in allow
 
 
 def _env_truthy(name):
