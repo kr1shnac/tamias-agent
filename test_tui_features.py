@@ -450,12 +450,74 @@ def test_slash_palette_offers_matching_models_after_model_command():
             menu = app.query_one(SlashMenu)
             assert menu.open and menu.mode == "models"
             assert len(menu.rows) == 1
-            assert "ultra" in menu.rows[0][0]
+            assert "ultra" in menu.rows[0][0].lower()
 
             await pilot.press("enter")
             await pilot.pause()
             assert app.current_model.endswith("nemotron-3-ultra-550b-a55b:free")
             assert app.ui_queue.get_nowait() == f"/model {app.current_model}"
+
+    _run(drive())
+
+
+# ------------------------------------------- model allowlist / cost labels (A6)
+
+
+def test_model_picker_marks_paid_models_and_filters_to_an_allowlist():
+    from tui.app import TAMIASApp
+    from tui.model_picker import ModelPicker, listed_models
+
+    # every catalogue entry carries a price marker, free or paid
+    labels = [f"{name} · {'free' if model.endswith(':free') else 'paid'}"
+              for name, model in listed_models()]
+    assert any(label.endswith("· free") for label in labels)
+    assert any(label.endswith("· paid") for label in labels)
+
+    # a policy that names models narrows the menu to exactly those
+    allowed = ["google/gemma-4-31b-it:free", "anthropic/claude-3-opus"]
+    assert [model for _, model in listed_models(allowed)] == allowed
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            app.push_screen(ModelPicker(allowed=allowed))
+            await pilot.pause()
+            assert [model for _, model in app.screen.entries] == allowed
+
+    _run(drive())
+
+
+def test_slash_model_search_respects_the_allowlist():
+    from tui.app import TAMIASApp
+    from tui.slash import SlashMenu
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            await pilot.pause()
+            app._model_allowlist = lambda: ["google/gemma-4-31b-it:free"]
+
+            app.query_one("#user-input").value = "/model "
+            await pilot.pause()
+            menu = app.query_one(SlashMenu)
+            assert menu.open and menu.mode == "models"
+            assert [row[1] for row in menu.rows] == ["google/gemma-4-31b-it:free"]
+
+    _run(drive())
+
+
+def test_app_choose_model_refuses_outside_the_allowlist():
+    from tui.app import TAMIASApp
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)):
+            before = app.current_model
+            app._model_allowlist = lambda: ["free/x"]
+            app._choose_model("premium/x")
+            assert app.current_model == before  # refused, chip unchanged
+            app._choose_model("free/x")
+            assert app.current_model == "free/x"
 
     _run(drive())
 
