@@ -14,7 +14,7 @@ for every claim).
 
 - `agent.py` (~2.4k lines) + `tui/` — the terminal agent that is demoed
   **through** the Tamias proxy on port 8000.
-- `test_agent.py` (~3.2k lines) + `test_tui_features.py` (~700 lines) — the two
+- `test_agent.py` (~3.3k lines) + `test_tui_features.py` (~750 lines) — the two
   suites; see "Run it".
 - `brief.py` — the offline brief compiler (D13, `docs/BRIEF.md`).
 - `context_index.py` — the offline symbol/name/content index (D14,
