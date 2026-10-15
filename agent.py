@@ -466,6 +466,24 @@ def refuse_secret(path):
     return None
 
 
+# Refusals the agent made on purpose, not failures for the model to fix. The
+# policy gate and the secret denylist say no deliberately, so a "failed tool"
+# counter that counts them would escalate to a bigger model for a retry that
+# cannot change the answer - spending more to learn nothing.
+DELIBERATE_REFUSAL_MARKERS = (
+    "Error: policy",
+    "is a protected secret file",
+    "references protected secret file",
+)
+
+
+def is_deliberate_refusal(result):
+    """True when a tool result is an agent refusal, not a genuine failure."""
+    first_line = str(result).splitlines()[0] if str(result) else ""
+
+    return any(marker in first_line for marker in DELIBERATE_REFUSAL_MARKERS)
+
+
 def scrubbed_env():
     """The process environment minus anything that looks like a credential.
 
@@ -1260,17 +1278,22 @@ def safe_tool_call(tool_name, raw_args):
 #worse than losing the prose around it
 #-------------------------
 
-def history_size():
-    """rough character weight of everything we would resend"""
+def context_size_from(start):
+    """character weight of history[start:] - one step's worth of context"""
     total = 0
 
-    for message in history:
+    for message in history[start:]:
         total += len(str(message.get("content") or ""))
 
         for call in message.get("tool_calls") or []:
             total += len(str(call.get("function", {}).get("arguments", "")))
 
     return total
+
+
+def history_size():
+    """rough character weight of everything we would resend"""
+    return context_size_from(0)
 
 
 def structural_summary():
@@ -1501,6 +1524,7 @@ def parse_args(argv=None):
 #counters for the one line summary
 def new_stats():
     return {"steps": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "cache_read_tokens": 0,
             "compactions": 0, "turns": 0, "models": {},
             "cost_usd": 0.0, "unpriced_steps": 0,
             "effort_policy": EFFORT_POLICY}
@@ -1530,6 +1554,34 @@ def usage_cost(usage):
     return number
 
 
+def usage_cache_read(usage):
+    """Prompt tokens the provider served from its cache, or 0 when unreported.
+
+    A cache read is billed far below a fresh prompt token, so a step whose
+    prompt was mostly cached is cheaper than its prompt count suggests - and a
+    model switch between steps throws the cache away. Reading it back is what
+    lets the token line show why a step was cheap, or why a switch cost more
+    than it saved.
+    """
+    if usage is None:
+        return 0
+
+    details = getattr(usage, "prompt_tokens_details", None)
+    value = getattr(details, "cached_tokens", None) if details is not None else None
+
+    if value is None:
+        extra = getattr(usage, "model_extra", None)
+        if isinstance(extra, dict):
+            inner = extra.get("prompt_tokens_details")
+            if isinstance(inner, dict):
+                value = inner.get("cached_tokens")
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+
+    return value
+
+
 # --- spend accounting -------------------------------------------------------
 # USD is the only unit the CLI reports. It never derives a number from token
 # counts and never compares against an invented baseline; a step whose cost the
@@ -1552,6 +1604,8 @@ def print_summary(stats):
     table.add_row("turns", str(stats.get("turns", 0)))
     table.add_row("prompt tokens", str(stats.get("prompt_tokens", 0)))
     table.add_row("completion tokens", str(stats.get("completion_tokens", 0)))
+    if stats.get("cache_read_tokens"):
+        table.add_row("cached prompt tokens", str(stats["cache_read_tokens"]))
     table.add_row("compactions", str(stats.get("compactions", 0)))
     table.add_row("spent (USD, provider-billed)", money)
 
@@ -1664,6 +1718,9 @@ def log_step(step, response, stats, took):
     if isinstance(completion_tokens, int):
         stats["completion_tokens"] += completion_tokens
 
+    cached = usage_cache_read(usage)
+    stats["cache_read_tokens"] = stats.get("cache_read_tokens", 0) + cached
+
     cost = usage_cost(usage)
     if cost is None:
         stats["unpriced_steps"] = stats.get("unpriced_steps", 0) + 1
@@ -1672,11 +1729,13 @@ def log_step(step, response, stats, took):
         stats["cost_usd"] = stats.get("cost_usd", 0.0) + cost
         cost_text = f"${cost:.4f}"
 
+    cache_note = f" (cached {cached})" if cached else ""
+
     console.print(
         f"[dim]  ↳ step {step} · "
         f"{served_by} · "
         f"effort {stats.get('effort_policy', EFFORT_POLICY)} · "
-        f"prompt {prompt_tokens} · completion {completion_tokens} · "
+        f"prompt {prompt_tokens}{cache_note} · completion {completion_tokens} · "
         f"{cost_text} · "
         f"{took:.1f}s[/dim]"
     )
@@ -1747,6 +1806,7 @@ def run_turn(user_input, max_steps, stats, on_event=None):
 
     step = 0
     tool_failures = 0 #evidence of difficulty, used to justify a bigger model
+    step_mark = checkpoint #content since the last model call is this step's work
     turn_started = time.perf_counter()
 
     while True:
@@ -1775,8 +1835,13 @@ def run_turn(user_input, max_steps, stats, on_event=None):
 
         #spend the least that can do this step: free by default, a bigger model
         #only once the turn has shown it needs one (failed tools, large context)
-        chosen_model = select_model(step=step, prompt_chars=history_size(),
+        #a step's difficulty is the work it inherits, not the whole transcript:
+        #measuring cumulative history would drift a long-but-easy session onto
+        #the premium models for no reason
+        step_ctx = context_size_from(step_mark)
+        chosen_model = select_model(step=step, prompt_chars=step_ctx,
                                     tool_failures=tool_failures)
+        step_mark = len(history)
 
         emit("status", message="thinking…", is_busy=True)
 
@@ -1845,9 +1910,11 @@ def run_turn(user_input, max_steps, stats, on_event=None):
                 #every tool call gets a result back, even a broken one
                 args, result = safe_tool_call(tool_name, tc.function.arguments)
 
-                if str(result).startswith("Error:"):
+                if (str(result).startswith("Error:")
+                        and not is_deliberate_refusal(result)):
                     #a failed tool is the clearest signal the cheap model is
-                    #struggling, so it is what lets the next step escalate
+                    #struggling, so it is what lets the next step escalate - but
+                    #a policy or secret refusal is deliberate, not struggle
                     tool_failures += 1
 
                 target = call_target(args)
@@ -1908,9 +1975,12 @@ def run_task(task, max_steps, on_event=None):
     else:
         money = f"${spent:.4f}"
 
+    cached = stats.get("cache_read_tokens", 0)
+    cache_note = f" (cached {cached})" if cached else ""
+
     console.print(
         f"[dim]steps: {stats['steps']} · "
-        f"prompt tokens: {stats['prompt_tokens']} · "
+        f"prompt tokens: {stats['prompt_tokens']}{cache_note} · "
         f"completion tokens: {stats['completion_tokens']} · "
         f"compactions: {stats['compactions']} · "
         f"spent: {money}[/dim]"

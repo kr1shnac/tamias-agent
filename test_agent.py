@@ -165,10 +165,10 @@ def tool_call(id_, name, arguments):
 
 def response(content=None, tool_calls=None, model="fake/model",
              prompt_tokens=None, completion_tokens=None, cost=None,
-             cost_in_extra=False):
+             cost_in_extra=False, cached_tokens=None, cached_in_extra=False):
     usage = None
     if (prompt_tokens is not None or completion_tokens is not None
-            or cost is not None):
+            or cost is not None or cached_tokens is not None):
         usage = SimpleNamespace(prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens)
         if cost is not None:
@@ -178,6 +178,17 @@ def response(content=None, tool_calls=None, model="fake/model",
                 usage.model_extra = {"cost": cost}
             else:
                 usage.cost = cost
+        if cached_tokens is not None:
+            # prompt_tokens_details.cached_tokens, either on the attribute the
+            # SDK models or stashed in model_extra
+            if cached_in_extra:
+                details = usage.model_extra if hasattr(usage, "model_extra") else {}
+                details["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+                usage.model_extra = details
+            else:
+                usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=cached_tokens
+                )
 
     return SimpleNamespace(
         model=model,
@@ -2472,6 +2483,138 @@ def test_protected_policy_path_is_refused():
         agent.PROTECTED_PATHS.discard(os.path.abspath(path))
         agent.PROTECTED_PATHS.discard(os.path.realpath(path))
         os.unlink(path)
+
+
+# ---------- A8: escalation evidence must be real difficulty ----------
+
+def test_is_deliberate_refusal_separates_policy_and_secrets_from_failures():
+    assert agent.is_deliberate_refusal(
+        "Error: policy deny - tool 'list_directory' is hard-denied for use "
+        "case 'x'")
+    assert agent.is_deliberate_refusal(
+        "Error: '.env' is a protected secret file and must not be read")
+    assert agent.is_deliberate_refusal(
+        "Error: shell command references protected secret file 'api.pem'")
+
+    # a genuine failure is not a refusal
+    assert not agent.is_deliberate_refusal("Error: file 'a.py' not found")
+    assert not agent.is_deliberate_refusal("ok, done")
+
+
+def test_context_size_from_measures_only_the_tail():
+    reset()
+    agent.history.extend([
+        {"role": "user", "content": "x" * 100},
+        {"role": "user", "content": "y" * 5},
+    ])
+
+    assert agent.context_size_from(0) == 105
+    assert agent.context_size_from(1) == 5
+    assert agent.history_size() == 105
+
+
+TIERS = {"AGENT_MODEL_FREE": "free/x", "AGENT_MODEL_MID": "mid/x",
+         "AGENT_MODEL_PREMIUM": "premium/x", "AGENT_EFFORT_POLICY": "auto"}
+
+
+def test_a_policy_denial_does_not_escalate_the_next_step():
+    # a denied tool is not the model struggling, so the next step stays cheap
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')]),
+        response("all done"),
+    ])
+    reset(client)
+
+    policy = agent.PolicyProfile(name="locked", tool_deny=["list_directory"])
+    agent.set_active_policy(policy)
+
+    try:
+        with mock.patch.dict(os.environ, TIERS):
+            assert agent.run_turn("look around", 25, agent.new_stats()) == "done"
+    finally:
+        agent.set_active_policy(None)
+
+    assert "Error: policy deny" in PRINTED[-1] or any(
+        "policy deny" in line for line in PRINTED)
+    # the step that followed the denial still ran on the free tier
+    assert client.calls[0]["model"] == "free/x"
+    assert client.calls[1]["model"] == "free/x"
+
+
+def test_pre_existing_history_does_not_escalate_a_small_step():
+    # a long transcript must not drift an easy step onto a premium model:
+    # the difficulty signal is the step's new work, not the whole history
+    client = FakeClient([response("done")])
+    reset(client)
+    agent.history.append({"role": "user", "content": "z" * 5000})
+    assert agent.history_size() >= agent.BIG_PROMPT_CHARS
+
+    with mock.patch.dict(os.environ, TIERS):
+        assert agent.run_turn("hi", 25, agent.new_stats()) == "done"
+
+    assert client.calls[0]["model"] == "free/x"
+
+
+def test_a_genuine_failure_still_escalates_the_next_step():
+    client = FakeClient([
+        response(None, [tool_call("c1", "read_file",
+                                  '{"file_path": "/nope/missing.py"}')]),
+        response("all done"),
+    ])
+    reset(client)
+
+    with mock.patch.dict(os.environ, TIERS):
+        assert agent.run_turn("read it", 25, agent.new_stats()) == "done"
+
+    assert client.calls[0]["model"] == "free/x"
+    assert client.calls[1]["model"] == "mid/x"
+
+
+# ---------- A9: cache-read awareness ----------
+
+def test_usage_cache_read_reads_both_shapes():
+    sdk_shaped = SimpleNamespace(
+        prompt_tokens=100, completion_tokens=5,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=80),
+    )
+    extra_shaped = SimpleNamespace(
+        prompt_tokens=100, completion_tokens=5,
+        model_extra={"prompt_tokens_details": {"cached_tokens": 64}},
+    )
+
+    assert agent.usage_cache_read(sdk_shaped) == 80
+    assert agent.usage_cache_read(extra_shaped) == 64
+
+    # absent, malformed or negative reads as zero rather than a guess
+    assert agent.usage_cache_read(SimpleNamespace(prompt_tokens=10)) == 0
+    assert agent.usage_cache_read(None) == 0
+    assert agent.usage_cache_read(
+        SimpleNamespace(prompt_tokens_details=SimpleNamespace(cached_tokens=True))
+    ) == 0
+
+
+def test_log_step_counts_cache_reads():
+    client = FakeClient([response("done", prompt_tokens=100,
+                                  completion_tokens=5, cached_tokens=80)])
+    reset(client)
+    stats = agent.new_stats()
+
+    agent.log_step(1, client.create(), stats, 0.1)
+
+    assert stats["prompt_tokens"] == 100
+    assert stats["cache_read_tokens"] == 80
+    assert any("cached 80" in line for line in PRINTED)
+
+
+def test_print_summary_shows_cached_prompt_tokens_when_present():
+    stats = agent.new_stats()
+    stats["steps"] = 1
+    stats["prompt_tokens"] = 100
+    stats["cache_read_tokens"] = 80
+
+    agent.print_summary(stats)
+
+    assert any("cached prompt tokens" in line for line in PRINTED)
 
 
 def _run_all():
