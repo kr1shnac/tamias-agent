@@ -11,9 +11,9 @@ not a licence to guess and spend.
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass, field
+
+from context_index import citations_for, key_terms  # noqa: F401  (key_terms re-exported)
 
 # A verb that says what to do but not what *done* means.
 VAGUE_VERBS = (
@@ -180,88 +180,19 @@ def format_brief(brief: Brief) -> str:
 
 # --- grounding (D13 -> D14) ---------------------------------------------------
 # A brief is only "retrieval-grounded" if every citation points at something that
-# really exists. This first pass is deliberately crude and offline - a bounded
-# filename/identifier scan, no embeddings - and it never invents a reference: a
-# citation is a path that matched, full stop. When nothing matches it cites
-# nothing, and the brief says so.
+# really exists. The heavy lifting lives in context_index (the symbol/name index
+# of D14); this is the thin slice the compiler needs. It never invents a
+# reference: a citation is a path (or path:line) that matched, and when nothing
+# matches it cites nothing and the brief says so.
 
-SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".mypy_cache",
-             ".pytest_cache", ".ruff_cache", "dist", "build", ".tox"}
-MAX_SCANNED_FILES = 4000
-MAX_FILE_BYTES = 400_000
 MAX_CITATIONS = 5
-
-_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]{4,}")
-# Words too common to make a useful citation.
-_STOPWORDS = {
-    "the", "and", "for", "with", "this", "that", "from", "into", "when", "then",
-    "make", "made", "should", "must", "have", "has", "are", "was", "were", "will",
-    "test", "tests", "file", "files", "code", "please", "fix", "add", "update",
-    "change", "make", "better", "clean", "issue", "error", "bug", "failing",
-}
-
-
-def key_terms(text, limit=8):
-    """The identifier-ish words worth searching for, most specific first."""
-    terms = []
-    seen = set()
-    for match in _IDENT.findall(text or ""):
-        low = match.lower()
-        if low in _STOPWORDS or low in seen:
-            continue
-        seen.add(low)
-        terms.append(match)
-    # prefer the longer (more specific) terms, keep the original spelling
-    terms.sort(key=len, reverse=True)
-    return terms[:limit]
 
 
 def retrieve_citations(text, root=".", max_citations=MAX_CITATIONS):
-    """Cite real files a brief's terms appear in - names first, then contents.
+    """Cite real files a brief's terms appear in - symbols, names, then content.
 
-    Offline and bounded: no network, no model, a hard cap on files and size. The
-    return value is a list of ``path`` (file name matched) or ``path:line``
-    (first content match) strings, and it is empty when nothing matches.
+    Offline and bounded; no network, no model, no embeddings. The return value
+    is a list of ``path`` (name/symbol match) or ``path:line`` (content match)
+    strings, and it is empty when nothing matches.
     """
-    terms = key_terms(text)
-    if not terms:
-        return []
-
-    lowered = [t.lower() for t in terms]
-    name_hits = []
-    content_hits = []
-    scanned = 0
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for name in filenames:
-            if scanned >= MAX_SCANNED_FILES:
-                break
-            scanned += 1
-            path = os.path.join(dirpath, name)
-            rel = os.path.relpath(path, root)
-
-            if any(term in name.lower() for term in lowered):
-                name_hits.append(rel)
-                continue
-
-            if not name.endswith((".py", ".js", ".ts", ".tsx", ".go", ".rs",
-                                  ".rb", ".java", ".md", ".toml", ".json",
-                                  ".yaml", ".yml", ".txt", ".cfg", ".ini")):
-                continue
-
-            try:
-                if os.path.getsize(path) > MAX_FILE_BYTES:
-                    continue
-                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-                    for number, line in enumerate(handle, start=1):
-                        if any(term in line.lower() for term in lowered):
-                            content_hits.append(f"{rel}:{number}")
-                            break
-            except OSError:
-                continue
-
-        if len(name_hits) + len(content_hits) >= max_citations:
-            break
-
-    return (name_hits + content_hits)[:max_citations]
+    return citations_for(text, root, max_citations)

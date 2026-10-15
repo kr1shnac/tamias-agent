@@ -148,7 +148,8 @@ def _install_stubs():
 _install_stubs()
 
 import agent  # noqa: E402  (import after the stubs are in place)
-import brief  # noqa: E402  (pure module: os/re/dataclasses only)
+import brief  # noqa: E402  (pure module: no rich/openai)
+import context_index  # noqa: E402  (pure module: offline index of D14)
 
 
 # ---------- fakes ----------
@@ -2894,7 +2895,7 @@ def test_retrieve_citations_finds_a_real_file_and_line():
         found = brief.retrieve_citations("resolve the widget_router problem",
                                          root=root)
 
-    assert "widget_router.py" in found               # a name match
+    assert any(hit.startswith("widget_router.py") for hit in found)  # symbol/name
     assert any("widget_router" in hit for hit in found)
 
 
@@ -2915,6 +2916,126 @@ def test_retrieve_citations_skips_vcs_and_cache_dirs():
                 handle.write("needle_target\n")
 
         assert brief.retrieve_citations("needle_target", root=root) == []
+
+
+# ---------- D14: searchable context index with mandatory citations ----------
+
+def _index_fixture(root):
+    with open(os.path.join(root, "widget_router.py"), "w") as handle:
+        handle.write(
+            "class WidgetRouter:\n"
+            "    pass\n\n"
+            "def resolve_widget_router(path):\n"
+            "    return path\n"
+        )
+    with open(os.path.join(root, "app.js"), "w") as handle:
+        handle.write("function mountWidget(id) {\n  return id;\n}\n")
+    with open(os.path.join(root, "main.go"), "w") as handle:
+        handle.write("func HandleRequest(w, r) {\n}\n")
+    with open(os.path.join(root, "lib.rs"), "w") as handle:
+        handle.write("pub fn resolve_widget() -> u8 { 1 }\n")
+    with open(os.path.join(root, "notes.md"), "w") as handle:
+        handle.write("# notes\n\nthe widget_router is documented here\n")
+
+
+def test_index_extracts_symbols_across_languages():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+    assert index.find_symbol("WidgetRouter")[0].kind == "class"
+    assert index.find_symbol("resolve_widget_router")[0].kind == "function"
+    assert index.find_symbol("mountWidget")[0].kind == "function"
+    assert index.find_symbol("HandleRequest")[0].kind == "function"
+    assert index.find_symbol("resolve_widget")[0].kind == "function"
+
+
+def test_index_ranks_an_exact_symbol_first_and_cites_its_definition():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+        hits = index.search("resolve_widget_router")
+
+    assert hits[0].citation.startswith("widget_router.py:")
+    assert hits[0].symbol == "resolve_widget_router"
+
+
+def test_index_prefix_matches_a_symbol():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        # "mount" has no exact symbol, so the prefix branch is what answers
+        names = {hit.symbol for hit in index.find_symbol("mount")}
+
+    assert "mountWidget" in names
+
+
+def test_index_content_pass_cites_a_real_line():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+        hits = index.grep("documented")
+
+    assert hits, "the content pass should find the line"
+    assert hits[0].path == "notes.md"
+    assert hits[0].line == 3
+
+
+def test_every_hit_carries_a_non_empty_citation():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        for hit in index.search("widget_router"):
+            assert hit.citation and ":" in hit.citation
+
+
+def test_index_returns_nothing_rather_than_guessing():
+    # mandatory citations: no real match means no result, never an invented one
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        assert index.search("zzzzq wvvvv qqqqz") == []
+        assert index.find_symbol("") == []
+        assert index.find_files("") == []
+
+
+def test_index_skips_vcs_and_cache_directories():
+    with tempfile.TemporaryDirectory() as root:
+        for skipped in (".git", "__pycache__", ".venv"):
+            folder = os.path.join(root, skipped)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "needle_target.py"), "w") as handle:
+                handle.write("def needle_target():\n    return 1\n")
+
+        index = context_index.ContextIndex(root).build()
+
+        assert index.search("needle_target") == []
+
+
+def test_index_uses_ripgrep_when_it_is_present():
+    with tempfile.TemporaryDirectory() as root:
+        index = context_index.ContextIndex(root)
+
+        fake = SimpleNamespace(stdout="./src/thing.py:12:a documented match\n",
+                               returncode=0)
+
+        with mock.patch.object(context_index.shutil, "which",
+                               return_value="/usr/bin/rg"), \
+                mock.patch.object(context_index.subprocess, "run",
+                                  return_value=fake) as run:
+            hits = index.grep("documented")
+
+    assert [hit.citation for hit in hits] == ["src/thing.py:12"]
+    assert run.call_args[0][0][0] == "rg"
+
+
+def test_citations_for_is_empty_for_an_empty_query():
+    with tempfile.TemporaryDirectory() as root:
+        assert context_index.citations_for("", root) == []
+        assert context_index.citations_for("   ", root) == []
 
 
 def _run_all():
