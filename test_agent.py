@@ -2679,6 +2679,59 @@ def test_print_summary_shows_cached_prompt_tokens_when_present():
     assert any("cached prompt tokens" in line for line in PRINTED)
 
 
+def test_compaction_sends_a_bounded_transcript_not_the_whole_history():
+    # compaction must send *less*: a session far past the trigger still gets a
+    # capped summariser call, so the peak context does not grow with the log
+    client = FakeClient([response("<summary>folded</summary>")])
+    reset(client)
+
+    for _ in range(40):
+        agent.history.append({"role": "user", "content": "x" * 5000})
+
+    whole = agent.history_size()
+    assert whole >= 200_000
+
+    assert agent.compact_history(client, agent.new_stats()) is True
+
+    sent = client.calls[0]["messages"]
+    sent_chars = sum(len(str(m.get("content") or "")) for m in sent)
+    assert sent_chars < whole // 2
+
+
+def test_compaction_facts_cover_what_the_transcript_drops():
+    # the bounded excerpt is paired with the recorded facts, so the original ask
+    # survives even when it is outside the window
+    client = FakeClient([response("<summary>folded</summary>")])
+    reset(client)
+
+    agent.history.append({"role": "user",
+                          "content": "ORIGINAL ASK " + "x" * 30_000})
+    for _ in range(10):
+        agent.history.append({"role": "user", "content": "later " + "y" * 3000})
+
+    agent.compact_history(client, agent.new_stats())
+
+    blob = "\n".join(str(m.get("content") or "")
+                     for m in client.calls[0]["messages"])
+    assert "ORIGINAL ASK" in blob
+    assert agent.COMPACT_TRANSCRIPT_CHARS < agent.COMPACT_TRIGGER_CHARS
+
+
+def test_the_compaction_call_is_metered():
+    # the summariser is a real billed request; the session total must include it
+    client = FakeClient([response("<summary>folded</summary>", prompt_tokens=1000,
+                                  completion_tokens=50, cost=0.02)])
+    reset(client)
+    agent.history.append({"role": "user", "content": "x" * 10})
+
+    stats = agent.new_stats()
+    agent.compact_history(client, stats)
+
+    assert stats["cost_usd"] == 0.02
+    assert stats["prompt_tokens"] == 1000
+    assert stats["completion_tokens"] == 50
+
+
 def _run_all():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

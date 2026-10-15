@@ -369,6 +369,10 @@ def build_system_prompt():
 MAX_TOOL_RESULT_CHARS = 8000
 COMPACT_TRIGGER_CHARS = 40000
 COMPACT_KEEP_RECENT = 2
+# what the summariser is allowed to re-read. The compaction call must not resend
+# the very context it is shrinking, so the transcript it sees is capped well
+# below the trigger; the deterministic facts cover everything older.
+COMPACT_TRANSCRIPT_CHARS = 20000
 
 #asked once, when the history gets too big to keep sending. a separate call with
 #no tools, so the model summarises instead of starting new work
@@ -1371,6 +1375,31 @@ def structural_summary():
     )
 
 
+def compaction_transcript(budget=COMPACT_TRANSCRIPT_CHARS):
+    """The bounded excerpt of history handed to the summariser.
+
+    Compaction exists to send *less*, so the summariser must not be handed the
+    whole conversation - older messages survive through ``structural_summary``
+    instead. The newest messages that fit ``budget`` chars are enough prose for
+    the model to write from, and the call stays bounded however long the
+    session runs.
+    """
+    tail = []
+    used = 0
+
+    for message in reversed(history):
+        weight = len(str(message.get("content") or ""))
+
+        if tail and used + weight > budget:
+            break
+
+        tail.append(message)
+        used += weight
+
+    tail.reverse()
+    return tail
+
+
 def compact_history(client, stats):
     """fold history into one message. returns True when it actually compacted"""
     summary = None
@@ -1379,11 +1408,20 @@ def compact_history(client, stats):
         response = client.chat.completions.create(
             model=MODEL,
             messages=[
-                {"role": "system", "content": COMPACT_PROMPT}
-            ] + history,
+                {"role": "system", "content": COMPACT_PROMPT},
+                {"role": "system", "content": (
+                    "Recorded facts for the whole conversation - rely on these; "
+                    "the messages after this one are only the most recent "
+                    "excerpt:\n\n" + structural_summary()
+                )},
+            ] + compaction_transcript(),
         )
 
         summary = response.choices[0].message.content
+
+        # the summariser is a real billed request; leaving it out of the tally
+        # would make the session total understate what we actually spent
+        account_usage(getattr(response, "usage", None), stats)
 
     except Exception as e:
         print_error("compaction", f"summary call failed, using recorded facts ({e})")
@@ -1629,7 +1667,8 @@ def print_summary(stats):
     if unpriced and not spent:
         money = "UNKNOWN (no step reported a cost)"
     elif unpriced:
-        money = f"${spent:.4f} (partial: {unpriced} of {stats['steps']} steps unpriced)"
+        calls = max(stats["steps"], unpriced)  # the summariser is a call too
+        money = f"${spent:.4f} (partial: {unpriced} of {calls} calls unpriced)"
     else:
         money = f"${spent:.4f}"
 
@@ -1734,6 +1773,35 @@ def call_model(messages, tools=None, model=None):
         )
 
 
+def account_usage(usage, stats):
+    """Fold one billed response's tokens and cost into the running stats.
+
+    Shared by the visible steps and the compaction call, so a request cannot be
+    spent without being counted. Returns ``(cost, cached)``; cost is None when
+    the provider reported none, and the step is counted as unpriced.
+    """
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+
+    cached = usage_cache_read(usage)
+    stats["cache_read_tokens"] = stats.get("cache_read_tokens", 0) + cached
+
+    if isinstance(prompt_tokens, int):
+        stats["prompt_tokens"] += prompt_tokens
+
+    if isinstance(completion_tokens, int):
+        stats["completion_tokens"] += completion_tokens
+
+    cost = usage_cost(usage)
+
+    if cost is None:
+        stats["unpriced_steps"] = stats.get("unpriced_steps", 0) + 1
+        return None, cached
+
+    stats["cost_usd"] = stats.get("cost_usd", 0.0) + cost
+    return cost, cached
+
+
 #one dim line after every API call - works when usage is missing
 def log_step(step, response, stats, took):
     usage = getattr(response, "usage", None)
@@ -1748,22 +1816,8 @@ def log_step(step, response, stats, took):
     stats.setdefault("models", {})
     stats["models"][served_by] = stats["models"].get(served_by, 0) + 1
 
-    if isinstance(prompt_tokens, int):
-        stats["prompt_tokens"] += prompt_tokens
-
-    if isinstance(completion_tokens, int):
-        stats["completion_tokens"] += completion_tokens
-
-    cached = usage_cache_read(usage)
-    stats["cache_read_tokens"] = stats.get("cache_read_tokens", 0) + cached
-
-    cost = usage_cost(usage)
-    if cost is None:
-        stats["unpriced_steps"] = stats.get("unpriced_steps", 0) + 1
-        cost_text = "cost ?"
-    else:
-        stats["cost_usd"] = stats.get("cost_usd", 0.0) + cost
-        cost_text = f"${cost:.4f}"
+    cost, cached = account_usage(usage, stats)
+    cost_text = "cost ?" if cost is None else f"${cost:.4f}"
 
     cache_note = f" (cached {cached})" if cached else ""
 
