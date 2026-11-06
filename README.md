@@ -10,6 +10,9 @@ All traffic flows through Tamias, which records token usage and cost per request
 
 > **Handoff:** read [`HANDOFF-OPENCODE.md`](HANDOFF-OPENCODE.md) first. It lists
 > verified state, pending work, boundary gaps, and the order to work in.
+>
+> **OpenCode brief:** read [`OPENCODE-AGENT-BRIEF.md`](OPENCODE-AGENT-BRIEF.md)
+> for the short status, known gaps, next task, and OpenCode permission rules.
 
 ---
 

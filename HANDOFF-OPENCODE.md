@@ -11,6 +11,8 @@ Version: **`0.1.0a7`**.
 Status: **offline verified; live model path not re-verified after the latest
 prompt/boundary changes; `company guarantee` must not be claimed yet.**
 
+Companion quick brief for OpenCode: **`OPENCODE-AGENT-BRIEF.md`**.
+
 ---
 
 ## 1. Read this in this order
