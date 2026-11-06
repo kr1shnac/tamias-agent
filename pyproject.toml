@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tamias-agent"
+version = "0.1.0a7"
+requires-python = ">=3.11"
+dependencies = [
+    "rich",
+    "textual",
+    "openai",
+    "python-dotenv",
+]
+
+[project.scripts]
+tamias-agent = "agent:main"
+
+# The demo is a flat set of top-level modules plus three packages. Keeping the
+# list explicit beats setuptools auto-discovery, which would otherwise sweep in
+# tests and the demo scripts.
+[tool.setuptools]
+py-modules = ["agent", "brief", "checkpoints", "context_index", "model_catalog", "providers"]
+packages = ["tui", "models", "policies"]
+
+[tool.setuptools.package-data]
+models = ["catalog.json"]
+policies = ["*.toml"]

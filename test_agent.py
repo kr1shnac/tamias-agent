@@ -229,6 +229,9 @@ def reset(client=None):
     agent.history.clear()
     PRINTED.clear()
     ASKED.clear()
+    agent.set_plan_gate(None, active=False)
+    agent.set_dossier_gate(False)
+    agent.reset_checkpoints()
     agent.client = client or FakeClient([])
 
 
@@ -422,8 +425,10 @@ def test_429_mid_tool_loop_rolls_back_history():
 
     assert agent.run_turn("break the loop", 25, stats) == "error"
 
-    # error printed, not raised
-    assert any("429" in line for line in PRINTED)
+    # reported as a provider limit (cleaned, not the raw provider JSON), and
+    # not raised
+    assert any("provider limit" in line for line in PRINTED)
+    assert any("rate-limited" in line for line in PRINTED)
 
     # rolled all the way back to where the turn started
     assert len(agent.history) == checkpoint
@@ -629,7 +634,7 @@ def test_cli_rejects_zero_steps():
 def test_main_routes_task_mode():
     reset(FakeClient([response("answered", prompt_tokens=1, completion_tokens=2)]))
 
-    assert agent.main(["--task", "what is 2+2?"]) == 0
+    assert agent.main(["--task", "what is 2+2?", "--unbounded"]) == 0
     assert agent.client.calls[0]["messages"][1] == \
         {"role": "user", "content": "what is 2+2?"}
 
@@ -920,6 +925,520 @@ def test_update_plan_call_reaches_the_model_as_a_tool_result():
     assert "0/1 done" in tool_message["content"]
 
 
+# ---------- Time Travel: file checkpoints ----------
+
+
+def test_a_write_creates_a_restorable_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "done"
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert checkpoint.id.startswith("cp-")
+        assert checkpoint.files
+        assert pathlib.Path(target).read_text() == "hello"
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert not pathlib.Path(target).exists()
+        assert result.removed == ["note.txt"]
+
+
+def test_a_created_directory_is_removed_by_restore():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "newdir")
+        create = json.dumps({"path": target})
+        client = FakeClient([
+            response(None, [tool_call("d1", "create_directory", create)]),
+            response("made the directory"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("make a directory", 25,
+                                  agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert pathlib.Path(target).is_dir()
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert not pathlib.Path(target).exists()
+        assert result.removed == ["newdir"]
+
+
+def test_a_checkpoint_restores_an_overwritten_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original")
+        write = json.dumps({"file_path": str(target), "content": "changed"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("overwrite", 25, agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert target.read_text() == "changed"
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert target.read_text() == "original"
+        assert result.restored == ["note.txt"]
+
+
+def test_a_shell_call_marks_the_checkpoint_incomplete():
+    with tempfile.TemporaryDirectory() as tmp:
+        shell = json.dumps({"command": "true"})
+        client = FakeClient([
+            response(None, [tool_call("s1", "run_shell", shell)]),
+            response("ran it"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("run a command", 25,
+                                  agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None and checkpoint.shell_ran is True
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert any("not captured" in warning for warning in result.warnings)
+
+
+def test_turn_end_reports_the_checkpoint_diff_counts():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original\n")
+        write = json.dumps({"file_path": str(target),
+                            "content": "changed\nsecond\n"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("changed it"),
+        ])
+        events = []
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn(
+                "change the note", 25, agent.new_stats(),
+                on_event=lambda name, **fields: events.append((name, fields)),
+            ) == "done"
+
+        end = [fields for name, fields in events if name == "turn_end"][-1]
+        assert end["checkpoint_id"].startswith("cp-")
+        assert end["checkpoint_added"] == 2
+        assert end["checkpoint_removed"] == 1
+        assert end["checkpoint_diff_paths"] == 1
+        assert end["checkpoint_diff_truncated"] is False
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None and checkpoint.diff_frozen_at is not None
+
+
+def test_a_checkpoint_freezes_the_turns_diff():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original\n")
+        checkpoint = checkpoints.Checkpoint.start("change the note", tmp)
+        checkpoint.capture(str(target))
+        target.write_text("changed\nsecond\n")
+
+        checkpoint.freeze_diff()
+        frozen = checkpoint.diff_text()
+        target.write_text("edited after the turn\n")
+
+        assert checkpoint.diff_frozen_at is not None
+        assert checkpoint.diff_summary()["added"] == 2
+        assert checkpoint.diff_summary()["removed"] == 1
+        assert "-original" in frozen and "+changed" in frozen
+        assert "edited after the turn" not in checkpoint.diff_text()
+
+
+def test_a_created_file_diff_is_all_added():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "new.txt")
+        checkpoint = checkpoints.Checkpoint.start("create the note", tmp)
+        checkpoint.capture(str(target))
+        target.write_text("hello\n")
+
+        diff = checkpoint.freeze_diff()[0]
+
+        assert diff.kind == "created"
+        assert diff.added == 1 and diff.removed == 0
+        assert "--- /dev/null" in diff.text
+        assert "+hello" in diff.text
+
+
+def test_a_binary_file_has_no_inline_diff():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "image.bin")
+        target.write_bytes(b"a\x00b")
+        checkpoint = checkpoints.Checkpoint.start("change the binary", tmp)
+        checkpoint.capture(str(target))
+        target.write_bytes(b"c\x00d")
+
+        diff = checkpoint.freeze_diff()[0]
+
+        assert diff.kind == "binary"
+        assert diff.text == ""
+        assert "binary file" in diff.note
+
+
+def test_a_checkpoint_diff_does_not_read_a_replaced_symlink():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        outside = pathlib.Path(tmp, "outside.txt")
+        target.write_text("original")
+        outside.write_text("outside secret")
+        checkpoint = checkpoints.Checkpoint.start("swap", tmp)
+        checkpoint.capture(str(target))
+
+        target.unlink()
+        target.symlink_to(outside)
+        checkpoint.freeze_diff()
+
+        diff = checkpoint.diff_files()[0]
+        assert diff.kind == "unavailable"
+        assert "refusing to read" in diff.note
+        assert "outside secret" not in checkpoint.diff_text()
+
+
+def test_a_checkpoint_never_restores_outside_its_workspace():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = pathlib.Path(tmp, "workspace")
+        workspace.mkdir()
+        outside = pathlib.Path(tmp, "outside.txt")
+        outside.write_text("keep me")
+        checkpoint = checkpoints.Checkpoint.start("escape", str(workspace))
+        checkpoint.files[str(outside)] = checkpoints.FileSnapshot(
+            path=str(outside), display="../outside.txt", existed=False)
+
+        result = checkpoint.restore_files()
+
+        assert not result.ok
+        assert outside.read_text() == "keep me"
+        assert result.failed[0][0] == "../outside.txt"
+
+
+def test_a_failed_restore_can_be_retried():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "newdir")
+        checkpoint = checkpoints.Checkpoint.start("make a directory", tmp)
+        checkpoint.capture(str(target), is_dir=True)
+        target.mkdir()
+        keep = target / "user-file.txt"
+        keep.write_text("the human put this here")
+
+        first = checkpoint.restore_files()
+        assert not first.ok
+        assert checkpoint.restored_at is None
+        assert target.is_dir()
+
+        keep.unlink()
+        second = checkpoint.restore_files()
+        assert second.ok
+        assert not target.exists()
+        assert checkpoint.restored_at is not None
+
+
+def test_restore_refuses_a_symlink_that_replaced_the_file():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        outside = pathlib.Path(tmp, "outside.txt")
+        target.write_text("original")
+        outside.write_text("outside")
+        checkpoint = checkpoints.Checkpoint.start("swap", tmp)
+        checkpoint.capture(str(target))
+
+        target.unlink()
+        target.symlink_to(outside)
+
+        result = checkpoint.restore_files()
+
+        assert not result.ok
+        assert outside.read_text() == "outside"
+        assert any("symlink" in reason for _, reason in result.failed)
+
+
+def test_a_read_only_turn_has_no_checkpoint():
+    read = json.dumps({"file_path": "note.txt"})
+    client = FakeClient([
+        response(None, [tool_call("r1", "read_file", read)]),
+        response("read it"),
+    ])
+
+    reset(client)
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("read a file", 25,
+                                  agent.new_stats()) == "done"
+
+    assert agent.latest_checkpoint() is None
+
+
+# ---------- the plan contract ----------
+
+
+def test_a_signed_plan_allows_the_next_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        plan = json.dumps({"todos": [
+            {"content": "write the note", "status": "in_progress"}]})
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        asked = []
+        agent.set_plan_gate(
+            lambda todos: asked.append(todos) or True, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "done"
+        assert asked[0]["todos"] == [{"content": "write the note",
+                                     "status": "in_progress"}]
+        assert pathlib.Path(target).read_text() == "hello"
+        tool_messages = [m["content"] for m in agent.history
+                         if m["role"] == "tool"]
+        assert "contract: signed by user" in tool_messages[0]
+        assert_history_valid(agent.history)
+
+
+def test_a_denied_plan_stops_the_turn_before_the_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        plan = json.dumps({"todos": [
+            {"content": "write the note", "status": "in_progress"}]})
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("must not be reached"),
+        ])
+
+        reset(client)
+        agent.set_plan_gate(lambda todos: False, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "refused"
+        assert len(client.calls) == 1      # the write step was never requested
+        assert not pathlib.Path(target).exists()
+        assert agent.plan_write_block("write_file").startswith(
+            "Error: plan contract denied")
+        assert_history_valid(agent.history)
+
+
+def test_status_only_plan_updates_do_not_ask_again_but_content_does():
+    reset()
+    asked = []
+    agent.set_plan_gate(
+        lambda todos: asked.append(todos) or True, active=True)
+
+    first = agent.update_plan([
+        {"content": "read", "status": "in_progress"},
+        {"content": "write", "status": "pending"},
+    ])
+    second = agent.update_plan([
+        {"content": "read", "status": "completed"},
+        {"content": "write", "status": "in_progress"},
+    ])
+    assert "contract: signed by user" in first
+    assert "contract: signed by user" in second
+    assert len(asked) == 1              # progress is not a new contract
+
+    third = agent.update_plan([
+        {"content": "read", "status": "completed"},
+        {"content": "write and test", "status": "in_progress"},
+    ])
+    assert "contract: signed by user" in third
+    assert len(asked) == 2              # changed steps need a new signature
+
+
+def test_an_active_plan_gate_with_no_approver_fails_closed():
+    reset()
+    agent.set_plan_gate(None, active=True)
+
+    out = agent.update_plan([
+        {"content": "write", "status": "in_progress"},
+    ])
+
+    assert out.startswith("Error: plan contract - no human approver")
+    assert agent.plan_write_block("run_shell").startswith(
+        "Error: plan contract denied")
+
+
+def test_a_crashing_plan_approver_fails_closed():
+    reset()
+
+    def broken(_contract):
+        raise RuntimeError("modal died")
+
+    agent.set_plan_gate(broken, active=True)
+    out = agent.update_plan([
+        {"content": "write", "status": "in_progress"},
+    ])
+
+    assert out.startswith("Error: plan contract - approval failed")
+    assert agent.plan_write_block(
+        "write_file", {"file_path": "x.txt"}).startswith(
+            "Error: plan contract denied")
+
+
+def test_a_write_outside_the_signed_plan_stops_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "other.txt")
+        plan = json.dumps({
+            "todos": [{"content": "write allowed.txt",
+                       "status": "in_progress"}],
+            "files": ["allowed.txt"],
+        })
+        write = json.dumps({"file_path": target, "content": "drift"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("must not be reached"),
+        ])
+
+        reset(client)
+        agent.set_plan_gate(lambda contract: True, active=True)
+        events = []
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write the note", 25, agent.new_stats(),
+                                     on_event=lambda *a, **k: events.append((a, k)))
+
+        assert outcome == "refused"
+        assert len(client.calls) == 2
+        assert not pathlib.Path(target).exists()
+        assert any(
+            "path" in str(kwargs.get("message", ""))
+            and "not in the signed plan" in str(kwargs.get("message", ""))
+            for _, kwargs in events
+        )
+        assert_history_valid(agent.history)
+
+
+def test_the_dossier_gate_holds_the_first_write_until_evidence():
+    with tempfile.TemporaryDirectory() as tmp:
+        pathlib.Path(tmp, "sample.py").write_text("value = 1\n")
+        reset()
+        agent.set_dossier_gate(True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            blocked = agent.dispatch_tool(
+                "write_file", {"file_path": "note.txt", "content": "hello"})
+            assert blocked.startswith("Error: dossier gate")
+            assert not pathlib.Path(tmp, "note.txt").exists()
+            assert agent.dossier_write_block("run_shell").startswith(
+                "Error: dossier gate")
+
+            evidence = agent.dispatch_tool(
+                "analyze_structure", {"directory": tmp, "focus": "all"})
+            assert "STRUCTURE ANALYSIS" in evidence
+
+            allowed = agent.dispatch_tool(
+                "write_file", {"file_path": "note.txt", "content": "hello"})
+            assert allowed.startswith("success")
+            assert pathlib.Path(tmp, "note.txt").read_text() == "hello"
+
+
+def test_finish_investigation_alone_does_not_unlock_a_write():
+    reset()
+    agent.set_dossier_gate(True)
+    with mock.patch.dict(agent._INVESTIGATED_TARGETS, {}, clear=True):
+        summary = agent.dispatch_tool("finish_investigation", {})
+
+    assert "INVESTIGATION FINISHED" in summary
+    assert agent.dossier_write_block("write_file").startswith(
+        "Error: dossier gate")
+
+
+def test_a_signed_plan_declares_files_risks_and_verification():
+    with tempfile.TemporaryDirectory() as tmp:
+        reset()
+        seen = []
+        agent.set_plan_gate(
+            lambda contract: seen.append(contract) or True, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.update_plan(
+                [{"content": "write allowed.txt", "status": "in_progress"}],
+                files=["allowed.txt"],
+                verification=[".venv/bin/python -m pytest -q"],
+                risks=["the file is new"],
+                cost_range_usd=[0.0, 0.02],
+            )
+            allowed = agent.plan_write_block(
+                "write_file", {"file_path": "allowed.txt"})
+            denied = agent.plan_write_block(
+                "write_file", {"file_path": "other.txt"})
+
+        assert seen[0]["files"] == ["allowed.txt"]
+        assert seen[0]["cost_range_usd"] == [0.0, 0.02]
+        assert "files: allowed.txt" in out
+        assert "verification: .venv/bin/python -m pytest -q" in out
+        assert "risk: the file is new" in out
+        assert "cost range: 0.0000-0.0200 (hypothetical)" in out
+        assert allowed is None
+        assert denied.startswith("Error: plan contract - path 'other.txt'")
+
+
+# ---------- the investigation tools ----------
+
+def test_investigate_target_walks_a_directory_without_crashing():
+    with mock.patch.object(agent, "COMPANY_ID", None, create=True):
+        out = agent.investigate_target(
+            "company/work/todoinc/apps/todo", "todo", "medium")
+
+    assert "Directory:" in out
+    assert "Feature traces for 'todo'" in out
+    assert "Error investigating" not in out
+    assert "src/todo.py" in out or "tests/test_todo.py" in out
+
+
 # ---------- request tuning ----------
 
 def test_call_model_retries_without_optional_fields():
@@ -1172,19 +1691,23 @@ def test_cap_and_compaction_constants_are_actually_tuned():
 
 
 def test_the_agent_still_works_after_all_this_prompt_work():
-    """the whole point of the rewrite: same 8 tools, same params, and a turn
+    """the whole point of the rewrite: same tools, same params, and a turn
     still completes with a real-ish loop"""
     assert [t["function"]["name"] for t in agent.TOOLS] == [
         "run_shell", "write_file", "edit_file", "read_file",
         "list_directory", "create_directory", "search_in_files",
-        "update_plan"]
+        "update_plan", "investigate_target", "trace_feature",
+        "analyze_structure", "build_similar", "record_unknown",
+        "record_comparison", "finish_investigation", "boundary_accuracy",
+        "model_performance_comparison", "reasoning_chain"]
 
     params = {t["function"]["name"]: sorted(
         t["function"]["parameters"]["properties"]) for t in agent.TOOLS}
 
     assert params["read_file"] == ["file_path"]
     assert params["edit_file"] == ["file_path", "new_text", "old_text"]
-    assert params["update_plan"] == ["todos"]
+    assert params["update_plan"] == [
+        "cost_range_usd", "files", "risks", "todos", "verification"]
 
     client = FakeClient([
         response(None, [tool_call("p1", "update_plan",
@@ -1381,6 +1904,35 @@ def test_bridge_translator_maps_milestones_to_events():
     assert got[5].unpriced_steps == 1
 
 
+def test_bridge_translator_maps_model_events_to_the_tui():
+    """The TUI hides the console, so a switch must also travel as an event.
+
+    This is the wiring that makes rotation visible in the terminal UI: the chip
+    follows every step, and a card is drawn only when the model really changed.
+    """
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import ModelSwitch
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("model_used", model="a/free:free", tier="free")
+    emit("model_switch", old_model="a/free:free", new_model="b/free:free",
+         old_tier="free", new_tier="free", reason="rotation",
+         estimated_savings_usd=0.0)
+
+    chip = out.get_nowait()
+    assert chip == {"type": "model_update", "model": "a/free:free"}
+
+    switch = out.get_nowait()
+    assert isinstance(switch, ModelSwitch)
+    assert switch.old_model == "a/free:free"
+    assert switch.new_model == "b/free:free"
+    assert switch.reason == "rotation"
+
+
 def test_bridge_keeps_a_missing_turn_cost_as_none():
     import queue as queue_module
 
@@ -1397,6 +1949,32 @@ def test_bridge_keeps_a_missing_turn_cost_as_none():
     assert isinstance(turn, TurnEnd)
     assert turn.cost_usd is None
     assert turn.unpriced_steps == 0
+
+
+def test_bridge_carries_the_checkpoint_facts():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import TurnEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("turn_end", prompt_tokens=1, completion_tokens=1,
+         total_duration_sec=0.5, checkpoint_id="cp-abcd1234",
+         checkpoint_files=2, checkpoint_shell=True,
+         checkpoint_added=7, checkpoint_removed=3,
+         checkpoint_diff_paths=2, checkpoint_diff_truncated=True)
+
+    turn = out.get_nowait()
+    assert isinstance(turn, TurnEnd)
+    assert turn.checkpoint_id == "cp-abcd1234"
+    assert turn.checkpoint_files == 2
+    assert turn.checkpoint_shell is True
+    assert turn.checkpoint_added == 7
+    assert turn.checkpoint_removed == 3
+    assert turn.checkpoint_diff_paths == 2
+    assert turn.checkpoint_diff_truncated is True
 
 
 def test_bridge_translator_tolerates_missing_optional_fields():
@@ -1435,12 +2013,13 @@ def test_main_routes_tui_mode():
 
     try:
         result = agent.main(["--tui", "--company-id", "acme",
-                             "--max-steps", "5"])
+                             "--max-steps", "5", "--unbounded"])
     finally:
         bridge.run_tui = original_run
         # main() sets COMPANY_ID globally; undo it so later tests are unbounded
         if saved_company is missing:
-            delattr(agent, "COMPANY_ID")
+            if hasattr(agent, "COMPANY_ID"):
+                delattr(agent, "COMPANY_ID")
         else:
             agent.COMPANY_ID = saved_company
 
@@ -1468,11 +2047,12 @@ def test_main_forwards_task_id_and_assignee_to_the_tui():
     try:
         result = agent.main(["--tui", "--company-id", "acme", "--max-steps",
                              "5", "--task-id", "PROJ-1457", "--assignee",
-                             "alex"])
+                             "alex", "--unbounded"])
     finally:
         bridge.run_tui = original_run
         if saved_company is missing:
-            delattr(agent, "COMPANY_ID")
+            if hasattr(agent, "COMPANY_ID"):
+                delattr(agent, "COMPANY_ID")
         else:
             agent.COMPANY_ID = saved_company
 
@@ -1760,6 +2340,18 @@ def test_build_system_prompt_appends_the_assignment():
     assert "PROJ-1457" in prompt
     assert "company/work/acme" in prompt
 
+    with _as_company("todoinc"), _as_assignment(None, None), \
+            mock.patch.object(
+                agent, "_ACTIVE_POLICY",
+                agent.PolicyProfile(
+                    name="todo-app",
+                    root="company/work/todoinc/apps/todo")):
+        project_prompt = agent.build_system_prompt()
+
+    assert "company/work/todoinc/apps/todo" in project_prompt
+    assert "do not use '.'" in project_prompt.lower()
+    assert "outside the project" in project_prompt
+
 
 def test_run_turn_sends_the_assignment_to_the_model():
     reset(FakeClient([response("ok", prompt_tokens=1, completion_tokens=1)]))
@@ -1783,7 +2375,8 @@ def test_main_records_the_assignment_globals():
 
     try:
         result = agent.main(["--task", "go", "--company-id", "acme",
-                             "--task-id", "PROJ-1", "--assignee", "alex"])
+                             "--task-id", "PROJ-1", "--assignee", "alex",
+                             "--unbounded"])
     finally:
         for name, value in saved.items():
             if value is missing:
@@ -1918,11 +2511,27 @@ def test_company_boundary_rejects_a_traversal_id():
     assert "not a valid single path segment" in out
 
 
-def test_resolve_in_company_workspace_rejects_a_bad_id():
+def test_company_resolution_rejects_bad_ids_and_explains_dot():
     resolved, err = agent.resolve_in_company_workspace("x", "../etc")
 
     assert resolved is None
     assert "not a valid single path segment" in err
+
+    root = "company/work/todoinc/apps/todo"
+    policy = agent.PolicyProfile(name="todo-app", root=root)
+
+    with mock.patch.object(agent, "_ACTIVE_POLICY", policy):
+        read_path, read_error = agent.resolve_in_company_workspace(
+            ".", "todoinc")
+        write_error = agent.policy_check(
+            "write_file", {"file_path": ".", "content": ""})
+
+    assert read_path is None
+    assert "repository root" in read_error
+    assert root in read_error
+    assert "outside company work area" not in read_error
+    assert "outside write scope" not in write_error
+    assert "repository root" in write_error
 
 
 def test_edit_file_refuses_empty_old_text():
@@ -2237,6 +2846,36 @@ def test_policy_audit_records_every_gate_decision():
     assert "not allowed" in audit[1]["reason"]
 
 
+def test_policy_audit_redacts_written_content():
+    """The trail records the decision, not a second copy of the file body."""
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "tracked"
+
+        [tools]
+        allow = ["write_file"]
+        """
+    )
+    assert err is None
+
+    body = "API_KEY=super-secret-value\n" * 10
+
+    with _with_policy(profile):
+        agent.policy_audit(
+            "write_file",
+            {"file_path": "company/work/acme/x.py", "content": body},
+            "allow",
+            None,
+        )
+        row = agent.POLICY_AUDIT[-1]
+
+    assert "super-secret-value" not in str(row)
+    assert row["args"]["file_path"] == "company/work/acme/x.py"
+    assert row["args"]["content"].startswith("<")
+    assert "sha256:" in row["args"]["content"]
+
+
 def test_policy_inactive_by_default_passes_everything_through():
     """No policy loaded - the dispatch gate is a no-op, unbounded as before."""
     with _with_policy(None), tempfile.TemporaryDirectory() as tmp, \
@@ -2425,8 +3064,10 @@ def test_main_loads_policy_flag_before_running():
     reset(FakeClient([response("done", prompt_tokens=10, completion_tokens=2)]))
 
     try:
-        code = agent.main(["--policy", policy_path,
-                           "--task", "look around"])
+        # _main is the in-process body; main() deliberately restores policy
+        # state on exit, so a leakage assertion must use _main.
+        code = agent._main(["--policy", policy_path,
+                            "--task", "look around"])
     finally:
         os.unlink(policy_path)
 
@@ -2434,6 +3075,265 @@ def test_main_loads_policy_flag_before_running():
     agent.set_active_policy(None)
     assert code == 0
     assert active is not None and active.name == "cli-bounded"
+
+
+# ---------- use-case scope gate ([domain] allow/deny) ----------
+
+DOMAIN_TOML = """
+    version = "1"
+
+    [use_case]
+    name = "todo-app"
+
+    [domain]
+    allow = ["todo", "task", "to-do", "due date", "item", "checklist"]
+    deny = ["chatgpt", "chatbot", "build an agent", "crypto", "llm"]
+"""
+
+
+def test_policy_parses_the_domain_terms():
+    profile, err = _load_policy_text(DOMAIN_TOML)
+
+    assert err is None
+    assert "todo" in profile.domain_allow
+    assert "chatgpt" in profile.domain_deny
+
+
+def test_no_domain_table_leaves_the_gate_off():
+    profile, err = _load_policy_text("""
+        [use_case]
+        name = "plain"
+    """)
+
+    assert err is None
+    assert profile.domain_allow == []
+    assert profile.domain_deny == []
+
+
+def test_domain_gate_allows_an_in_scope_request():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        assert agent.domain_check("add a due date to each todo item") is None
+
+
+def test_domain_gate_refuses_a_request_with_no_in_scope_term():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        refusal = agent.domain_check("build me a ChatGPT clone")
+
+        assert refusal is not None
+        assert refusal.startswith("Error: boundary")
+
+
+def test_domain_deny_wins_over_an_in_scope_term():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        # mentions "task" (allowed) and "chatbot" (denied): deny wins
+        refusal = agent.domain_check("add a task, then also build a chatbot")
+
+        assert refusal is not None
+        assert "chatbot" in refusal
+
+
+def test_domain_gate_is_off_without_a_policy():
+    assert agent.domain_check("build a ChatGPT clone") is None
+
+
+def test_a_refused_turn_calls_no_model_and_leaves_history_clean():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    client = FakeClient([response("must not be reached")])
+    reset(client)
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("build me a ChatGPT clone", 25,
+                                 agent.new_stats())
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "refused"
+    assert client.calls == []          # no token was spent
+    assert agent.history == []         # nothing entered the transcript
+    assert decisions == ["refuse-domain"]
+
+
+def test_a_refused_turn_emits_a_boundary_status_and_a_turn_end():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    reset(FakeClient([response("must not be reached")]))
+
+    events = []
+
+    with _with_policy(profile):
+        agent.run_turn("write a crypto trading bot", 25, agent.new_stats(),
+                       on_event=lambda n, **f: events.append((n, f)))
+
+    statuses = [f for n, f in events if n == "status"]
+
+    assert statuses and statuses[0]["message"].startswith("Error: boundary")
+    assert events[-1][0] == "turn_end"   # the view re-enables input
+
+
+def test_an_in_scope_turn_still_reaches_the_model():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    client = FakeClient([response("added a due date to every item")])
+    reset(client)
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a due date to each todo item", 25,
+                                 agent.new_stats())
+
+    assert outcome == "done"
+    assert len(client.calls) == 1
+
+
+def test_run_task_exits_nonzero_on_a_scope_refusal():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    reset(FakeClient([response("must not be reached")]))
+
+    with _with_policy(profile):
+        code = agent.run_task("build me a ChatGPT clone", 25)
+
+    assert code == 1
+
+
+# ---------- verify-before-execute: the whole plan is checked, then run ----------
+
+def test_verify_plan_is_a_noop_without_a_policy():
+    assert agent.verify_plan([("read_file", {"file_path": "x"})]) == []
+
+
+def test_verify_plan_flags_a_call_that_leaves_the_project():
+    profile, _ = _load_policy_text("""
+        [use_case]
+        name = "todo-app"
+
+        [paths]
+        deny_read = ["company/work/todoinc/apps/chatbot/**"]
+    """)
+
+    with _with_policy(profile):
+        failures = agent.verify_plan([
+            ("read_file",
+             {"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}),
+            ("read_file",
+             {"file_path": "company/work/todoinc/apps/todo/src/todo.py"}),
+        ])
+
+    assert [name for name, _ in failures] == ["read_file"]
+
+
+BATCH_POLICY = """
+    version = "1"
+
+    [use_case]
+    name = "todo-app"
+
+    [domain]
+    allow = ["todo"]
+
+    [paths]
+    allow_write = ["company/work/todoinc/apps/todo/**"]
+    deny_read = ["company/work/todoinc/apps/chatbot/**"]
+"""
+
+
+def test_a_batch_that_leaves_the_project_executes_none_of_it():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    target = "company/work/todoinc/apps/todo/should-not-exist.py"
+    probe = os.path.join(agent.WORKSPACE, target)
+    if os.path.exists(probe):
+        os.unlink(probe)
+
+    reset(FakeClient([
+        response(None, [
+            tool_call("c1", "write_file",
+                      json.dumps({"file_path": target, "content": "x"})),
+            tool_call("c2", "read_file",
+                      '{"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}'),
+        ]),
+        response("understood"),
+    ]))
+
+    events = []
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats(),
+                                 on_event=lambda n, **f: events.append((n, f)))
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "refused"            # a boundary batch stops the turn
+    assert len(agent.client.calls) == 1    # no re-proposal: the turn stopped
+    assert not os.path.exists(probe)       # the in-scope write did NOT run
+    assert decisions.count("deny") == 2    # both calls in the batch were refused
+
+    ends = [f for n, f in events if n == "tool_end"]
+    assert ends and all(f["success"] is False for f in ends)
+    assert any("boundary" in f["result"] for f in ends)
+
+
+def test_a_fully_in_scope_batch_executes():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call(
+            "c1", "read_file",
+            '{"file_path": "company/work/todoinc/apps/todo/README.md"}')]),
+        response("read it"),
+    ]))
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats())
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "done"
+    assert "allow" in decisions
+    assert "deny" not in decisions
+
+
+def test_a_secret_read_stops_the_turn_too():
+    # a per-call deliberate refusal (the secret guard) is terminal in the same
+    # way a policy denial is: the turn stops rather than retrying
+    profile, err = _load_policy_text("""
+        [use_case]
+        name = "todo-app"
+
+        [tools]
+        allow = ["read_file"]
+    """)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call("c1", "read_file", '{"file_path": ".env"}')]),
+        response("should not run"),
+    ]))
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats())
+
+    assert outcome == "refused"
+    assert len(agent.client.calls) == 1
+
+
+def test_run_task_marks_a_refusal_and_exits_nonzero():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call(
+            "c1", "read_file",
+            '{"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}')]),
+        response("unreached"),
+    ]))
+
+    with _with_policy(profile):
+        code = agent.run_task("add a todo to the list", 25)
+
+    assert code == 1
+    assert any("REFUSED" in line for line in PRINTED)
 
 
 # ---------- managed mode (--require-proxy / D12) ----------
@@ -2685,6 +3585,43 @@ def test_is_deliberate_refusal_separates_policy_and_secrets_from_failures():
     assert not agent.is_deliberate_refusal("ok, done")
 
 
+def test_is_rate_limit_error_matches_provider_limits_only():
+    assert agent.is_rate_limit_error(
+        RuntimeError("Error code: 429 - Rate limit exceeded"))
+    assert agent.is_rate_limit_error(
+        RuntimeError("Rate limit exceeded: free-models-per-day"))
+    assert agent.is_rate_limit_error(SimpleNamespace(status_code=429))
+
+    assert not agent.is_rate_limit_error(RuntimeError("Connection error."))
+    assert not agent.is_rate_limit_error(RuntimeError("model not found"))
+
+
+def test_a_rate_limited_provider_is_reported_honestly():
+    # the free-tier daily limit is the most common live-demo failure: it must
+    # be named as a provider limit, never as a boundary block or completed work
+    reset(FakeClient([
+        RuntimeError("Error code: 429 - Rate limit exceeded: "
+                     "free-models-per-day"),
+    ]))
+
+    events = []
+    outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats(),
+                             on_event=lambda n, **f: events.append((n, f)))
+
+    assert outcome == "error"                      # exits non-zero, not "done"
+    assert len(agent.client.calls) == 1            # it did try the call
+
+    joined = "\n".join(PRINTED)
+    assert "provider limit" in joined
+    assert "not a use-case boundary block" in joined
+    assert "429" not in joined                     # the raw provider JSON is hidden
+
+    statuses = [f["message"] for n, f in events if n == "status"]
+    assert any("provider rate limited" in m for m in statuses)
+    # and it is never mistaken for a boundary event in the UI
+    assert not any(m.startswith("Error: boundary") for m in statuses)
+
+
 def test_context_size_from_measures_only_the_tail():
     reset()
     agent.history.extend([
@@ -2701,8 +3638,9 @@ TIERS = {"AGENT_MODEL_FREE": "free/x", "AGENT_MODEL_MID": "mid/x",
          "AGENT_MODEL_PREMIUM": "premium/x", "AGENT_EFFORT_POLICY": "auto"}
 
 
-def test_a_policy_denial_does_not_escalate_the_next_step():
-    # a denied tool is not the model struggling, so the next step stays cheap
+def test_a_policy_denial_stops_the_turn_without_escalating():
+    # a denied tool is not the model struggling: the turn stops rather than
+    # climbing to a bigger model to retry the very call the fence refused
     client = FakeClient([
         response(None, [tool_call("c1", "list_directory", '{"path": "."}')]),
         response("all done"),
@@ -2714,15 +3652,15 @@ def test_a_policy_denial_does_not_escalate_the_next_step():
 
     try:
         with mock.patch.dict(os.environ, TIERS):
-            assert agent.run_turn("look around", 25, agent.new_stats()) == "done"
+            outcome = agent.run_turn("look around", 25, agent.new_stats())
     finally:
         agent.set_active_policy(None)
 
-    assert "Error: policy deny" in PRINTED[-1] or any(
-        "policy deny" in line for line in PRINTED)
-    # the step that followed the denial still ran on the free tier
+    assert outcome == "refused"
+    assert any("policy deny" in line for line in PRINTED)
+    # the turn stopped after the denial: no escalated second step
+    assert len(client.calls) == 1
     assert client.calls[0]["model"] == "free/x"
-    assert client.calls[1]["model"] == "free/x"
 
 
 def test_pre_existing_history_does_not_escalate_a_small_step():

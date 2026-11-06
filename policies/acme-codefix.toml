@@ -1,0 +1,40 @@
+# Boundary for ONE project: acme / codefix-bot
+#
+# Demonstrates the difference between the COMPANY fence (company/work/acme/)
+# and the USE-CASE fence (bots/codefix/ only). A real deployment keeps this
+# file outside the agent's reach, e.g. ~/.config/tamias/policies/acme-codefix.toml.
+version = "1"
+
+[use_case]
+name      = "codefix-bot"
+root      = "company/work/acme/bots/codefix"
+read_only = false
+
+[tools]
+# absent tool = disabled; this bot gets the code-fix set and nothing else
+allow = ["read_file", "search_in_files", "list_directory", "edit_file", "write_file", "run_shell"]
+deny  = []
+ask   = ["write_file", "edit_file"]   # a human must confirm every change (headless = no)
+
+[run_shell]
+allow   = ["python3 -m pytest", "git status", "git diff", "git log"]
+deny    = ["rm ", "mv ", "curl ", "wget ", "git push", "chmod ", "cat ", "ssh "]
+timeout = 30
+
+[paths]
+# the project boundary: writes only here...
+allow_write = ["company/work/acme/bots/codefix/**"]
+# ...and reads that never leave here. `dir/**` covers files *under* dir, so the
+# bare dir is listed too - otherwise list_directory/search_in_files on the
+# directory path itself would pass the gate (found by demo/check_boundary.py).
+deny_read   = [
+  "company/work/acme/bots/payments",
+  "company/work/acme/bots/payments/**",
+  "company/work/acme/hr",
+  "company/work/acme/hr/**",
+  "**/*.pem",
+]
+
+[audit]
+# outside the fence, so the agent cannot rewrite its own trail
+path = "policies/acme-codefix.audit.jsonl"

@@ -316,7 +316,7 @@ class LiveRunner:
                               note="external arm not wired")
 
         command = [self.python, self.agent_path, "--task", task.prompt,
-                   "--max-steps", str(self.max_steps)]
+                   "--max-steps", str(self.max_steps), "--unbounded"]
 
         try:
             completed = subprocess.run(command, cwd=self.cwd,

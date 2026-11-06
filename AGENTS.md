@@ -19,6 +19,8 @@ for every claim).
 - `brief.py` — the offline brief compiler (D13, `docs/BRIEF.md`).
 - `context_index.py` — the offline symbol/name/content index (D14,
   `docs/CONTEXT-INDEX.md`).
+- `checkpoints.py` — Time Travel v1: pre-write file snapshots, preview and
+  restore safety (no UI imports).
 - `bench.py` — the cost-per-success benchmark harness (D17, `docs/BENCHMARK.md`).
 - Not part of the published `tamias` package. It is a **demo dependency**.
 

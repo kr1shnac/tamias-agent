@@ -27,6 +27,8 @@ import uuid
 import agent as core
 from tui.events import (
     MessageDelta,
+    ModelSwitch,
+    PlanAsk,
     StatusUpdate,
     ToolAsk,
     ToolEnd,
@@ -73,6 +75,51 @@ class AskGate:
         self._event.set()
 
 
+class PlanGate:
+    """One-at-a-time bridge for signing the agent's published plan.
+
+    The core blocks before the first write until ``ask`` returns. Like the
+    policy gate, no answer (or a closed screen) means ``False``: the plan is
+    denied and the turn stops without touching the project.
+    """
+
+    TIMEOUT_SEC = 300.0
+
+    def __init__(self, agent_queue):
+        self.agent_queue = agent_queue
+        self._event = threading.Event()
+        self._answer = False
+
+    def ask(self, contract):
+        """Called from the agent worker thread; blocks for the signature."""
+        if isinstance(contract, list):
+            contract = {"todos": contract}
+        payload = {
+            "todos": [
+                {"content": str(todo.get("content", "")),
+                 "status": str(todo.get("status", ""))}
+                for todo in contract.get("todos", [])
+            ],
+            "files": [str(item) for item in contract.get("files", [])],
+            "verification": [str(item)
+                             for item in contract.get("verification", [])],
+            "risks": [str(item) for item in contract.get("risks", [])],
+            "cost_range_usd": contract.get("cost_range_usd"),
+        }
+
+        self._answer = False
+        self._event.clear()
+        self.agent_queue.put(PlanAsk(contract=payload))
+
+        answered = self._event.wait(timeout=self.TIMEOUT_SEC)
+        return bool(answered and self._answer)
+
+    def resolve(self, approved):
+        """Called from the view thread with the human's decision."""
+        self._answer = bool(approved)
+        self._event.set()
+
+
 def make_translator(agent_queue, session_id):
     """Return an ``on_event`` callback that pushes ``tui.events`` onto a queue.
 
@@ -96,6 +143,18 @@ def make_translator(agent_queue, session_id):
                 content=fields.get("content", ""),
                 model=fields.get("model", ""),
             ))
+        elif name == "model_used":
+            # keeps the header chip on the model that actually answered a step
+            agent_queue.put({"type": "model_update", "model": fields.get("model", "")})
+        elif name == "model_switch":
+            agent_queue.put(ModelSwitch(
+                old_model=fields.get("old_model", ""),
+                new_model=fields.get("new_model", ""),
+                old_tier=fields.get("old_tier", "free"),
+                new_tier=fields.get("new_tier", "free"),
+                reason=fields.get("reason", "auto-escalation"),
+                estimated_savings_usd=float(fields.get("estimated_savings_usd", 0.0)),
+            ))
         elif name == "tool_start":
             agent_queue.put(ToolStart(
                 tool_call_id=fields.get("tool_call_id", ""),
@@ -117,6 +176,18 @@ def make_translator(agent_queue, session_id):
                 total_duration_sec=float(fields.get("total_duration_sec", 0.0)),
                 cost_usd=None if raw_cost is None else float(raw_cost),
                 unpriced_steps=int(fields.get("unpriced_steps", 0) or 0),
+                model=str(fields.get("model", "") or ""),
+                tier=str(fields.get("tier", "") or ""),
+                model_usage=fields.get("model_usage") or {},
+                checkpoint_id=str(fields.get("checkpoint_id", "") or ""),
+                checkpoint_files=int(fields.get("checkpoint_files", 0) or 0),
+                checkpoint_shell=bool(fields.get("checkpoint_shell", False)),
+                checkpoint_added=int(fields.get("checkpoint_added", 0) or 0),
+                checkpoint_removed=int(fields.get("checkpoint_removed", 0) or 0),
+                checkpoint_diff_paths=int(
+                    fields.get("checkpoint_diff_paths", 0) or 0),
+                checkpoint_diff_truncated=bool(
+                    fields.get("checkpoint_diff_truncated", False)),
             ))
 
     return on_event
@@ -138,7 +209,7 @@ def _silence_console():
 
 
 def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None,
-                 ask_gate=None):
+                 ask_gate=None, plan_gate=None):
     """Consume user turns from ``ui_queue`` and drive the agent core.
 
     Emits ``tui.events`` onto ``agent_queue``. Runs until it sees ``None``
@@ -152,6 +223,17 @@ def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None,
     # own default (no one to ask), which denies fail-closed
     if ask_gate is not None:
         core.ASK_HANDLER = ask_gate.ask
+
+    # The interactive view always has a human who can sign; a published plan is
+    # held until they do. Headless runs never install this gate.
+    if plan_gate is not None:
+        core.set_plan_gate(plan_gate.ask, active=True)
+
+    # The dossier gate is on by default in the interactive view; an operator
+    # can turn it off with AGENT_DOSSIER_GATE=0 for a quick demo. Headless runs
+    # never reach this function, so the CLI keeps its existing behaviour.
+    core.set_dossier_gate(
+        os.environ.get("AGENT_DOSSIER_GATE", "1") != "0")
 
     session_id = uuid.uuid4().hex[:12]
     emit = make_translator(agent_queue, session_id)
@@ -194,16 +276,34 @@ def agent_worker(ui_queue, agent_queue, max_steps=25, company_id=None,
             if len(parts) == 2 and parts[1].strip():
                 requested = parts[1].strip()
 
-                if not core.model_allowed(requested):
+                if not core.model_runnable(requested):
+                    reason = "outside this policy's model allowlist"
+                    try:
+                        import providers
+                        if not providers.model_allowed(requested):
+                            reason = providers.why_blocked(requested)
+                    except Exception:
+                        pass
                     agent_queue.put(StatusUpdate(
-                        message=(f"Error: model '{requested}' is outside this "
-                                 "policy's model allowlist"),
+                        message=f"Error: model '{requested}' is refused - {reason}",
                         is_busy=False,
                     ))
                     continue
 
+                old_model = core.MODEL
+                old_tier = core._tier_of_model(old_model)
                 core.MODEL = requested
+                new_tier = core._tier_of_model(requested)
+
                 agent_queue.put({"type": "model_update", "model": core.MODEL})
+                agent_queue.put(ModelSwitch(
+                    old_model=old_model,
+                    new_model=requested,
+                    old_tier=old_tier,
+                    new_tier=new_tier,
+                    reason="manual",
+                    estimated_savings_usd=0.0,
+                ))
             continue
 
         try:
@@ -224,10 +324,12 @@ def run_tui(max_steps=25, company_id=None, task_id=None, assignee=None):
     ui_queue = queue.Queue()
     agent_queue = queue.Queue()
     ask_gate = AskGate(agent_queue)
+    plan_gate = PlanGate(agent_queue)
 
     worker = threading.Thread(
         target=agent_worker,
         args=(ui_queue, agent_queue, max_steps, company_id, ask_gate),
+        kwargs={"plan_gate": plan_gate},
         daemon=True,
     )
     worker.start()
@@ -235,7 +337,8 @@ def run_tui(max_steps=25, company_id=None, task_id=None, assignee=None):
     try:
         TAMIASApp(ui_queue, agent_queue, company_id=company_id,
                   task_id=task_id, assignee=assignee,
-                  ask_gate=ask_gate).run()
+                  ask_gate=ask_gate, plan_gate=plan_gate,
+                  checkpoint_lookup=core.get_checkpoint).run()
     finally:
         ui_queue.put(None)          # stop the worker once the view is gone
         worker.join(timeout=2)

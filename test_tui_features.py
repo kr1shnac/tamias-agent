@@ -149,6 +149,14 @@ def test_boundary_detection():
     assert is_boundary_violation(
         "Error: '/etc/passwd' is outside company work area (company_id=acme)")
     assert is_boundary_violation("Error: '/etc/passwd' is outside the workspace")
+    # the policy gate and the use-case scope gate are boundary events too
+    assert is_boundary_violation(
+        "Error: policy deny - path 'x' is off-limits for use case 'todo-app'")
+    assert is_boundary_violation(
+        "Error: boundary - 'chatgpt' is outside use case 'todo-app'")
+    assert not is_boundary_violation(
+        "Error: '.' is the repository root, not the project. Use "
+        "'company/work/todoinc/apps/todo' or a path under it.")
     assert not is_boundary_violation("success")
     assert not is_boundary_violation("")
 
@@ -159,17 +167,22 @@ def test_taskboard_lifecycle():
     assert task.id.startswith("PROJ-")
 
     board.note_tool()
-    assert task.progress > 0
+    assert task.tool_calls == 1
+    assert task.progress == 0          # no invented in-flight percentage
 
-    for _ in range(50):  # in-flight progress must never reach 100
+    for _ in range(50):  # counts are facts; a percentage is not
         board.note_tool()
-    assert task.progress == 95
+    assert task.tool_calls == 51
+    assert task.progress == 0
+    assert "%" not in task.board_line()
 
     board.finish_turn()
-    assert task.progress == 100
+    assert task.status == "ready"
+    assert task.progress == 0          # a reply is not acceptance
 
     done = board.complete(spent_usd=12.5)
     assert done.status == "complete"
+    assert done.progress == 100        # only human confirmation sets 100%
     assert done.spent_usd == 12.5
     assert board.current is None
     assert done in board.history
@@ -179,8 +192,26 @@ def test_task_not_completed_without_complete():
     board = TaskBoard()
     board.begin("x")
     board.finish_turn()
-    assert board.current.status == "active"
+    assert board.current.status == "ready"
+    assert board.current.status != "complete"
     assert board.history == []
+
+
+def test_a_blocked_task_never_reads_as_ready():
+    board = TaskBoard()
+    board.begin("build a LinkedIn clone")
+    board.note_tool()
+    board.block()
+
+    task = board.current
+    assert task.status == "blocked"
+    assert task.progress < 100            # not "ready to complete"
+    assert "blocked" in task.board_line()
+    assert "✗" in task.board_line()
+
+    # and a blocked task that is superseded is kept, never silently dropped
+    board.begin("the next thing")
+    assert task in board.history
 
 
 # ---------------------------------------------------- task board honesty (§10)
@@ -402,18 +433,122 @@ def test_boundary_violation_opens_the_blocked_modal():
     _run(drive())
 
 
-def test_m_cycles_through_the_model_tiers():
+def test_a_scope_refusal_opens_the_blocked_modal():
+    from tui.app import TAMIASApp
+    from tui.modals import BoundaryModal
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue(), company_id="todoinc")
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.start_agent_turn("build me a ChatGPT clone")
+            # the core emits exactly this status when run_turn refuses a turn
+            app.handle_status_update(
+                "Error: boundary - 'chatgpt' is outside use case 'todo-app'",
+                False,
+            )
+            await pilot.pause()
+            assert isinstance(app.screen, BoundaryModal)
+            assert app.screen._attempted == "(off-topic request)"
+
+    _run(drive())
+
+
+def test_a_scope_refusal_modal_carries_the_savings_note():
+    from tui.app import TAMIASApp
+    from tui.modals import BoundaryModal
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue(), company_id="todoinc")
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.start_agent_turn("build me a LinkedIn clone")
+            app.handle_status_update(
+                "Error: boundary - 'clone' is outside use case 'todo-app'",
+                False,
+            )
+            await pilot.pause()
+            assert isinstance(app.screen, BoundaryModal)
+            assert "0 tokens" in app.screen._note   # nothing was sent
+
+    _run(drive())
+
+
+def test_a_boundary_turn_shows_only_one_modal():
+    from tui.app import TAMIASApp
+    from tui.modals import BoundaryModal
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue(), company_id="acme")
+        async with app.run_test(size=(120, 32)) as pilot:
+            pushes = []
+            original = app.push_screen
+
+            def counting(screen, *args, **kwargs):
+                if isinstance(screen, BoundaryModal):
+                    pushes.append(screen)
+                return original(screen, *args, **kwargs)
+
+            app.push_screen = counting
+            app.start_agent_turn("read /etc/passwd")
+            app.start_tool("t1", "read_file", '{"file_path": "/etc/passwd"}')
+            app.end_tool(
+                "t1",
+                "Error: '/etc/passwd' is outside company work area "
+                "(company_id=acme)",
+                True, 0.1,
+            )
+            # the core also emits a closing boundary status, then the turn end
+            app.handle_status_update(
+                "Error: boundary - blocked: outside company work area", False)
+            app.end_agent_turn()
+            await pilot.pause()
+
+            assert len(pushes) == 1     # the tool card's modal, not a duplicate
+
+    _run(drive())
+
+
+def test_a_boundary_turn_does_not_mark_the_task_ready():
+    from tui.app import TAMIASApp
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue(), company_id="acme")
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.start_agent_turn("read /etc/passwd")
+            app.start_tool("t1", "read_file", '{"file_path": "/etc/passwd"}')
+            app.end_tool(
+                "t1",
+                "Error: '/etc/passwd' is outside company work area "
+                "(company_id=acme)",
+                True, 0.1,
+            )
+            await pilot.pause()
+            app.end_agent_turn()
+            await pilot.pause()
+
+            task = app.board.current
+            assert task is not None
+            assert task.status == "blocked"     # not active, not complete
+            assert task.progress < 100          # never "ready"
+            assert "blocked" in str(
+                app.query_one("#task-board").render())
+
+    _run(drive())
+
+
+def test_m_cycles_through_the_runnable_models():
     from tui.app import MODEL_TIERS, TAMIASApp
 
     async def drive():
         app = TAMIASApp(queue.Queue(), queue.Queue())
         async with app.run_test(size=(120, 32)):
-            app.action_cycle_model()
-            assert app.current_model == MODEL_TIERS[1][1]
-            app.action_cycle_model()
-            assert app.current_model == MODEL_TIERS[2][1]
-            app.action_cycle_model()
-            assert app.current_model == MODEL_TIERS[0][1]
+            models = [model for _, model in MODEL_TIERS]
+            assert len(models) > 1
+            start = models.index(app.current_model)
+
+            # `m` walks the whole runnable list in order and wraps around
+            for step in (1, 2, 3):
+                app.action_cycle_model()
+                assert app.current_model == models[(start + step) % len(models)]
 
     _run(drive())
 
@@ -500,19 +635,36 @@ def test_slash_palette_offers_matching_models_after_model_command():
 # ------------------------------------------- model allowlist / cost labels (A6)
 
 
-def test_model_picker_marks_paid_models_and_filters_to_an_allowlist():
+def test_model_picker_offers_only_models_this_run_can_call(monkeypatch):
+    """Free models by default; a paid model needs --allow-paid or a usable key.
+
+    The picker is a promise: every row must be callable. Offering a paid model
+    while the run has no budget for it would be the one lie a demo cannot
+    survive, so the default menu is free-only.
+    """
     from tui.app import TAMIASApp
     from tui.model_picker import ModelPicker, listed_models
+    import model_catalog
 
-    # every catalogue entry carries a price marker, free or paid
-    labels = [f"{name} · {'free' if model.endswith(':free') else 'paid'}"
-              for name, model in listed_models()]
-    assert any(label.endswith("· free") for label in labels)
-    assert any(label.endswith("· paid") for label in labels)
+    monkeypatch.delenv("AGENT_ALLOW_PAID", raising=False)
 
-    # a policy that names models narrows the menu to exactly those
-    allowed = ["google/gemma-4-31b-it:free", "anthropic/claude-3-opus"]
+    free = model_catalog.ids("free")
+    assert free, "the catalog must ship free models"
+
+    offered = [model for _, model in listed_models()]
+    assert set(offered) <= set(free), "no paid model may be offered by default"
+    assert set(offered) == set(free), "every usable free model is offered"
+
+    # every row carries a visible tier marker so price is never a surprise
+    assert all(label.endswith(")") for label, _ in listed_models())
+
+    # a policy naming two free models narrows the menu to exactly those
+    allowed = free[:2]
     assert [model for _, model in listed_models(allowed)] == allowed
+
+    # a policy naming a paid model cannot resurrect it while paid is off
+    with_paid = allowed + ["anthropic/claude-3-opus"]
+    assert [model for _, model in listed_models(with_paid)] == allowed
 
     async def drive():
         app = TAMIASApp(queue.Queue(), queue.Queue())
@@ -522,6 +674,16 @@ def test_model_picker_marks_paid_models_and_filters_to_an_allowlist():
             assert [model for _, model in app.screen.entries] == allowed
 
     _run(drive())
+
+
+def test_picker_offers_paid_models_once_the_operator_allows_spend(monkeypatch):
+    from tui.model_picker import _build_models
+
+    monkeypatch.setenv("AGENT_ALLOW_PAID", "1")
+    tiers = {tier for _, _, tier in _build_models()}
+
+    assert "free" in tiers, "free models stay available"
+    assert {"mid", "premium"} <= tiers, "paid tiers appear only when allowed"
 
 
 def test_slash_model_search_respects_the_allowlist():
@@ -545,16 +707,37 @@ def test_slash_model_search_respects_the_allowlist():
 
 def test_app_choose_model_refuses_outside_the_allowlist():
     from tui.app import TAMIASApp
+    import model_catalog
+
+    free = model_catalog.ids("free")[0]
 
     async def drive():
         app = TAMIASApp(queue.Queue(), queue.Queue())
         async with app.run_test(size=(120, 34)):
             before = app.current_model
-            app._model_allowlist = lambda: ["free/x"]
-            app._choose_model("premium/x")
+            app._model_allowlist = lambda: [free]
+            app._choose_model("anthropic/claude-3-opus")
             assert app.current_model == before  # refused, chip unchanged
-            app._choose_model("free/x")
-            assert app.current_model == "free/x"
+            app._choose_model(free)
+            assert app.current_model == free
+
+    _run(drive())
+
+
+def test_app_choose_model_refuses_paid_models_without_opt_in(monkeypatch):
+    from tui.app import TAMIASApp
+
+    monkeypatch.delenv("AGENT_ALLOW_PAID", raising=False)
+
+    async def drive():
+        app = TAMIASApp(queue.Queue(), queue.Queue())
+        async with app.run_test(size=(120, 34)) as pilot:
+            before = app.current_model
+            app._choose_model("anthropic/claude-3-opus")
+            await pilot.pause()
+            assert app.current_model == before
+            shown = " ".join(str(node.render()) for node in app.query(".agent-turn"))
+            assert "--allow-paid" in shown   # says how to enable it, no dead end
 
     _run(drive())
 
@@ -610,7 +793,9 @@ def test_main_defaults_to_the_tui_on_an_interactive_terminal(monkeypatch):
                           task_id=task_id, assignee=assignee) or 0),
     )
 
-    assert agent.main([]) == 0
+    # --unbounded isolates launch routing from the deployment fence, which is
+    # covered by test_main_loads_the_deployment_boundary_for_the_ui
+    assert agent.main(["--unbounded"]) == 0
     assert called == {"max_steps": 25, "company_id": None,
                       "task_id": None, "assignee": None}
 
@@ -627,6 +812,46 @@ def test_main_plain_flag_keeps_the_text_repl(monkeypatch):
 
     assert agent.main(["--plain"]) == 0
     assert "tui" not in opened
+
+
+def test_main_loads_the_deployment_boundary_for_the_ui(monkeypatch):
+    # a human who just runs `agent.py` gets the fence without typing flags
+    import agent
+    import tui.bridge as bridge
+
+    seen = {}
+
+    def fake_run_tui(max_steps=25, company_id=None, task_id=None,
+                     assignee=None):
+        policy = agent.active_policy()
+        seen["policy"] = policy.name if policy else None
+        seen["company_arg"] = company_id
+        seen["company"] = getattr(agent, "COMPANY_ID", None)
+        return 0
+
+    monkeypatch.setattr(agent, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(bridge, "run_tui", fake_run_tui)
+
+    assert agent.main([]) == 0
+    assert seen["policy"] == "todo-app"      # the boundary was active
+    assert seen["company"] == "todoinc"
+    assert seen["company_arg"] == "todoinc"  # the board is not "unassigned"
+    # and it is restored, so an in-process caller is not left bounded
+    assert agent.active_policy() is None
+
+
+def test_unbounded_skips_the_deployment_boundary(monkeypatch):
+    import agent
+    import tui.bridge as bridge
+
+    def fake_run_tui(max_steps=25, company_id=None, task_id=None,
+                     assignee=None):
+        return 0 if agent.active_policy() is None else 3
+
+    monkeypatch.setattr(agent, "is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(bridge, "run_tui", fake_run_tui)
+
+    assert agent.main(["--unbounded"]) == 0
 
 
 # ------------------------------------------------ live event plumbing (§7-§9)
@@ -751,5 +976,126 @@ def test_the_app_confirms_an_ask_gated_call_can_be_refused():
             assert isinstance(app.screen, ConfirmModal)
             await _press(pilot, "n")
             assert gate.answers == [False]
+
+    _run(drive())
+
+
+# ------------------------------------------ plan contract (premium slice)
+
+
+def test_plan_gate_blocks_the_worker_until_the_plan_is_signed():
+    import threading
+
+    from tui.bridge import PlanGate
+
+    agent_queue = queue.Queue()
+    gate = PlanGate(agent_queue)
+    outcome = {}
+
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault("approved", gate.ask([
+            {"content": "write the note", "status": "in_progress"},
+        ])))
+    worker.start()
+
+    request = agent_queue.get(timeout=2)
+    assert request.contract["todos"] == [
+        {"content": "write the note", "status": "in_progress"}]
+
+    gate.resolve(True)
+    worker.join(timeout=2)
+    assert outcome["approved"] is True
+
+
+def test_plan_gate_fails_closed_when_nobody_answers():
+    from tui.bridge import PlanGate
+
+    gate = PlanGate(queue.Queue())
+    original = PlanGate.TIMEOUT_SEC
+    PlanGate.TIMEOUT_SEC = 0.05
+
+    try:
+        assert gate.ask([{"content": "write", "status": "pending"}]) is False
+    finally:
+        PlanGate.TIMEOUT_SEC = original
+
+
+def test_the_app_signs_a_plan_contract_through_a_modal():
+    from textual.widgets import Static
+
+    from tui.app import TAMIASApp
+    from tui.modals import PlanContractModal
+
+    class FakeGate:
+        def __init__(self):
+            self.answers = []
+
+        def resolve(self, approved):
+            self.answers.append(bool(approved))
+
+    async def drive():
+        gate = FakeGate()
+        app = TAMIASApp(queue.Queue(), queue.Queue(), plan_gate=gate)
+        async with app.run_test(size=(120, 36)) as pilot:
+            app.start_agent_turn("write a note")
+            app.confirm_plan_contract({
+                "todos": [
+                    {"content": "write the note", "status": "in_progress"},
+                    {"content": "run the tests", "status": "pending"},
+                ],
+                "files": ["note.txt"],
+                "verification": ["pytest -q"],
+                "risks": ["the note is new"],
+                "cost_range_usd": [0.0, 0.02],
+            })
+            await pilot.pause()
+            assert isinstance(app.screen, PlanContractModal)
+            text = " ".join(str(widget.render())
+                            for widget in app.screen.query(Static))
+            assert "PLAN CONTRACT" in text
+            assert "write the note" in text
+            assert "sign before the next write" in text
+            assert "note.txt" in text
+            assert "pytest -q" in text
+            assert "the note is new" in text
+            assert "$0.0000" in text
+
+            await _press(pilot, "y")
+            assert gate.answers == [True]
+            assert app.current_receipt.plan_approved is True
+
+    _run(drive())
+
+
+def test_the_app_denies_a_plan_contract_and_records_it():
+    from tui.app import TAMIASApp
+    from tui.modals import PlanContractModal
+
+    class FakeGate:
+        def __init__(self):
+            self.answers = []
+
+        def resolve(self, approved):
+            self.answers.append(bool(approved))
+
+    async def drive():
+        gate = FakeGate()
+        app = TAMIASApp(queue.Queue(), queue.Queue(), plan_gate=gate)
+        async with app.run_test(size=(120, 36)) as pilot:
+            app.start_agent_turn("write a note")
+            app.confirm_plan_contract([
+                {"content": "write the note", "status": "in_progress"},
+            ])
+            await pilot.pause()
+            assert isinstance(app.screen, PlanContractModal)
+            await _press(pilot, "n")
+            assert gate.answers == [False]
+
+            receipt = app.current_receipt
+            assert receipt.plan_denied is True
+            assert receipt.status == "plan denied"
+            assert "PLAN" in receipt.to_text()
+            assert "denied by user" in receipt.to_text()
+            assert "no writes ran" in receipt.to_text()
 
     _run(drive())

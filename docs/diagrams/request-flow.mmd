@@ -1,0 +1,26 @@
+# Request Flow Diagram (Mermaid)
+
+```mermaid
+flowchart TD
+    A[Agent] -->|HTTP request| B[Tamias Proxy]
+    B --> C{Router Mode}
+    C -->|shadow| D[Record decision]
+    D --> E[Forward unchanged]
+    C -->|active| F[Rewrite to cheap-model]
+    F --> G[Fail-closed gate]
+    G -->|pass| H[Forward to provider]
+    G -->|fail| I[Refuse request]
+    C -->|off| J[Forward unchanged]
+    J --> H
+
+    style A fill:#e1f5fe,stroke:#01579b
+    style B fill:#e1f5fe,stroke:#01579b
+    style C fill:#fff9c4,stroke:#f57f17
+    style D fill:#c8e6c9,stroke:#2e7d32
+    style E fill:#c8e6c9,stroke:#2e7d32
+    style F fill:#ffeb3b,stroke:#f57f17
+    style G fill:#ffeb3b,stroke:#f57f17
+    style H fill:#e8f5e9,stroke:#388e3c
+    style I fill:#ffcdd2,stroke:#c62828
+    style J fill:#e8f5e9,stroke:#388e3c
+```

@@ -32,13 +32,20 @@ def progress_bar(percent: int, width: int = 20) -> str:
 
 
 def is_boundary_violation(result: str) -> bool:
-    """A blocked tool result is any path that resolved outside its boundary."""
+    """A blocked result is any path/move that resolved outside its boundary.
+
+    Covers the filesystem fence ("outside the company work area"), the policy
+    gate's own refusals ("policy deny - ...") and a use-case scope refusal
+    ("Error: boundary - ..."), so every kind of block surfaces as one thing.
+    """
     if not result:
         return False
     lowered = result.lower()
     return (
         "outside company work area" in lowered
         or "outside the workspace" in lowered
+        or "policy deny" in lowered
+        or lowered.startswith("error: boundary")
     )
 
 
@@ -50,7 +57,7 @@ class Task:
     title: str
     start: float = field(default_factory=time.monotonic)
     progress: int = 0
-    status: str = "active"          # active | complete
+    status: str = "active"          # active | complete | blocked
     steps: int = 0
     tool_calls: int = 0
     spent_usd: float = 0.0          # provider-billed USD over the task
@@ -71,10 +78,20 @@ class Task:
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def board_line(self) -> str:
-        mark = "✓" if self.status == "complete" else "•"
-        return (f"[{mark}] {self.id} "
-                f"{'completed' if self.status == 'complete' else 'in progress'}  "
-                f"{self.bar} {self.progress:>3}%")
+        if self.status == "complete":
+            return (f"[✓] {self.id} completed  "
+                    f"{self.bar} 100%")
+        if self.status == "blocked":
+            return (f"[✗] {self.id} blocked  "
+                    f"(not completed · {self.steps} steps · "
+                    f"{self.tool_calls} tools)")
+        if self.status == "ready":
+            return (f"[◆] {self.id} ready to review  "
+                    f"· {self.steps} steps · {self.tool_calls} tools")
+        # A turn has no known denominator while it is running, so there is no
+        # honest percentage to show. Counts are facts; a bar would be theatre.
+        return (f"[•] {self.id} working  "
+                f"· {self.steps} steps · {self.tool_calls} tools")
 
 
 class TaskBoard:
@@ -96,9 +113,9 @@ class TaskBoard:
     # --- lifecycle ---------------------------------------------------------
     def begin(self, title: str) -> Task:
         """Start a new task, closing any in-flight one as superseded."""
-        if self.current is not None and self.current.status == "active":
+        if self.current is not None:
             # an unfinished task that gets replaced is kept in history so the
-            # board never silently drops work
+            # board never silently drops work (a blocked one is kept too)
             self.history.append(self.current)
 
         if self._task_id:
@@ -117,26 +134,32 @@ class TaskBoard:
         return self.current
 
     def note_step(self) -> None:
-        if self.current is None or self.current.status != "active":
+        if self.current is None or self.current.status not in ("active", "ready"):
             return
         self.current.steps += 1
-        self._bump()
 
     def note_tool(self) -> None:
-        if self.current is None or self.current.status != "active":
+        if self.current is None or self.current.status not in ("active", "ready"):
             return
         self.current.tool_calls += 1
-        self._bump()
-
-    def _bump(self) -> None:
-        task = self.current
-        # each step/tool nudges progress; capped below 100 until the turn ends
-        task.progress = min(IN_FLIGHT_CAP, task.progress + 9)
 
     def finish_turn(self) -> None:
-        """The agent finished its reply: the task is ready to be confirmed."""
+        """The agent finished its reply: the task is ready for human review.
+
+        It is not complete. Only :meth:`complete` (the confirmation modal) may
+        set 100%, because a reply is not evidence that the work was accepted.
+        """
         if self.current is not None and self.current.status == "active":
-            self.current.progress = 100
+            self.current.status = "ready"
+
+    def block(self) -> None:
+        """The turn hit the boundary: it is neither completed nor progressing.
+
+        A blocked task must never read as 100%/"ready" - the fix for a turn
+        that was stopped by the fence but still looked finished.
+        """
+        if self.current is not None and self.current.status == "active":
+            self.current.status = "blocked"
 
     def complete(self, spent_usd: float = 0.0) -> Optional[Task]:
         """Confirm completion. Only ever called from the confirmation modal."""

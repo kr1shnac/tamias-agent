@@ -13,6 +13,8 @@ live_check.db
 *.db
 *.db-journal
 demo/runs/
+# policy audit trails: per-action records, never committed
+policies/*.audit.jsonl
 sbom.json
 licenses.csv
 
