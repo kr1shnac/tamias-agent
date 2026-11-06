@@ -1,0 +1,47 @@
+# TODOINC / todo-app - the boundary for ONE product
+#
+# A real deployment keeps this file outside the agent's reach, e.g.
+# ~/.config/tamias/policies/todoinc-todo.toml. It is written by the company
+# admin, read by the agent, and never editable by the agent.
+version = "1"
+
+[use_case]
+name      = "todo-app"
+root      = "company/work/todoinc/apps/todo"
+company   = "todoinc"
+read_only = false
+
+# The product scope, checked on every request BEFORE any model call. A request
+# must mention one `allow` term (fail closed) and must not name any `deny`
+# term (deny wins). This is the "only the to-do app, nothing else" fence at the
+# level of *what the agent will work on*; the paths/tools below are the fence
+# at the level of *what it can reach*.
+[domain]
+allow = ["todo", "to-do", "to do", "task", "task list", "checklist", "item", "due date"]
+deny  = ["chatgpt", "chat gpt", "chatbot", "chat bot", "llm", "gpt", "openai",
+         "build an agent", "crypto", "trading bot", "rag", "clone", "linkedin",
+         "facebook", "instagram", "netflix", "uber", "amazon", "twitter"]
+
+[tools]
+allow = ["read_file", "search_in_files", "list_directory", "create_directory", "edit_file", "write_file", "run_shell", "update_plan", "investigate_target", "trace_feature", "analyze_structure", "build_similar", "record_unknown", "record_comparison", "finish_investigation", "boundary_accuracy", "model_performance_comparison", "reasoning_chain"]
+ask   = ["write_file", "edit_file", "create_directory"]   # a human confirms every change (headless = no)
+
+[run_shell]
+allow   = ["python3 -m pytest", "git status", "git diff", "git log"]
+deny    = ["rm ", "mv ", "curl ", "wget ", "git push", "chmod ", "cat ", "ssh "]
+timeout = 30
+
+[paths]
+# writes only inside the product...
+allow_write = ["company/work/todoinc/apps/todo/**"]
+# ...and reads that never leave it (list the dir AND dir/** - see demo/README)
+deny_read   = [
+  "company/work/todoinc/apps/chatbot",
+  "company/work/todoinc/apps/chatbot/**",
+  "company/work/todoinc/hr",
+  "company/work/todoinc/hr/**",
+  "**/*.pem",
+]
+
+[audit]
+path = "policies/todoinc-todo.audit.jsonl"

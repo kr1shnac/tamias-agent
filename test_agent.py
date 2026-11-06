@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import pathlib
 import subprocess
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest.mock as mock
+import urllib.error
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -146,6 +148,9 @@ def _install_stubs():
 _install_stubs()
 
 import agent  # noqa: E402  (import after the stubs are in place)
+import bench  # noqa: E402  (harness + maths; no rich/openai)
+import brief  # noqa: E402  (pure module: no rich/openai)
+import context_index  # noqa: E402  (pure module: offline index of D14)
 
 
 # ---------- fakes ----------
@@ -162,11 +167,31 @@ def tool_call(id_, name, arguments):
 
 
 def response(content=None, tool_calls=None, model="fake/model",
-             prompt_tokens=None, completion_tokens=None):
+             prompt_tokens=None, completion_tokens=None, cost=None,
+             cost_in_extra=False, cached_tokens=None, cached_in_extra=False):
     usage = None
-    if prompt_tokens is not None or completion_tokens is not None:
+    if (prompt_tokens is not None or completion_tokens is not None
+            or cost is not None or cached_tokens is not None):
         usage = SimpleNamespace(prompt_tokens=prompt_tokens,
                                 completion_tokens=completion_tokens)
+        if cost is not None:
+            # OpenRouter returns usage.cost; the OpenAI SDK parks it in
+            # model_extra.  Both shapes must be read the same way.
+            if cost_in_extra:
+                usage.model_extra = {"cost": cost}
+            else:
+                usage.cost = cost
+        if cached_tokens is not None:
+            # prompt_tokens_details.cached_tokens, either on the attribute the
+            # SDK models or stashed in model_extra
+            if cached_in_extra:
+                details = usage.model_extra if hasattr(usage, "model_extra") else {}
+                details["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+                usage.model_extra = details
+            else:
+                usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=cached_tokens
+                )
 
     return SimpleNamespace(
         model=model,
@@ -204,6 +229,9 @@ def reset(client=None):
     agent.history.clear()
     PRINTED.clear()
     ASKED.clear()
+    agent.set_plan_gate(None, active=False)
+    agent.set_dossier_gate(False)
+    agent.reset_checkpoints()
     agent.client = client or FakeClient([])
 
 
@@ -242,9 +270,58 @@ def assert_history_valid(history):
 def test_defaults_are_env_overridable():
     source = pathlib.Path(agent.__file__).read_text(encoding="utf-8")
 
-    assert 'os.environ.get("TAMIAS_BASE_URL", "https://openrouter.ai/api/v1")' in source
-    assert 'os.environ.get("AGENT_MODEL", "poolside/laguna-s-2.1:free")' in source
+    assert 'DEFAULT_PROVIDER_URL = "https://openrouter.ai/api/v1"' in source
+    assert 'BASE_URL = os.environ.get("TAMIAS_BASE_URL", DEFAULT_PROVIDER_URL)' in source
+    assert 'os.environ.get("AGENT_MODEL", "nvidia/nemotron-3.5-lightning:free")' in source
     assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
+
+
+def test_gateway_token_is_preferred_over_provider_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-company",
+                                      "OPENROUTER_API_KEY": "sk-provider"}):
+        assert agent.resolve_api_key() == "vk-company"
+
+
+def test_provider_key_is_the_fallback():
+    with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-provider"},
+                         clear=True):
+        assert agent.resolve_api_key() == "sk-provider"
+
+
+def test_no_credential_means_no_client():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert agent.resolve_api_key() is None
+        assert agent.create_client() is None
+
+
+def test_create_client_uses_the_resolved_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-company"},
+                         clear=True):
+        OPENAI_CALLS.clear()
+        built = agent.create_client()
+
+        assert built is not None
+        assert OPENAI_CALLS[-1]["api_key"] == "vk-company"
+        assert OPENAI_CALLS[-1]["base_url"] == agent.BASE_URL
+
+
+def test_missing_credential_errors_at_call_not_at_import():
+    saved = agent.client
+
+    try:
+        agent.client = None
+        error = None
+
+        try:
+            agent.get_client()
+        except RuntimeError as caught:
+            error = caught
+
+        assert error is not None
+        assert "TAMIAS_API_KEY" in str(error)
+    finally:
+        agent.client = saved
+
 
 
 def test_ask_default_is_25():
@@ -348,8 +425,10 @@ def test_429_mid_tool_loop_rolls_back_history():
 
     assert agent.run_turn("break the loop", 25, stats) == "error"
 
-    # error printed, not raised
-    assert any("429" in line for line in PRINTED)
+    # reported as a provider limit (cleaned, not the raw provider JSON), and
+    # not raised
+    assert any("provider limit" in line for line in PRINTED)
+    assert any("rate-limited" in line for line in PRINTED)
 
     # rolled all the way back to where the turn started
     assert len(agent.history) == checkpoint
@@ -555,7 +634,7 @@ def test_cli_rejects_zero_steps():
 def test_main_routes_task_mode():
     reset(FakeClient([response("answered", prompt_tokens=1, completion_tokens=2)]))
 
-    assert agent.main(["--task", "what is 2+2?"]) == 0
+    assert agent.main(["--task", "what is 2+2?", "--unbounded"]) == 0
     assert agent.client.calls[0]["messages"][1] == \
         {"role": "user", "content": "what is 2+2?"}
 
@@ -667,9 +746,10 @@ def test_read_file_caps_a_huge_file_and_names_the_failure():
         with open(huge, "w", encoding="utf-8") as handle:
             handle.write("z" * 40000)
 
-        assert "characters cut from the middle" in agent.read_file(huge)
-        assert agent.read_file(tmp).startswith("Error:")
-        assert agent.read_file(os.path.join(tmp, "gone.txt")).startswith("Error:")
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert "characters cut from the middle" in agent.read_file(huge)
+            assert agent.read_file(tmp).startswith("Error:")
+            assert agent.read_file(os.path.join(tmp, "gone.txt")).startswith("Error:")
 
 
 def test_run_shell_caps_a_noisy_command_but_keeps_short_output():
@@ -686,10 +766,108 @@ def test_search_in_files_caps_a_flood_of_matches():
             with open(os.path.join(tmp, name), "w", encoding="utf-8") as handle:
                 handle.write("needle\n" * 5000)
 
-        out = agent.search_in_files("needle", tmp)
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.search_in_files("needle", tmp)
 
-        assert "characters cut from the middle" in out
-        assert agent.search_in_files("absent", tmp).startswith("No matches")
+            assert "characters cut from the middle" in out
+            assert agent.search_in_files("absent", tmp).startswith("No matches")
+
+
+# ---------- workspace confinement ----------
+
+def test_resolve_in_workspace_allows_the_root_and_children():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            safe, err = agent.resolve_in_workspace(".")
+            assert err is None and os.path.realpath(safe) == os.path.realpath(tmp)
+            safe2, err2 = agent.resolve_in_workspace(os.path.join(tmp, "sub", "f.txt"))
+            assert err2 is None and safe2.startswith(os.path.realpath(tmp))
+
+
+def test_resolve_in_workspace_rejects_escapes():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            for bad in ("../escape.txt", "/etc/passwd", os.path.join(tmp, "..", "x")):
+                safe, err = agent.resolve_in_workspace(bad)
+                assert safe is None and err.startswith("Error:")
+
+
+def test_read_file_refuses_a_path_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.read_file("/etc/passwd")
+            assert out.startswith("Error:") and "outside the workspace" in out
+
+
+def test_write_file_refuses_to_escape_and_creates_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        escaped = os.path.join(tmp, "..", f"escaped-{os.getpid()}.txt")
+        try:
+            with mock.patch.object(agent, "WORKSPACE", tmp):
+                out = agent.write_file(escaped, "pwned")
+                assert out.startswith("Error:")
+            assert not os.path.exists(os.path.realpath(escaped))
+        finally:
+            if os.path.exists(escaped):
+                os.unlink(escaped)
+
+
+def test_edit_file_refuses_a_path_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        outside = os.path.join(tmp, "outside.txt")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("original")
+        inner = os.path.join(tmp, "inner")
+        os.makedirs(inner)
+
+        with mock.patch.object(agent, "WORKSPACE", inner):
+            out = agent.edit_file(outside, "original", "changed")
+            assert out.startswith("Error:")
+
+        with open(outside, encoding="utf-8") as handle:
+            assert handle.read() == "original"
+
+
+def test_list_and_create_directory_refuse_escapes():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert agent.list_directory("/").startswith("Error:")
+            assert agent.create_directory("../nope").startswith("Error:")
+
+
+def test_search_in_files_refuses_a_directory_outside_the_workspace():
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            assert agent.search_in_files("x", "/").startswith("Error:")
+
+
+def test_symlink_pointing_outside_is_refused():
+    if not hasattr(os, "symlink"):
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        outside = tempfile.NamedTemporaryFile(delete=False)
+        outside.write(b"secret")
+        outside.close()
+        link = os.path.join(tmp, "link.txt")
+        try:
+            os.symlink(outside.name, link)
+            with mock.patch.object(agent, "WORKSPACE", tmp):
+                out = agent.read_file(link)
+                assert out.startswith("Error:") and "outside the workspace" in out
+        finally:
+            os.unlink(outside.name)
+
+
+def test_run_shell_can_be_disabled_by_policy():
+    with mock.patch.dict(os.environ, {agent.SHELL_ENV_VAR: "0"}):
+        out = agent.run_shell("echo hi")
+        assert out.startswith("Error:") and "disabled" in out
+
+
+def test_run_shell_is_enabled_by_default():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(agent.SHELL_ENV_VAR, None)
+        assert agent.shell_allowed() is True
 
 
 # ---------- the plan tool ----------
@@ -745,6 +923,520 @@ def test_update_plan_call_reaches_the_model_as_a_tool_result():
 
     assert "step one" in tool_message["content"]
     assert "0/1 done" in tool_message["content"]
+
+
+# ---------- Time Travel: file checkpoints ----------
+
+
+def test_a_write_creates_a_restorable_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "done"
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert checkpoint.id.startswith("cp-")
+        assert checkpoint.files
+        assert pathlib.Path(target).read_text() == "hello"
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert not pathlib.Path(target).exists()
+        assert result.removed == ["note.txt"]
+
+
+def test_a_created_directory_is_removed_by_restore():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "newdir")
+        create = json.dumps({"path": target})
+        client = FakeClient([
+            response(None, [tool_call("d1", "create_directory", create)]),
+            response("made the directory"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("make a directory", 25,
+                                  agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert pathlib.Path(target).is_dir()
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert not pathlib.Path(target).exists()
+        assert result.removed == ["newdir"]
+
+
+def test_a_checkpoint_restores_an_overwritten_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original")
+        write = json.dumps({"file_path": str(target), "content": "changed"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("overwrite", 25, agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None
+        assert target.read_text() == "changed"
+
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert target.read_text() == "original"
+        assert result.restored == ["note.txt"]
+
+
+def test_a_shell_call_marks_the_checkpoint_incomplete():
+    with tempfile.TemporaryDirectory() as tmp:
+        shell = json.dumps({"command": "true"})
+        client = FakeClient([
+            response(None, [tool_call("s1", "run_shell", shell)]),
+            response("ran it"),
+        ])
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("run a command", 25,
+                                  agent.new_stats()) == "done"
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None and checkpoint.shell_ran is True
+        result = checkpoint.restore_files()
+        assert result.ok
+        assert any("not captured" in warning for warning in result.warnings)
+
+
+def test_turn_end_reports_the_checkpoint_diff_counts():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original\n")
+        write = json.dumps({"file_path": str(target),
+                            "content": "changed\nsecond\n"})
+        client = FakeClient([
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("changed it"),
+        ])
+        events = []
+
+        reset(client)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn(
+                "change the note", 25, agent.new_stats(),
+                on_event=lambda name, **fields: events.append((name, fields)),
+            ) == "done"
+
+        end = [fields for name, fields in events if name == "turn_end"][-1]
+        assert end["checkpoint_id"].startswith("cp-")
+        assert end["checkpoint_added"] == 2
+        assert end["checkpoint_removed"] == 1
+        assert end["checkpoint_diff_paths"] == 1
+        assert end["checkpoint_diff_truncated"] is False
+
+        checkpoint = agent.latest_checkpoint()
+        assert checkpoint is not None and checkpoint.diff_frozen_at is not None
+
+
+def test_a_checkpoint_freezes_the_turns_diff():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        target.write_text("original\n")
+        checkpoint = checkpoints.Checkpoint.start("change the note", tmp)
+        checkpoint.capture(str(target))
+        target.write_text("changed\nsecond\n")
+
+        checkpoint.freeze_diff()
+        frozen = checkpoint.diff_text()
+        target.write_text("edited after the turn\n")
+
+        assert checkpoint.diff_frozen_at is not None
+        assert checkpoint.diff_summary()["added"] == 2
+        assert checkpoint.diff_summary()["removed"] == 1
+        assert "-original" in frozen and "+changed" in frozen
+        assert "edited after the turn" not in checkpoint.diff_text()
+
+
+def test_a_created_file_diff_is_all_added():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "new.txt")
+        checkpoint = checkpoints.Checkpoint.start("create the note", tmp)
+        checkpoint.capture(str(target))
+        target.write_text("hello\n")
+
+        diff = checkpoint.freeze_diff()[0]
+
+        assert diff.kind == "created"
+        assert diff.added == 1 and diff.removed == 0
+        assert "--- /dev/null" in diff.text
+        assert "+hello" in diff.text
+
+
+def test_a_binary_file_has_no_inline_diff():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "image.bin")
+        target.write_bytes(b"a\x00b")
+        checkpoint = checkpoints.Checkpoint.start("change the binary", tmp)
+        checkpoint.capture(str(target))
+        target.write_bytes(b"c\x00d")
+
+        diff = checkpoint.freeze_diff()[0]
+
+        assert diff.kind == "binary"
+        assert diff.text == ""
+        assert "binary file" in diff.note
+
+
+def test_a_checkpoint_diff_does_not_read_a_replaced_symlink():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        outside = pathlib.Path(tmp, "outside.txt")
+        target.write_text("original")
+        outside.write_text("outside secret")
+        checkpoint = checkpoints.Checkpoint.start("swap", tmp)
+        checkpoint.capture(str(target))
+
+        target.unlink()
+        target.symlink_to(outside)
+        checkpoint.freeze_diff()
+
+        diff = checkpoint.diff_files()[0]
+        assert diff.kind == "unavailable"
+        assert "refusing to read" in diff.note
+        assert "outside secret" not in checkpoint.diff_text()
+
+
+def test_a_checkpoint_never_restores_outside_its_workspace():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = pathlib.Path(tmp, "workspace")
+        workspace.mkdir()
+        outside = pathlib.Path(tmp, "outside.txt")
+        outside.write_text("keep me")
+        checkpoint = checkpoints.Checkpoint.start("escape", str(workspace))
+        checkpoint.files[str(outside)] = checkpoints.FileSnapshot(
+            path=str(outside), display="../outside.txt", existed=False)
+
+        result = checkpoint.restore_files()
+
+        assert not result.ok
+        assert outside.read_text() == "keep me"
+        assert result.failed[0][0] == "../outside.txt"
+
+
+def test_a_failed_restore_can_be_retried():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "newdir")
+        checkpoint = checkpoints.Checkpoint.start("make a directory", tmp)
+        checkpoint.capture(str(target), is_dir=True)
+        target.mkdir()
+        keep = target / "user-file.txt"
+        keep.write_text("the human put this here")
+
+        first = checkpoint.restore_files()
+        assert not first.ok
+        assert checkpoint.restored_at is None
+        assert target.is_dir()
+
+        keep.unlink()
+        second = checkpoint.restore_files()
+        assert second.ok
+        assert not target.exists()
+        assert checkpoint.restored_at is not None
+
+
+def test_restore_refuses_a_symlink_that_replaced_the_file():
+    import checkpoints
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp, "note.txt")
+        outside = pathlib.Path(tmp, "outside.txt")
+        target.write_text("original")
+        outside.write_text("outside")
+        checkpoint = checkpoints.Checkpoint.start("swap", tmp)
+        checkpoint.capture(str(target))
+
+        target.unlink()
+        target.symlink_to(outside)
+
+        result = checkpoint.restore_files()
+
+        assert not result.ok
+        assert outside.read_text() == "outside"
+        assert any("symlink" in reason for _, reason in result.failed)
+
+
+def test_a_read_only_turn_has_no_checkpoint():
+    read = json.dumps({"file_path": "note.txt"})
+    client = FakeClient([
+        response(None, [tool_call("r1", "read_file", read)]),
+        response("read it"),
+    ])
+
+    reset(client)
+    with tempfile.TemporaryDirectory() as tmp:
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            assert agent.run_turn("read a file", 25,
+                                  agent.new_stats()) == "done"
+
+    assert agent.latest_checkpoint() is None
+
+
+# ---------- the plan contract ----------
+
+
+def test_a_signed_plan_allows_the_next_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        plan = json.dumps({"todos": [
+            {"content": "write the note", "status": "in_progress"}]})
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("wrote the note"),
+        ])
+
+        reset(client)
+        asked = []
+        agent.set_plan_gate(
+            lambda todos: asked.append(todos) or True, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "done"
+        assert asked[0]["todos"] == [{"content": "write the note",
+                                     "status": "in_progress"}]
+        assert pathlib.Path(target).read_text() == "hello"
+        tool_messages = [m["content"] for m in agent.history
+                         if m["role"] == "tool"]
+        assert "contract: signed by user" in tool_messages[0]
+        assert_history_valid(agent.history)
+
+
+def test_a_denied_plan_stops_the_turn_before_the_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "note.txt")
+        plan = json.dumps({"todos": [
+            {"content": "write the note", "status": "in_progress"}]})
+        write = json.dumps({"file_path": target, "content": "hello"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("must not be reached"),
+        ])
+
+        reset(client)
+        agent.set_plan_gate(lambda todos: False, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write a note", 25, agent.new_stats())
+
+        assert outcome == "refused"
+        assert len(client.calls) == 1      # the write step was never requested
+        assert not pathlib.Path(target).exists()
+        assert agent.plan_write_block("write_file").startswith(
+            "Error: plan contract denied")
+        assert_history_valid(agent.history)
+
+
+def test_status_only_plan_updates_do_not_ask_again_but_content_does():
+    reset()
+    asked = []
+    agent.set_plan_gate(
+        lambda todos: asked.append(todos) or True, active=True)
+
+    first = agent.update_plan([
+        {"content": "read", "status": "in_progress"},
+        {"content": "write", "status": "pending"},
+    ])
+    second = agent.update_plan([
+        {"content": "read", "status": "completed"},
+        {"content": "write", "status": "in_progress"},
+    ])
+    assert "contract: signed by user" in first
+    assert "contract: signed by user" in second
+    assert len(asked) == 1              # progress is not a new contract
+
+    third = agent.update_plan([
+        {"content": "read", "status": "completed"},
+        {"content": "write and test", "status": "in_progress"},
+    ])
+    assert "contract: signed by user" in third
+    assert len(asked) == 2              # changed steps need a new signature
+
+
+def test_an_active_plan_gate_with_no_approver_fails_closed():
+    reset()
+    agent.set_plan_gate(None, active=True)
+
+    out = agent.update_plan([
+        {"content": "write", "status": "in_progress"},
+    ])
+
+    assert out.startswith("Error: plan contract - no human approver")
+    assert agent.plan_write_block("run_shell").startswith(
+        "Error: plan contract denied")
+
+
+def test_a_crashing_plan_approver_fails_closed():
+    reset()
+
+    def broken(_contract):
+        raise RuntimeError("modal died")
+
+    agent.set_plan_gate(broken, active=True)
+    out = agent.update_plan([
+        {"content": "write", "status": "in_progress"},
+    ])
+
+    assert out.startswith("Error: plan contract - approval failed")
+    assert agent.plan_write_block(
+        "write_file", {"file_path": "x.txt"}).startswith(
+            "Error: plan contract denied")
+
+
+def test_a_write_outside_the_signed_plan_stops_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "other.txt")
+        plan = json.dumps({
+            "todos": [{"content": "write allowed.txt",
+                       "status": "in_progress"}],
+            "files": ["allowed.txt"],
+        })
+        write = json.dumps({"file_path": target, "content": "drift"})
+        client = FakeClient([
+            response(None, [tool_call("p1", "update_plan", plan)]),
+            response(None, [tool_call("w1", "write_file", write)]),
+            response("must not be reached"),
+        ])
+
+        reset(client)
+        agent.set_plan_gate(lambda contract: True, active=True)
+        events = []
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            outcome = agent.run_turn("write the note", 25, agent.new_stats(),
+                                     on_event=lambda *a, **k: events.append((a, k)))
+
+        assert outcome == "refused"
+        assert len(client.calls) == 2
+        assert not pathlib.Path(target).exists()
+        assert any(
+            "path" in str(kwargs.get("message", ""))
+            and "not in the signed plan" in str(kwargs.get("message", ""))
+            for _, kwargs in events
+        )
+        assert_history_valid(agent.history)
+
+
+def test_the_dossier_gate_holds_the_first_write_until_evidence():
+    with tempfile.TemporaryDirectory() as tmp:
+        pathlib.Path(tmp, "sample.py").write_text("value = 1\n")
+        reset()
+        agent.set_dossier_gate(True)
+        with mock.patch.object(agent, "WORKSPACE", tmp), \
+                mock.patch.object(agent, "COMPANY_ID", None, create=True):
+            blocked = agent.dispatch_tool(
+                "write_file", {"file_path": "note.txt", "content": "hello"})
+            assert blocked.startswith("Error: dossier gate")
+            assert not pathlib.Path(tmp, "note.txt").exists()
+            assert agent.dossier_write_block("run_shell").startswith(
+                "Error: dossier gate")
+
+            evidence = agent.dispatch_tool(
+                "analyze_structure", {"directory": tmp, "focus": "all"})
+            assert "STRUCTURE ANALYSIS" in evidence
+
+            allowed = agent.dispatch_tool(
+                "write_file", {"file_path": "note.txt", "content": "hello"})
+            assert allowed.startswith("success")
+            assert pathlib.Path(tmp, "note.txt").read_text() == "hello"
+
+
+def test_finish_investigation_alone_does_not_unlock_a_write():
+    reset()
+    agent.set_dossier_gate(True)
+    with mock.patch.dict(agent._INVESTIGATED_TARGETS, {}, clear=True):
+        summary = agent.dispatch_tool("finish_investigation", {})
+
+    assert "INVESTIGATION FINISHED" in summary
+    assert agent.dossier_write_block("write_file").startswith(
+        "Error: dossier gate")
+
+
+def test_a_signed_plan_declares_files_risks_and_verification():
+    with tempfile.TemporaryDirectory() as tmp:
+        reset()
+        seen = []
+        agent.set_plan_gate(
+            lambda contract: seen.append(contract) or True, active=True)
+        with mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.update_plan(
+                [{"content": "write allowed.txt", "status": "in_progress"}],
+                files=["allowed.txt"],
+                verification=[".venv/bin/python -m pytest -q"],
+                risks=["the file is new"],
+                cost_range_usd=[0.0, 0.02],
+            )
+            allowed = agent.plan_write_block(
+                "write_file", {"file_path": "allowed.txt"})
+            denied = agent.plan_write_block(
+                "write_file", {"file_path": "other.txt"})
+
+        assert seen[0]["files"] == ["allowed.txt"]
+        assert seen[0]["cost_range_usd"] == [0.0, 0.02]
+        assert "files: allowed.txt" in out
+        assert "verification: .venv/bin/python -m pytest -q" in out
+        assert "risk: the file is new" in out
+        assert "cost range: 0.0000-0.0200 (hypothetical)" in out
+        assert allowed is None
+        assert denied.startswith("Error: plan contract - path 'other.txt'")
+
+
+# ---------- the investigation tools ----------
+
+def test_investigate_target_walks_a_directory_without_crashing():
+    with mock.patch.object(agent, "COMPANY_ID", None, create=True):
+        out = agent.investigate_target(
+            "company/work/todoinc/apps/todo", "todo", "medium")
+
+    assert "Directory:" in out
+    assert "Feature traces for 'todo'" in out
+    assert "Error investigating" not in out
+    assert "src/todo.py" in out or "tests/test_todo.py" in out
 
 
 # ---------- request tuning ----------
@@ -999,19 +1691,23 @@ def test_cap_and_compaction_constants_are_actually_tuned():
 
 
 def test_the_agent_still_works_after_all_this_prompt_work():
-    """the whole point of the rewrite: same 8 tools, same params, and a turn
+    """the whole point of the rewrite: same tools, same params, and a turn
     still completes with a real-ish loop"""
     assert [t["function"]["name"] for t in agent.TOOLS] == [
         "run_shell", "write_file", "edit_file", "read_file",
         "list_directory", "create_directory", "search_in_files",
-        "update_plan"]
+        "update_plan", "investigate_target", "trace_feature",
+        "analyze_structure", "build_similar", "record_unknown",
+        "record_comparison", "finish_investigation", "boundary_accuracy",
+        "model_performance_comparison", "reasoning_chain"]
 
     params = {t["function"]["name"]: sorted(
         t["function"]["parameters"]["properties"]) for t in agent.TOOLS}
 
     assert params["read_file"] == ["file_path"]
     assert params["edit_file"] == ["file_path", "new_text", "old_text"]
-    assert params["update_plan"] == ["todos"]
+    assert params["update_plan"] == [
+        "cost_range_usd", "files", "risks", "todos", "verification"]
 
     client = FakeClient([
         response(None, [tool_call("p1", "update_plan",
@@ -1080,6 +1776,2491 @@ def test_assistant_content_is_never_left_null():
 
     for message in agent.history:
         assert isinstance(message["content"], str)
+
+
+
+# ---------- agent -> UI event stream (bridge) ----------
+
+def test_run_turn_emits_a_complete_event_stream():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 prompt_tokens=5, completion_tokens=1),
+        response("all done", model="fake/x"),
+    ]))
+
+    events = []
+
+    def collect(name, **fields):
+        events.append((name, fields))
+
+    assert agent.run_turn("look around", 25, agent.new_stats(),
+                          on_event=collect) == "done"
+
+    names = [name for name, _ in events]
+
+    assert names[0] == "turn_start"      # the view opens a turn on this
+    assert names[-1] == "turn_end"       # ...and only this re-enables input
+    assert "tool_start" in names
+    assert "tool_end" in names
+    assert "message" in names
+
+    starts = [f for n, f in events if n == "tool_start"]
+    ends = [f for n, f in events if n == "tool_end"]
+
+    assert starts[0]["tool_name"] == "list_directory"
+    assert starts[0]["tool_call_id"] == "c1"
+    assert ends[0]["tool_call_id"] == "c1"
+    assert ends[0]["success"] is True
+    assert isinstance(ends[0]["duration_sec"], float)
+
+    message = [f for n, f in events if n == "message"][0]
+    assert message["content"] == "all done"
+
+    end = [f for n, f in events if n == "turn_end"][-1]
+    assert end["prompt_tokens"] == 5      # usage is carried through
+
+
+def test_run_turn_reports_a_failed_tool_as_unsuccessful():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "read_file",
+                                  '{"file_path": "definitely_missing.txt"}')]),
+        response("handled"),
+    ]))
+
+    events = []
+    agent.run_turn("read it", 25, agent.new_stats(),
+                   on_event=lambda n, **f: events.append((n, f)))
+
+    failed = [f for n, f in events if n == "tool_end"][0]
+
+    assert failed["success"] is False
+    assert failed["result"].startswith("Error:")
+
+
+def test_run_turn_without_a_listener_is_unchanged():
+    reset(FakeClient([response("answered")]))
+
+    # the CLI passes no callback: same return value, no listener required
+    assert agent.run_turn("hi", 25, agent.new_stats()) == "done"
+    assert agent.history[-1]["content"] == "answered"
+
+
+def test_run_task_forwards_events_through():
+    reset(FakeClient([response("done", prompt_tokens=2, completion_tokens=1)]))
+
+    seen = []
+
+    assert agent.run_task("go", 25,
+                          on_event=lambda n, **f: seen.append(n)) == 0
+    assert seen[0] == "turn_start"
+    assert seen[-1] == "turn_end"
+
+
+def test_tui_flag_parses():
+    assert agent.parse_args(["--tui"]).tui is True
+    assert agent.parse_args([]).tui is False
+
+
+def test_bridge_translator_maps_milestones_to_events():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import (MessageDelta, StatusUpdate, ToolEnd, ToolStart,
+                            TurnEnd, TurnStart)
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "sess123")
+
+    emit("turn_start", user_prompt="hi")
+    emit("status", message="thinking…", is_busy=True)
+    emit("message", content="hello", model="m")
+    emit("tool_start", tool_call_id="t1", tool_name="read_file",
+         arguments='{"file_path": "a.py"}')
+    emit("tool_end", tool_call_id="t1", result="ok", success=True,
+         duration_sec=1.25)
+    emit("turn_end", prompt_tokens=10, completion_tokens=2,
+         total_duration_sec=3.0, cost_usd=0.0042, unpriced_steps=1)
+
+    got = [out.get_nowait() for _ in range(6)]
+
+    assert isinstance(got[0], TurnStart)
+    assert got[0].session_id == "sess123" and got[0].user_prompt == "hi"
+
+    assert isinstance(got[1], StatusUpdate) and got[1].is_busy is True
+
+    assert isinstance(got[2], MessageDelta)
+    assert got[2].content == "hello" and got[2].model == "m"
+
+    assert isinstance(got[3], ToolStart)
+    assert got[3].tool_name == "read_file" and got[3].tool_call_id == "t1"
+
+    assert isinstance(got[4], ToolEnd)
+    assert got[4].success is True and got[4].duration_sec == 1.25
+
+    assert isinstance(got[5], TurnEnd) and got[5].prompt_tokens == 10
+    # the provider cost and the unpriced count survive the mapping: this is the
+    # contract that feeds the spend ledger in the TUI
+    assert got[5].cost_usd == 0.0042
+    assert got[5].unpriced_steps == 1
+
+
+def test_bridge_translator_maps_model_events_to_the_tui():
+    """The TUI hides the console, so a switch must also travel as an event.
+
+    This is the wiring that makes rotation visible in the terminal UI: the chip
+    follows every step, and a card is drawn only when the model really changed.
+    """
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import ModelSwitch
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("model_used", model="a/free:free", tier="free")
+    emit("model_switch", old_model="a/free:free", new_model="b/free:free",
+         old_tier="free", new_tier="free", reason="rotation",
+         estimated_savings_usd=0.0)
+
+    chip = out.get_nowait()
+    assert chip == {"type": "model_update", "model": "a/free:free"}
+
+    switch = out.get_nowait()
+    assert isinstance(switch, ModelSwitch)
+    assert switch.old_model == "a/free:free"
+    assert switch.new_model == "b/free:free"
+    assert switch.reason == "rotation"
+
+
+def test_bridge_keeps_a_missing_turn_cost_as_none():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import TurnEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    # a turn whose cost the provider never reported must arrive as None, not 0
+    emit("turn_end", prompt_tokens=1, completion_tokens=1,
+         total_duration_sec=0.5)
+    turn = out.get_nowait()
+    assert isinstance(turn, TurnEnd)
+    assert turn.cost_usd is None
+    assert turn.unpriced_steps == 0
+
+
+def test_bridge_carries_the_checkpoint_facts():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import TurnEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("turn_end", prompt_tokens=1, completion_tokens=1,
+         total_duration_sec=0.5, checkpoint_id="cp-abcd1234",
+         checkpoint_files=2, checkpoint_shell=True,
+         checkpoint_added=7, checkpoint_removed=3,
+         checkpoint_diff_paths=2, checkpoint_diff_truncated=True)
+
+    turn = out.get_nowait()
+    assert isinstance(turn, TurnEnd)
+    assert turn.checkpoint_id == "cp-abcd1234"
+    assert turn.checkpoint_files == 2
+    assert turn.checkpoint_shell is True
+    assert turn.checkpoint_added == 7
+    assert turn.checkpoint_removed == 3
+    assert turn.checkpoint_diff_paths == 2
+    assert turn.checkpoint_diff_truncated is True
+
+
+def test_bridge_translator_tolerates_missing_optional_fields():
+    import queue as queue_module
+
+    from tui import bridge
+    from tui.events import ToolEnd
+
+    out = queue_module.Queue()
+    emit = bridge.make_translator(out, "s")
+
+    emit("tool_end", tool_call_id="c", result="Error: boom", success=False)
+
+    event = out.get_nowait()
+
+    assert isinstance(event, ToolEnd)
+    assert event.success is False
+    assert event.duration_sec == 0.0  # defaulted, not None
+
+
+def test_main_routes_tui_mode():
+    reset(FakeClient([]))
+
+    import tui.bridge as bridge
+
+    called = {}
+    original_run = bridge.run_tui
+    missing = object()
+    saved_company = getattr(agent, "COMPANY_ID", missing)
+
+    bridge.run_tui = lambda max_steps=25, company_id=None, task_id=None, \
+        assignee=None: (
+        called.update(max_steps=max_steps, company_id=company_id,
+                      task_id=task_id, assignee=assignee) or 0
+    )
+
+    try:
+        result = agent.main(["--tui", "--company-id", "acme",
+                             "--max-steps", "5", "--unbounded"])
+    finally:
+        bridge.run_tui = original_run
+        # main() sets COMPANY_ID globally; undo it so later tests are unbounded
+        if saved_company is missing:
+            if hasattr(agent, "COMPANY_ID"):
+                delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved_company
+
+    assert result == 0
+    assert called == {"max_steps": 5, "company_id": "acme",
+                      "task_id": None, "assignee": None}
+
+
+def test_main_forwards_task_id_and_assignee_to_the_tui():
+    reset(FakeClient([]))
+
+    import tui.bridge as bridge
+
+    called = {}
+    original_run = bridge.run_tui
+    missing = object()
+    saved_company = getattr(agent, "COMPANY_ID", missing)
+
+    bridge.run_tui = lambda max_steps=25, company_id=None, task_id=None, \
+        assignee=None: (
+        called.update(max_steps=max_steps, company_id=company_id,
+                      task_id=task_id, assignee=assignee) or 0
+    )
+
+    try:
+        result = agent.main(["--tui", "--company-id", "acme", "--max-steps",
+                             "5", "--task-id", "PROJ-1457", "--assignee",
+                             "alex", "--unbounded"])
+    finally:
+        bridge.run_tui = original_run
+        if saved_company is missing:
+            if hasattr(agent, "COMPANY_ID"):
+                delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved_company
+
+    assert result == 0
+    # the board can only be honest if the CLI stops dropping these (§10)
+    assert called == {"max_steps": 5, "company_id": "acme",
+                      "task_id": "PROJ-1457", "assignee": "alex"}
+
+
+# ---------- credit-saving model routing + report ----------
+
+def test_select_model_uses_the_configured_tier():
+    with mock.patch.dict(os.environ, {
+        "AGENT_MODEL_FREE": "free/x",
+        "AGENT_MODEL_MID": "mid/x",
+        "AGENT_MODEL_PREMIUM": "premium/x",
+    }):
+        assert agent.select_model("free") == "free/x"
+        assert agent.select_model("eco") == "free/x"
+        assert agent.select_model("cheap") == "free/x"
+        assert agent.select_model("mid") == "mid/x"
+        assert agent.select_model("balanced") == "mid/x"
+        assert agent.select_model("premium") == "premium/x"
+        assert agent.select_model("quality") == "premium/x"
+        assert agent.select_model("best") == "premium/x"
+
+
+def test_select_model_auto_stays_free_until_the_turn_earns_more():
+    with mock.patch.dict(os.environ, {
+        "AGENT_MODEL_FREE": "free/x",
+        "AGENT_MODEL_MID": "mid/x",
+        "AGENT_MODEL_PREMIUM": "premium/x",
+    }):
+        # a clean, small step is free
+        assert agent.select_model("auto", prompt_chars=10) == "free/x"
+
+        # one failed tool, or a middling context, earns the mid tier
+        assert agent.select_model("auto", tool_failures=1) == "mid/x"
+        assert agent.select_model("auto",
+                                  prompt_chars=agent.MID_PROMPT_CHARS) == "mid/x"
+
+        # repeated failures, or a genuinely big context, earn the premium tier
+        assert agent.select_model("auto", tool_failures=2) == "premium/x"
+        assert agent.select_model("auto",
+                                  prompt_chars=agent.BIG_PROMPT_CHARS) == "premium/x"
+
+
+def test_select_model_defaults_to_the_current_model():
+    # with no tiers configured every policy resolves to MODEL, so switching the
+    # router on cannot silently change which model runs
+    assert agent.select_model("auto") == agent.MODEL
+    assert agent.select_model("static") == agent.MODEL
+    assert agent.select_model("premium") == agent.MODEL
+
+
+def test_select_model_static_ignores_difficulty():
+    with mock.patch.dict(os.environ, {"AGENT_MODEL_PREMIUM": "premium/x"}):
+        assert agent.select_model("static", tool_failures=99,
+                                  prompt_chars=99999) == agent.MODEL
+
+
+def test_run_turn_records_which_model_served_each_step():
+    reset(FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')]),
+        response("done"),
+    ]))
+
+    stats = agent.new_stats()
+
+    assert agent.run_turn("go", 25, stats) == "done"
+    assert stats["steps"] == 2
+    assert sum(stats["models"].values()) == 2      # one tally per step
+    assert stats["turns"] == 1
+
+
+def test_usage_cost_reads_the_provider_billed_amount_or_none():
+    assert agent.usage_cost(None) is None
+    assert agent.usage_cost(SimpleNamespace()) is None
+
+    # a real zero is a price (a free model), and must survive as 0.0
+    assert agent.usage_cost(SimpleNamespace(cost=0.0)) == 0.0
+    assert agent.usage_cost(SimpleNamespace(cost=0.0123)) == 0.0123
+
+    # the OpenAI SDK keeps the unknown field on model_extra
+    assert agent.usage_cost(SimpleNamespace(model_extra={"cost": 0.5})) == 0.5
+
+    # a bool is not a price, even though bool is an int subclass
+    assert agent.usage_cost(SimpleNamespace(cost=True)) is None
+    assert agent.usage_cost(SimpleNamespace(cost="0.01")) is None
+    # a negative or non-finite cost is malformed, not a real price
+    assert agent.usage_cost(SimpleNamespace(cost=-0.01)) is None
+    assert agent.usage_cost(SimpleNamespace(cost=float("nan"))) is None
+    assert agent.usage_cost(SimpleNamespace(cost=float("inf"))) is None
+
+
+def test_log_step_accumulates_provider_cost_and_counts_the_unpriced():
+    reset(FakeClient([]))
+
+    stats = agent.new_stats()
+    agent.log_step(1, response("a", prompt_tokens=10, completion_tokens=2,
+                               cost=0.0042), stats, 0.1)
+    # second step reports no cost at all: it must be counted, not read as $0
+    agent.log_step(2, response("b", prompt_tokens=10, completion_tokens=2),
+                   stats, 0.1)
+    # the SDK shape (model_extra) accumulates too
+    agent.log_step(3, response("c", prompt_tokens=1, completion_tokens=1,
+                               cost=0.0008, cost_in_extra=True), stats, 0.1)
+
+    assert abs(stats["cost_usd"] - 0.0050) < 1e-9
+    assert stats["unpriced_steps"] == 1
+
+
+def test_spend_report_prints_provider_billed_usd_with_no_baseline():
+    reset(FakeClient([]))
+
+    stats = agent.new_stats()
+    stats["steps"] = 3
+    stats["turns"] = 1
+    stats["cost_usd"] = 0.0123
+    stats["unpriced_steps"] = 1
+    stats["models"] = {"free/x": 2}
+
+    agent.print_summary(stats)
+
+    printed = "\n".join(PRINTED)
+
+    assert "$0.0123" in printed
+    assert "unpriced" in printed
+    assert "free/x×2" in printed
+    # the fabricated comparison is gone for good
+    lowered = printed.lower()
+    assert "codex" not in lowered
+    assert "baseline" not in lowered
+    assert "saved" not in lowered
+
+
+def test_spend_report_says_unknown_when_nothing_was_priced():
+    reset(FakeClient([]))
+    stats = agent.new_stats()
+    stats["steps"] = 2
+    stats["unpriced_steps"] = 2
+
+    agent.print_summary(stats)
+
+    assert "UNKNOWN" in "\n".join(PRINTED)
+
+
+def test_interactive_credits_command_reports_usd_not_a_baseline():
+    reset(FakeClient([]))
+
+    ASKED.extend(["/credits", "/quit"])
+
+    assert agent.interactive_loop(25) == 0
+    printed = "\n".join(PRINTED)
+    assert "spend" in printed.lower()
+    assert "codex" not in printed.lower()
+    assert "baseline" not in printed.lower()
+
+
+# ---------- company boundary for run_shell ----------
+
+@contextlib.contextmanager
+def _as_company(company_id):
+    """Set agent.COMPANY_ID for the duration, restoring whatever was there."""
+    missing = object()
+    saved = getattr(agent, "COMPANY_ID", missing)
+    agent.COMPANY_ID = company_id
+
+    try:
+        yield
+    finally:
+        if saved is missing:
+            delattr(agent, "COMPANY_ID")
+        else:
+            agent.COMPANY_ID = saved
+
+
+def test_shell_escapes_company_flags_absolute_and_parent_paths():
+    company = os.path.realpath("/work/company/work/acme")
+
+    assert agent.shell_escapes_company("cat /etc/passwd", company) == "/etc/passwd"
+    assert agent.shell_escapes_company("cat ../../secret", company) == "../../secret"
+    assert agent.shell_escapes_company("cat ~/notes", company) == "~"
+
+    # a path inside the area, and a plain command, are both fine
+    assert agent.shell_escapes_company("cat src/app.py", company) is None
+    assert agent.shell_escapes_company("pytest -q", company) is None
+
+
+def test_run_shell_refuses_paths_outside_the_company_area():
+    with _as_company("acme"):
+        out = agent.run_shell("cat /etc/passwd")
+
+    assert out.startswith("Error:")
+    assert "outside company work area" in out
+
+
+def test_run_shell_refuses_parent_hops_when_bounded():
+    with _as_company("acme"):
+        out = agent.run_shell("cat ../../etc/passwd")
+
+    assert out.startswith("Error:")
+    assert "outside company work area" in out
+
+
+def test_run_shell_runs_inside_the_company_directory():
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _as_company("acme"), \
+             mock.patch.object(agent, "WORKSPACE", tmp), \
+             mock.patch.object(subprocess, "run", fake_run):
+            out = agent.run_shell("echo hi")
+
+    assert out == "ok"
+    assert seen["cwd"] == os.path.realpath(
+        os.path.join(tmp, "company", "work", "acme")
+    )
+
+
+def test_run_shell_without_company_is_unbounded():
+    with _as_company(None):
+        assert agent.run_shell("echo hi").strip() == "hi"
+
+
+# ---------- task assignment (--task-id / --assignee) ----------
+
+@contextlib.contextmanager
+def _as_assignment(task_id, assignee):
+    """Set agent.TASK_ID / agent.ASSIGNEE for the duration, restoring after."""
+    missing = object()
+    saved = {name: getattr(agent, name, missing)
+             for name in ("TASK_ID", "ASSIGNEE")}
+
+    agent.TASK_ID = task_id
+    agent.ASSIGNEE = assignee
+
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is missing:
+                delattr(agent, name)
+            else:
+                setattr(agent, name, value)
+
+
+def test_assignment_flags_parse():
+    args = agent.parse_args(["--task-id", "PROJ-1457", "--assignee", "alex"])
+
+    assert args.task_id == "PROJ-1457"
+    assert args.assignee == "alex"
+
+    default = agent.parse_args([])
+    assert default.task_id is None
+    assert default.assignee is None
+
+
+def test_assignment_line_names_the_task_owner_and_company():
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        line = agent.assignment_line()
+
+    assert "PROJ-1457" in line
+    assert "alex" in line
+    assert "company/work/acme" in line
+
+
+def test_assignment_line_is_empty_without_an_assignment():
+    with _as_company(None), _as_assignment(None, None):
+        assert agent.assignment_line() == ""
+
+
+def test_build_system_prompt_appends_the_assignment():
+    with _as_company(None), _as_assignment(None, None):
+        assert agent.build_system_prompt() == agent.SYSTEM_PROMPT
+
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        prompt = agent.build_system_prompt()
+
+    assert prompt.startswith("You are TAMIAS")   # the preamble still leads
+    assert "PROJ-1457" in prompt
+    assert "company/work/acme" in prompt
+
+    with _as_company("todoinc"), _as_assignment(None, None), \
+            mock.patch.object(
+                agent, "_ACTIVE_POLICY",
+                agent.PolicyProfile(
+                    name="todo-app",
+                    root="company/work/todoinc/apps/todo")):
+        project_prompt = agent.build_system_prompt()
+
+    assert "company/work/todoinc/apps/todo" in project_prompt
+    assert "do not use '.'" in project_prompt.lower()
+    assert "outside the project" in project_prompt
+
+
+def test_run_turn_sends_the_assignment_to_the_model():
+    reset(FakeClient([response("ok", prompt_tokens=1, completion_tokens=1)]))
+
+    with _as_company("acme"), _as_assignment("PROJ-1457", "alex"):
+        assert agent.run_turn("do it", 25, agent.new_stats()) == "done"
+
+    system = agent.client.calls[0]["messages"][0]["content"]
+
+    assert system.startswith("You are TAMIAS")
+    assert "PROJ-1457" in system
+    assert "alex" in system
+
+
+def test_main_records_the_assignment_globals():
+    reset(FakeClient([response("done", prompt_tokens=1, completion_tokens=1)]))
+
+    missing = object()
+    saved = {name: getattr(agent, name, missing)
+             for name in ("COMPANY_ID", "TASK_ID", "ASSIGNEE")}
+
+    try:
+        result = agent.main(["--task", "go", "--company-id", "acme",
+                             "--task-id", "PROJ-1", "--assignee", "alex",
+                             "--unbounded"])
+    finally:
+        for name, value in saved.items():
+            if value is missing:
+                if hasattr(agent, name):
+                    delattr(agent, name)
+            else:
+                setattr(agent, name, value)
+
+    assert result == 0
+    # the assignment reached the model through the system prompt
+    assert "PROJ-1" in agent.client.calls[0]["messages"][0]["content"]
+
+
+# ---------- secret protection + company-id validation ----------
+
+def test_is_sensitive_path_matches_credentials_not_placeholders():
+    assert agent.is_sensitive_path(".env")
+    assert agent.is_sensitive_path("./.env")
+    assert agent.is_sensitive_path("config/.env.production")
+    assert agent.is_sensitive_path("keys/server.pem")
+    assert agent.is_sensitive_path(".ssh/id_rsa")
+    assert agent.is_sensitive_path("sub/.aws/credentials")
+    assert agent.is_sensitive_path("secrets.json")
+
+    assert not agent.is_sensitive_path(".env.example")
+    assert not agent.is_sensitive_path("src/app.py")
+    assert not agent.is_sensitive_path("README.md")
+
+
+def test_read_file_refuses_dotenv():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, ".env"), "w") as handle:
+            handle.write("OPENROUTER_API_KEY=leak-me\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.read_file(".env")
+
+    assert out.startswith("Error:")
+    assert "leak-me" not in out
+    assert "protected secret" in out
+
+
+def test_write_and_edit_refuse_dotenv():
+    with tempfile.TemporaryDirectory() as tmp:
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            wrote = agent.write_file(".env", "OPENROUTER_API_KEY=x")
+            edited = agent.edit_file(".env", "x", "y")
+
+        assert not os.path.exists(os.path.join(tmp, ".env"))
+
+    assert wrote.startswith("Error:")
+    assert edited.startswith("Error:")
+
+
+def test_list_directory_hides_secret_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, ".env"), "w") as handle:
+            handle.write("SECRET=1\n")
+        with open(os.path.join(tmp, "notes.txt"), "w") as handle:
+            handle.write("hello\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            listing = agent.list_directory(".")
+
+    assert "notes.txt" in listing
+    assert ".env" not in listing
+
+
+def test_search_in_files_skips_secret_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "credentials.json"), "w") as handle:
+            handle.write('{"token": "findme"}\n')
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.search_in_files("findme", ".")
+
+    assert out.startswith("No matches")
+    assert '{"token"' not in out
+
+
+def test_run_shell_refuses_dotenv():
+    out = agent.run_shell("cat .env")
+
+    assert out.startswith("Error:")
+    assert "protected secret" in out
+
+
+def test_scrubbed_env_drops_credentials_but_keeps_the_rest():
+    with mock.patch.dict(os.environ, {
+        "OPENROUTER_API_KEY": "leak-me",
+        "SOME_TOKEN": "leak-me",
+        "TAMIAS_BASE_URL": "http://localhost",
+    }):
+        env = agent.scrubbed_env()
+
+    assert "OPENROUTER_API_KEY" not in env
+    assert "SOME_TOKEN" not in env
+    assert env["TAMIAS_BASE_URL"] == "http://localhost"
+    assert "PATH" in env
+
+
+def test_run_shell_passes_a_scrubbed_environment():
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "ok", "")
+
+    with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "leak-me"}), \
+         mock.patch.object(subprocess, "run", fake_run):
+        agent.run_shell("echo hi")
+
+    assert "OPENROUTER_API_KEY" not in seen["env"]
+
+
+def test_valid_company_id_rejects_traversal_and_separators():
+    assert agent.valid_company_id("acme")
+    assert agent.valid_company_id("team-1.2")
+
+    assert not agent.valid_company_id("../etc")
+    assert not agent.valid_company_id("a/b")
+    assert not agent.valid_company_id("..")
+    assert not agent.valid_company_id("")
+    assert not agent.valid_company_id(None)
+
+
+def test_company_boundary_rejects_a_traversal_id():
+    with _as_company("../../etc"):
+        out = agent.run_shell("echo hi")
+
+    assert out.startswith("Error:")
+    assert "not a valid single path segment" in out
+
+
+def test_company_resolution_rejects_bad_ids_and_explains_dot():
+    resolved, err = agent.resolve_in_company_workspace("x", "../etc")
+
+    assert resolved is None
+    assert "not a valid single path segment" in err
+
+    root = "company/work/todoinc/apps/todo"
+    policy = agent.PolicyProfile(name="todo-app", root=root)
+
+    with mock.patch.object(agent, "_ACTIVE_POLICY", policy):
+        read_path, read_error = agent.resolve_in_company_workspace(
+            ".", "todoinc")
+        write_error = agent.policy_check(
+            "write_file", {"file_path": ".", "content": ""})
+
+    assert read_path is None
+    assert "repository root" in read_error
+    assert root in read_error
+    assert "outside company work area" not in read_error
+    assert "outside write scope" not in write_error
+    assert "repository root" in write_error
+
+
+def test_edit_file_refuses_empty_old_text():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "note.txt")
+
+        with open(path, "w") as handle:
+            handle.write("hello\n")
+
+        with _as_company(None), mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.edit_file("note.txt", "", "X")
+
+        with open(path) as handle:
+            unchanged = handle.read()
+
+    assert "old_text must not be empty" in out
+    assert unchanged == "hello\n"
+
+
+def _load_policy_text(toml_text):
+    """Load a policy from raw TOML through the real file loader."""
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(toml_text)
+        path = fh.name
+
+    try:
+        return agent.load_policy(path)
+    finally:
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def _with_policy(profile):
+    """Set agent._ACTIVE_POLICY for the duration, restoring whatever was there."""
+    missing = object()
+    saved = getattr(agent, "_ACTIVE_POLICY", missing)
+    agent.set_active_policy(profile)
+
+    try:
+        yield
+    finally:
+        if saved is missing:
+            delattr(agent, "_ACTIVE_POLICY")
+        else:
+            agent.set_active_policy(saved)
+
+
+def test_load_policy_parses_full_toml():
+    profile, err = _load_policy_text(
+        """
+        version = "1"
+
+        [use_case]
+        name = "code-fix-bot"
+        read_only = false
+
+        [tools]
+        allow = ["read_file", "search_in_files", "edit_file", "run_shell"]
+        deny = ["git push", "write_file"]
+
+        [run_shell]
+        allow = ["git status", "git diff", "python3 -m pytest"]
+        deny = ["rm ", "curl ", "git push "]
+
+        [paths]
+        allow_write = ["company/work/acme/bots/**"]
+        deny_read = ["company/work/acme/hr/**"]
+        """
+    )
+
+    assert err is None
+    assert profile.name == "code-fix-bot"
+    assert profile.read_only is False
+    assert "write_file" in profile.tool_deny
+    assert "read_file" in profile.tool_allow
+    assert "rm " in profile.shell_deny
+    assert "git status" in profile.shell_allow
+    assert profile.allow_write == ["company/work/acme/bots/**"]
+    assert profile.deny_read == ["company/work/acme/hr/**"]
+
+
+def test_load_policy_rejects_missing_file():
+    profile, err = agent.load_policy("/no/such/policy.toml")
+
+    assert profile is None
+    assert err.startswith("Error:")
+    assert "could not load policy" in err
+
+
+def test_load_policy_requires_use_case_name():
+    profile, err = _load_policy_text('[tools]\nallow = ["read_file"]\n')
+
+    assert profile is None
+    assert "use_case" in err
+
+
+def test_policy_gate_blocks_all_dispatched_tools_equally():
+    """The gate sits in front of dispatch_tool, so safe_tool_call hits it too."""
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "narrow"
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "not allowed for use case 'narrow'" in out
+
+
+def test_policy_hard_deny_wins_over_allow():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "no-shell"
+
+        [tools]
+        allow = ["run_shell", "read_file"]
+        deny = ["run_shell"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("run_shell", {"command": "echo hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "hard-denied" in out
+
+
+def test_policy_read_only_blocks_writes_and_shell():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "reviewer"
+        read_only = true
+
+        [tools]
+        allow = ["read_file", "write_file", "run_shell"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile), tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        write = agent.dispatch_tool("write_file",
+                                    {"file_path": "x.txt", "content": "hi"})
+        shell = agent.dispatch_tool("run_shell", {"command": "echo hi"})
+
+    assert "read-only" in write
+    assert "read-only" in shell
+
+
+def test_policy_read_only_still_allows_reads():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "reviewer"
+        read_only = true
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "note.txt")
+
+        with open(path, "w") as handle:
+            handle.write("hello\n")
+
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            out = agent.dispatch_tool("read_file", {"file_path": "note.txt"})
+
+    assert "hello" in out
+    assert not out.startswith("Error: policy deny -")
+
+
+def test_policy_shell_denies_a_forbidden_command_family():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "no-egress"
+
+        [tools]
+        allow = ["run_shell"]
+
+        [run_shell]
+        allow = ["git status", "python3 -m pytest"]
+        deny = ["rm ", "curl "]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        denied = agent.dispatch_tool("run_shell", {"command": "curl http://x"})
+        allowed = agent.dispatch_tool("run_shell", {"command": "git status"})
+
+    assert "denied family" in denied
+    assert not allowed.startswith("Error: policy deny -")
+
+
+def test_policy_shell_requires_an_allowed_family():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "only-tests"
+
+        [tools]
+        allow = ["run_shell"]
+
+        [run_shell]
+        allow = ["python3 -m pytest"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        out = agent.dispatch_tool("run_shell", {"command": "ls -la"})
+
+    assert "not in an allowed family" in out
+
+
+def test_policy_path_deny_read_blocks_read_tools():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "clean-room"
+
+        [tools]
+        allow = ["read_file"]
+
+        [paths]
+        deny_read = ["company/work/acme/hr/**"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "payroll.txt"), "w") as handle:
+            handle.write("secret\n")
+
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            denied = agent.dispatch_tool(
+                "read_file", {"file_path": "company/work/acme/hr/payroll.txt"})
+
+    assert "off-limits" in denied
+
+
+def test_policy_path_allow_write_scope_blocks_outside_writes():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "bots-only"
+
+        [tools]
+        allow = ["write_file"]
+
+        [paths]
+        allow_write = ["company/work/acme/bots/**"]
+        """
+    )
+    assert err is None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with _with_policy(profile), \
+                mock.patch.object(agent, "WORKSPACE", tmp):
+            denied = agent.dispatch_tool(
+                "write_file",
+                {"file_path": "company/work/acme/elsewhere/x.txt",
+                 "content": "hi"})
+            allowed = agent.dispatch_tool(
+                "write_file",
+                {"file_path": "company/work/acme/bots/x.txt", "content": "hi"})
+
+    assert "outside the write scope" in denied
+    assert "written completely" in allowed
+
+
+def test_policy_audit_records_every_gate_decision():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "tracked"
+
+        [tools]
+        allow = ["read_file"]
+        """
+    )
+    assert err is None
+
+    with _with_policy(profile):
+        agent.dispatch_tool("read_file", {"file_path": "a.txt"})
+        agent.dispatch_tool("update_plan", {"todos": []})
+        audit = list(agent.POLICY_AUDIT)
+
+    decisions = [row["decision"] for row in audit]
+
+    assert len(audit) == 2
+    assert decisions == ["allow", "deny"]
+    assert audit[0]["use_case"] == "tracked"
+    assert "not allowed" in audit[1]["reason"]
+
+
+def test_policy_audit_redacts_written_content():
+    """The trail records the decision, not a second copy of the file body."""
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "tracked"
+
+        [tools]
+        allow = ["write_file"]
+        """
+    )
+    assert err is None
+
+    body = "API_KEY=super-secret-value\n" * 10
+
+    with _with_policy(profile):
+        agent.policy_audit(
+            "write_file",
+            {"file_path": "company/work/acme/x.py", "content": body},
+            "allow",
+            None,
+        )
+        row = agent.POLICY_AUDIT[-1]
+
+    assert "super-secret-value" not in str(row)
+    assert row["args"]["file_path"] == "company/work/acme/x.py"
+    assert row["args"]["content"].startswith("<")
+    assert "sha256:" in row["args"]["content"]
+
+
+def test_policy_inactive_by_default_passes_everything_through():
+    """No policy loaded - the dispatch gate is a no-op, unbounded as before."""
+    with _with_policy(None), tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "w.txt", "content": "hi"})
+
+    assert "written completely" in out
+    assert agent.POLICY_AUDIT == []
+
+
+# ---------- ask escalation (policy item 5) ----------
+
+@contextlib.contextmanager
+def _with_ask_handler(handler):
+    """Set agent.ASK_HANDLER for the duration, restoring whatever was there."""
+    saved = agent.ASK_HANDLER
+    agent.ASK_HANDLER = handler
+
+    try:
+        yield
+    finally:
+        agent.ASK_HANDLER = saved
+
+
+def _ask_profile():
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "careful"
+
+        [tools]
+        allow = ["read_file", "write_file"]
+        ask = ["write_file"]
+        """
+    )
+    assert err is None
+    return profile
+
+
+def test_policy_parses_the_ask_list():
+    profile = _ask_profile()
+
+    assert profile.tool_ask == ["write_file"]
+
+
+def test_policy_ask_fires_only_for_an_unblocked_ask_gated_tool():
+    profile = _ask_profile()
+
+    with _with_policy(profile):
+        assert agent.policy_ask("write_file", {"file_path": "x"}) is not None
+        assert agent.policy_ask("read_file", {"file_path": "x"}) is None
+
+
+def test_a_headless_ask_is_denied_fail_closed():
+    # no ASK_HANDLER: no one can confirm, so the call must not run
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(None), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert out.startswith("Error: policy ask denied")
+    assert audit[-1]["decision"] == "ask-denied"
+    assert written is False
+
+
+def test_an_ask_answered_yes_runs_and_is_audited():
+    profile = _ask_profile()
+    seen = []
+
+    def handler(tool_name, args, reason):
+        seen.append((tool_name, reason))
+        return True
+
+    with _with_policy(profile), _with_ask_handler(handler), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert "written completely" in out
+    assert written is True
+    assert seen and seen[0][0] == "write_file"
+    assert audit[-1]["decision"] == "ask-allowed"
+
+
+def test_an_ask_answered_no_is_denied_and_not_run():
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(lambda *a: False), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+        audit = list(agent.POLICY_AUDIT)
+        written = os.path.exists(os.path.join(tmp, "x.txt"))
+
+    assert out.startswith("Error: policy ask denied")
+    assert audit[-1]["decision"] == "ask-denied"
+    assert written is False
+
+
+def test_a_hard_deny_beats_an_ask():
+    # deny wins: an ask-gated call that is also denied never reaches the handler
+    profile, err = _load_policy_text(
+        """
+        [use_case]
+        name = "both"
+
+        [tools]
+        deny = ["write_file"]
+        ask = ["write_file"]
+        """
+    )
+    assert err is None
+
+    def handler(*args):
+        raise AssertionError("a denied call must never be asked")
+
+    with _with_policy(profile), _with_ask_handler(handler), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        out = agent.dispatch_tool("write_file",
+                                  {"file_path": "x.txt", "content": "hi"})
+
+    assert out.startswith("Error: policy deny -")
+    assert "hard-denied" in out
+
+
+def test_an_ask_gated_call_is_not_audited_as_a_plain_allow():
+    profile = _ask_profile()
+
+    with _with_policy(profile), _with_ask_handler(lambda *a: True), \
+            tempfile.TemporaryDirectory() as tmp, \
+            mock.patch.object(agent, "WORKSPACE", tmp):
+        agent.dispatch_tool("read_file", {"file_path": "a.txt"})
+        agent.dispatch_tool("write_file", {"file_path": "b.txt", "content": "x"})
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    # the read is a plain allow; the ask-gated write is not
+    assert decisions == ["allow", "ask-allowed"]
+
+
+def test_policy_from_dict_parses_a_tools_ask_list():
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"},
+         "tools": {"ask": ["run_shell"]}},
+        "x",
+    )
+
+    assert err is None
+    assert profile.tool_ask == ["run_shell"]
+
+
+def test_policy_from_dict_survives_a_malformed_tools_table():
+    # tools written as a list must not crash the loader
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"}, "tools": ["read_file"]}, "x"
+    )
+
+    assert err is None
+    assert profile.tool_allow == []
+    assert profile.tool_ask == []
+
+
+def test_main_loads_policy_flag_before_running():
+    profile_toml = """
+        [use_case]
+        name = "cli-bounded"
+
+        [tools]
+        allow = ["read_file"]
+    """
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write(profile_toml)
+        policy_path = fh.name
+
+    reset(FakeClient([response("done", prompt_tokens=10, completion_tokens=2)]))
+
+    try:
+        # _main is the in-process body; main() deliberately restores policy
+        # state on exit, so a leakage assertion must use _main.
+        code = agent._main(["--policy", policy_path,
+                            "--task", "look around"])
+    finally:
+        os.unlink(policy_path)
+
+    active = agent._ACTIVE_POLICY
+    agent.set_active_policy(None)
+    assert code == 0
+    assert active is not None and active.name == "cli-bounded"
+
+
+# ---------- use-case scope gate ([domain] allow/deny) ----------
+
+DOMAIN_TOML = """
+    version = "1"
+
+    [use_case]
+    name = "todo-app"
+
+    [domain]
+    allow = ["todo", "task", "to-do", "due date", "item", "checklist"]
+    deny = ["chatgpt", "chatbot", "build an agent", "crypto", "llm"]
+"""
+
+
+def test_policy_parses_the_domain_terms():
+    profile, err = _load_policy_text(DOMAIN_TOML)
+
+    assert err is None
+    assert "todo" in profile.domain_allow
+    assert "chatgpt" in profile.domain_deny
+
+
+def test_no_domain_table_leaves_the_gate_off():
+    profile, err = _load_policy_text("""
+        [use_case]
+        name = "plain"
+    """)
+
+    assert err is None
+    assert profile.domain_allow == []
+    assert profile.domain_deny == []
+
+
+def test_domain_gate_allows_an_in_scope_request():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        assert agent.domain_check("add a due date to each todo item") is None
+
+
+def test_domain_gate_refuses_a_request_with_no_in_scope_term():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        refusal = agent.domain_check("build me a ChatGPT clone")
+
+        assert refusal is not None
+        assert refusal.startswith("Error: boundary")
+
+
+def test_domain_deny_wins_over_an_in_scope_term():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+
+    with _with_policy(profile):
+        # mentions "task" (allowed) and "chatbot" (denied): deny wins
+        refusal = agent.domain_check("add a task, then also build a chatbot")
+
+        assert refusal is not None
+        assert "chatbot" in refusal
+
+
+def test_domain_gate_is_off_without_a_policy():
+    assert agent.domain_check("build a ChatGPT clone") is None
+
+
+def test_a_refused_turn_calls_no_model_and_leaves_history_clean():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    client = FakeClient([response("must not be reached")])
+    reset(client)
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("build me a ChatGPT clone", 25,
+                                 agent.new_stats())
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "refused"
+    assert client.calls == []          # no token was spent
+    assert agent.history == []         # nothing entered the transcript
+    assert decisions == ["refuse-domain"]
+
+
+def test_a_refused_turn_emits_a_boundary_status_and_a_turn_end():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    reset(FakeClient([response("must not be reached")]))
+
+    events = []
+
+    with _with_policy(profile):
+        agent.run_turn("write a crypto trading bot", 25, agent.new_stats(),
+                       on_event=lambda n, **f: events.append((n, f)))
+
+    statuses = [f for n, f in events if n == "status"]
+
+    assert statuses and statuses[0]["message"].startswith("Error: boundary")
+    assert events[-1][0] == "turn_end"   # the view re-enables input
+
+
+def test_an_in_scope_turn_still_reaches_the_model():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    client = FakeClient([response("added a due date to every item")])
+    reset(client)
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a due date to each todo item", 25,
+                                 agent.new_stats())
+
+    assert outcome == "done"
+    assert len(client.calls) == 1
+
+
+def test_run_task_exits_nonzero_on_a_scope_refusal():
+    profile, _ = _load_policy_text(DOMAIN_TOML)
+    reset(FakeClient([response("must not be reached")]))
+
+    with _with_policy(profile):
+        code = agent.run_task("build me a ChatGPT clone", 25)
+
+    assert code == 1
+
+
+# ---------- verify-before-execute: the whole plan is checked, then run ----------
+
+def test_verify_plan_is_a_noop_without_a_policy():
+    assert agent.verify_plan([("read_file", {"file_path": "x"})]) == []
+
+
+def test_verify_plan_flags_a_call_that_leaves_the_project():
+    profile, _ = _load_policy_text("""
+        [use_case]
+        name = "todo-app"
+
+        [paths]
+        deny_read = ["company/work/todoinc/apps/chatbot/**"]
+    """)
+
+    with _with_policy(profile):
+        failures = agent.verify_plan([
+            ("read_file",
+             {"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}),
+            ("read_file",
+             {"file_path": "company/work/todoinc/apps/todo/src/todo.py"}),
+        ])
+
+    assert [name for name, _ in failures] == ["read_file"]
+
+
+BATCH_POLICY = """
+    version = "1"
+
+    [use_case]
+    name = "todo-app"
+
+    [domain]
+    allow = ["todo"]
+
+    [paths]
+    allow_write = ["company/work/todoinc/apps/todo/**"]
+    deny_read = ["company/work/todoinc/apps/chatbot/**"]
+"""
+
+
+def test_a_batch_that_leaves_the_project_executes_none_of_it():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    target = "company/work/todoinc/apps/todo/should-not-exist.py"
+    probe = os.path.join(agent.WORKSPACE, target)
+    if os.path.exists(probe):
+        os.unlink(probe)
+
+    reset(FakeClient([
+        response(None, [
+            tool_call("c1", "write_file",
+                      json.dumps({"file_path": target, "content": "x"})),
+            tool_call("c2", "read_file",
+                      '{"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}'),
+        ]),
+        response("understood"),
+    ]))
+
+    events = []
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats(),
+                                 on_event=lambda n, **f: events.append((n, f)))
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "refused"            # a boundary batch stops the turn
+    assert len(agent.client.calls) == 1    # no re-proposal: the turn stopped
+    assert not os.path.exists(probe)       # the in-scope write did NOT run
+    assert decisions.count("deny") == 2    # both calls in the batch were refused
+
+    ends = [f for n, f in events if n == "tool_end"]
+    assert ends and all(f["success"] is False for f in ends)
+    assert any("boundary" in f["result"] for f in ends)
+
+
+def test_a_fully_in_scope_batch_executes():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call(
+            "c1", "read_file",
+            '{"file_path": "company/work/todoinc/apps/todo/README.md"}')]),
+        response("read it"),
+    ]))
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats())
+        decisions = [row["decision"] for row in agent.POLICY_AUDIT]
+
+    assert outcome == "done"
+    assert "allow" in decisions
+    assert "deny" not in decisions
+
+
+def test_a_secret_read_stops_the_turn_too():
+    # a per-call deliberate refusal (the secret guard) is terminal in the same
+    # way a policy denial is: the turn stops rather than retrying
+    profile, err = _load_policy_text("""
+        [use_case]
+        name = "todo-app"
+
+        [tools]
+        allow = ["read_file"]
+    """)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call("c1", "read_file", '{"file_path": ".env"}')]),
+        response("should not run"),
+    ]))
+
+    with _with_policy(profile):
+        outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats())
+
+    assert outcome == "refused"
+    assert len(agent.client.calls) == 1
+
+
+def test_run_task_marks_a_refusal_and_exits_nonzero():
+    profile, err = _load_policy_text(BATCH_POLICY)
+    assert err is None
+
+    reset(FakeClient([
+        response(None, [tool_call(
+            "c1", "read_file",
+            '{"file_path": "company/work/todoinc/apps/chatbot/src/bot.py"}')]),
+        response("unreached"),
+    ]))
+
+    with _with_policy(profile):
+        code = agent.run_task("add a todo to the list", 25)
+
+    assert code == 1
+    assert any("REFUSED" in line for line in PRINTED)
+
+
+# ---------- managed mode (--require-proxy / D12) ----------
+
+POLICY_TABLE = {
+    "version": "1",
+    "use_case": {"name": "codefix", "read_only": True},
+    "tools": {"deny": ["run_shell"]},
+    "paths": {"deny_read": ["secrets/**"]},
+}
+
+
+def test_gateway_root_strips_a_v1_suffix():
+    assert agent.gateway_root("http://127.0.0.1:8000/v1") == "http://127.0.0.1:8000"
+    assert agent.gateway_root("http://127.0.0.1:8000/v1/") == "http://127.0.0.1:8000"
+    assert agent.gateway_root("http://gw:9000") == "http://gw:9000"
+
+
+def test_policy_from_dict_matches_the_file_profile():
+    profile, err = agent.policy_from_dict(POLICY_TABLE, "gateway policy")
+
+    assert err is None
+    assert profile.name == "codefix"
+    assert profile.read_only is True
+    assert profile.tool_deny == ["run_shell"]
+    assert profile.deny_read == ["secrets/**"]
+
+
+def test_policy_from_dict_rejects_a_missing_use_case():
+    profile, err = agent.policy_from_dict({"version": "1"}, "x")
+
+    assert profile is None and "use_case" in err
+
+
+def test_policy_from_dict_rejects_a_non_numeric_version():
+    profile, err = agent.policy_from_dict(
+        {"version": "two", "use_case": {"name": "x"}}, "x"
+    )
+
+    assert profile is None and "not a number" in err
+
+
+def test_policy_from_dict_rejects_a_newer_schema():
+    profile, err = agent.policy_from_dict(
+        {"version": "2", "use_case": {"name": "x"}}, "x"
+    )
+
+    assert profile is None and "unsupported" in err
+
+
+def test_policy_parses_a_model_allowlist():
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": {"allow": ["free/x", "mid/x"]}},
+        "x",
+    )
+
+    assert err is None
+    assert profile.model_allow == ["free/x", "mid/x"]
+
+
+def test_policy_parses_the_documented_top_level_models_list():
+    # the BOUNDED-AGENT.md example writes `models = [...]`, so that shape must
+    # narrow the allowlist too - a doc/code mismatch here fails open silently
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": ["nvidia/nemotron-3.5-lightning:free"]},
+        "x",
+    )
+
+    assert err is None
+    assert profile.model_allow == ["nvidia/nemotron-3.5-lightning:free"]
+
+
+def test_no_model_allowlist_allows_any_model():
+    profile, err = agent.policy_from_dict(
+        {"version": "1", "use_case": {"name": "x"}}, "x"
+    )
+    agent.set_active_policy(profile)
+
+    try:
+        assert agent.allowed_models() == []
+        assert agent.model_allowed("anything/at-all") is True
+    finally:
+        agent.set_active_policy(None)
+
+
+def test_model_allowlist_refuses_a_model_outside_it():
+    profile, err = agent.policy_from_dict(
+        {"version": "1",
+         "use_case": {"name": "x"},
+         "models": {"allow": ["free/x"]}},
+        "x",
+    )
+    agent.set_active_policy(profile)
+
+    try:
+        assert agent.allowed_models() == ["free/x"]
+        assert agent.model_allowed("free/x") is True
+        assert agent.model_allowed("premium/x") is False
+        assert agent.model_allowed("") is False
+    finally:
+        agent.set_active_policy(None)
+
+
+def test_model_allowed_without_a_policy_is_permissive():
+    agent.set_active_policy(None)
+    assert agent.model_allowed("whatever/x") is True
+
+
+def test_fetch_policy_reads_the_policy_table_and_sends_the_token():
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"policy": POLICY_TABLE}).encode()
+
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return FakeResponse()
+
+    with mock.patch.object(agent.urllib.request, "urlopen", fake_urlopen):
+        data, err = agent.fetch_policy("http://gw.test/v1", "vk-x")
+
+    assert err is None and data == POLICY_TABLE
+    assert seen["url"] == "http://gw.test/policy"
+    assert seen["auth"] == "Bearer vk-x"
+
+
+def test_enter_managed_mode_refuses_without_a_token():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        err = agent.enter_managed_mode()
+
+    assert err and "gateway token" in err
+
+
+def test_enter_managed_mode_refuses_a_provider_key():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "sk-provider"}, clear=True):
+        err = agent.enter_managed_mode()
+
+    assert err and "vk-" in err
+
+
+def test_enter_managed_mode_refuses_the_direct_provider_url():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", agent.DEFAULT_PROVIDER_URL):
+            err = agent.enter_managed_mode()
+
+    assert err and "direct provider URL" in err
+
+
+def test_enter_managed_mode_refuses_when_the_gateway_refuses():
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError("http://gw.test/policy", 404, "no", {}, None)
+
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", "http://gw.test/v1"):
+            with mock.patch.object(agent.urllib.request, "urlopen", boom):
+                err = agent.enter_managed_mode()
+
+    assert err and "HTTP 404" in err
+
+
+def test_enter_managed_mode_applies_a_served_policy():
+    with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"}, clear=True):
+        with mock.patch.object(agent, "BASE_URL", "http://gw.test/v1"):
+            with mock.patch.object(agent, "fetch_policy",
+                                   lambda *a, **k: (POLICY_TABLE, None)):
+                err = agent.enter_managed_mode()
+
+    active = agent.active_policy()
+    agent.set_active_policy(None)
+    assert err is None
+    assert active is not None and active.name == "codefix"
+
+
+def test_managed_mode_env_flag_is_truthy():
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "1"}, clear=True):
+        assert agent._env_truthy(agent.MANAGED_MODE_ENV) is True
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "no"}, clear=True):
+        assert agent._env_truthy(agent.MANAGED_MODE_ENV) is False
+
+
+def test_managed_main_refuses_without_a_policy():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        code = agent.main(["--require-proxy", "--task", "hi"])
+
+    assert code == 1
+
+
+def test_managed_mode_env_var_refuses_without_a_token():
+    with mock.patch.dict(os.environ, {"TAMIAS_REQUIRE_PROXY": "1"}, clear=True):
+        assert agent.main(["--task", "hi"]) == 1
+
+
+def test_managed_main_refuses_a_local_policy_alongside_the_flag():
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        fh.write('[use_case]\nname = "x"\n')
+        policy_path = fh.name
+
+    try:
+        with mock.patch.dict(os.environ, {"TAMIAS_API_KEY": "vk-acme-abc"},
+                             clear=True):
+            code = agent.main(["--require-proxy", "--policy", policy_path,
+                               "--task", "hi"])
+    finally:
+        os.unlink(policy_path)
+
+    assert code == 1
+
+
+def test_protected_policy_path_is_refused():
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+        path = fh.name
+
+    try:
+        assert agent.is_sensitive_path(path) is False
+        agent.protect_path(path)
+        assert agent.is_sensitive_path(path) is True
+        assert agent.refuse_secret(path)
+    finally:
+        agent.PROTECTED_PATHS.discard(os.path.abspath(path))
+        agent.PROTECTED_PATHS.discard(os.path.realpath(path))
+        os.unlink(path)
+
+
+# ---------- A8: escalation evidence must be real difficulty ----------
+
+def test_is_deliberate_refusal_separates_policy_and_secrets_from_failures():
+    assert agent.is_deliberate_refusal(
+        "Error: policy deny - tool 'list_directory' is hard-denied for use "
+        "case 'x'")
+    assert agent.is_deliberate_refusal(
+        "Error: '.env' is a protected secret file and must not be read")
+    assert agent.is_deliberate_refusal(
+        "Error: shell command references protected secret file 'api.pem'")
+
+    # a genuine failure is not a refusal
+    assert not agent.is_deliberate_refusal("Error: file 'a.py' not found")
+    assert not agent.is_deliberate_refusal("ok, done")
+
+
+def test_is_rate_limit_error_matches_provider_limits_only():
+    assert agent.is_rate_limit_error(
+        RuntimeError("Error code: 429 - Rate limit exceeded"))
+    assert agent.is_rate_limit_error(
+        RuntimeError("Rate limit exceeded: free-models-per-day"))
+    assert agent.is_rate_limit_error(SimpleNamespace(status_code=429))
+
+    assert not agent.is_rate_limit_error(RuntimeError("Connection error."))
+    assert not agent.is_rate_limit_error(RuntimeError("model not found"))
+
+
+def test_a_rate_limited_provider_is_reported_honestly():
+    # the free-tier daily limit is the most common live-demo failure: it must
+    # be named as a provider limit, never as a boundary block or completed work
+    reset(FakeClient([
+        RuntimeError("Error code: 429 - Rate limit exceeded: "
+                     "free-models-per-day"),
+    ]))
+
+    events = []
+    outcome = agent.run_turn("add a todo to the list", 25, agent.new_stats(),
+                             on_event=lambda n, **f: events.append((n, f)))
+
+    assert outcome == "error"                      # exits non-zero, not "done"
+    assert len(agent.client.calls) == 1            # it did try the call
+
+    joined = "\n".join(PRINTED)
+    assert "provider limit" in joined
+    assert "not a use-case boundary block" in joined
+    assert "429" not in joined                     # the raw provider JSON is hidden
+
+    statuses = [f["message"] for n, f in events if n == "status"]
+    assert any("provider rate limited" in m for m in statuses)
+    # and it is never mistaken for a boundary event in the UI
+    assert not any(m.startswith("Error: boundary") for m in statuses)
+
+
+def test_context_size_from_measures_only_the_tail():
+    reset()
+    agent.history.extend([
+        {"role": "user", "content": "x" * 100},
+        {"role": "user", "content": "y" * 5},
+    ])
+
+    assert agent.context_size_from(0) == 105
+    assert agent.context_size_from(1) == 5
+    assert agent.history_size() == 105
+
+
+TIERS = {"AGENT_MODEL_FREE": "free/x", "AGENT_MODEL_MID": "mid/x",
+         "AGENT_MODEL_PREMIUM": "premium/x", "AGENT_EFFORT_POLICY": "auto"}
+
+
+def test_a_policy_denial_stops_the_turn_without_escalating():
+    # a denied tool is not the model struggling: the turn stops rather than
+    # climbing to a bigger model to retry the very call the fence refused
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')]),
+        response("all done"),
+    ])
+    reset(client)
+
+    policy = agent.PolicyProfile(name="locked", tool_deny=["list_directory"])
+    agent.set_active_policy(policy)
+
+    try:
+        with mock.patch.dict(os.environ, TIERS):
+            outcome = agent.run_turn("look around", 25, agent.new_stats())
+    finally:
+        agent.set_active_policy(None)
+
+    assert outcome == "refused"
+    assert any("policy deny" in line for line in PRINTED)
+    # the turn stopped after the denial: no escalated second step
+    assert len(client.calls) == 1
+    assert client.calls[0]["model"] == "free/x"
+
+
+def test_pre_existing_history_does_not_escalate_a_small_step():
+    # a long transcript must not drift an easy step onto a premium model:
+    # the difficulty signal is the step's new work, not the whole history
+    client = FakeClient([response("done")])
+    reset(client)
+    agent.history.append({"role": "user", "content": "z" * 5000})
+    assert agent.history_size() >= agent.BIG_PROMPT_CHARS
+
+    with mock.patch.dict(os.environ, TIERS):
+        assert agent.run_turn("hi", 25, agent.new_stats()) == "done"
+
+    assert client.calls[0]["model"] == "free/x"
+
+
+def test_a_genuine_failure_still_escalates_the_next_step():
+    client = FakeClient([
+        response(None, [tool_call("c1", "read_file",
+                                  '{"file_path": "/nope/missing.py"}')]),
+        response("all done"),
+    ])
+    reset(client)
+
+    with mock.patch.dict(os.environ, TIERS):
+        assert agent.run_turn("read it", 25, agent.new_stats()) == "done"
+
+    assert client.calls[0]["model"] == "free/x"
+    assert client.calls[1]["model"] == "mid/x"
+
+
+# ---------- A9: cache-read awareness ----------
+
+def test_usage_cache_read_reads_both_shapes():
+    sdk_shaped = SimpleNamespace(
+        prompt_tokens=100, completion_tokens=5,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=80),
+    )
+    extra_shaped = SimpleNamespace(
+        prompt_tokens=100, completion_tokens=5,
+        model_extra={"prompt_tokens_details": {"cached_tokens": 64}},
+    )
+
+    assert agent.usage_cache_read(sdk_shaped) == 80
+    assert agent.usage_cache_read(extra_shaped) == 64
+
+    # absent, malformed or negative reads as zero rather than a guess
+    assert agent.usage_cache_read(SimpleNamespace(prompt_tokens=10)) == 0
+    assert agent.usage_cache_read(None) == 0
+    assert agent.usage_cache_read(
+        SimpleNamespace(prompt_tokens_details=SimpleNamespace(cached_tokens=True))
+    ) == 0
+
+
+def test_log_step_counts_cache_reads():
+    client = FakeClient([response("done", prompt_tokens=100,
+                                  completion_tokens=5, cached_tokens=80)])
+    reset(client)
+    stats = agent.new_stats()
+
+    agent.log_step(1, client.create(), stats, 0.1)
+
+    assert stats["prompt_tokens"] == 100
+    assert stats["cache_read_tokens"] == 80
+    assert any("cached 80" in line for line in PRINTED)
+
+
+def test_print_summary_shows_cached_prompt_tokens_when_present():
+    stats = agent.new_stats()
+    stats["steps"] = 1
+    stats["prompt_tokens"] = 100
+    stats["cache_read_tokens"] = 80
+
+    agent.print_summary(stats)
+
+    assert any("cached prompt tokens" in line for line in PRINTED)
+
+
+def test_compaction_sends_a_bounded_transcript_not_the_whole_history():
+    # compaction must send *less*: a session far past the trigger still gets a
+    # capped summariser call, so the peak context does not grow with the log
+    client = FakeClient([response("<summary>folded</summary>")])
+    reset(client)
+
+    for _ in range(40):
+        agent.history.append({"role": "user", "content": "x" * 5000})
+
+    whole = agent.history_size()
+    assert whole >= 200_000
+
+    assert agent.compact_history(client, agent.new_stats()) is True
+
+    sent = client.calls[0]["messages"]
+    sent_chars = sum(len(str(m.get("content") or "")) for m in sent)
+    assert sent_chars < whole // 2
+
+
+def test_compaction_facts_cover_what_the_transcript_drops():
+    # the bounded excerpt is paired with the recorded facts, so the original ask
+    # survives even when it is outside the window
+    client = FakeClient([response("<summary>folded</summary>")])
+    reset(client)
+
+    agent.history.append({"role": "user",
+                          "content": "ORIGINAL ASK " + "x" * 30_000})
+    for _ in range(10):
+        agent.history.append({"role": "user", "content": "later " + "y" * 3000})
+
+    agent.compact_history(client, agent.new_stats())
+
+    blob = "\n".join(str(m.get("content") or "")
+                     for m in client.calls[0]["messages"])
+    assert "ORIGINAL ASK" in blob
+    assert agent.COMPACT_TRANSCRIPT_CHARS < agent.COMPACT_TRIGGER_CHARS
+
+
+def test_the_compaction_call_is_metered():
+    # the summariser is a real billed request; the session total must include it
+    client = FakeClient([response("<summary>folded</summary>", prompt_tokens=1000,
+                                  completion_tokens=50, cost=0.02)])
+    reset(client)
+    agent.history.append({"role": "user", "content": "x" * 10})
+
+    stats = agent.new_stats()
+    agent.compact_history(client, stats)
+
+    assert stats["cost_usd"] == 0.02
+    assert stats["prompt_tokens"] == 1000
+    assert stats["completion_tokens"] == 50
+
+
+# ---------- A12: pre-flight token ceiling + running cost ceiling ----------
+
+
+def test_estimate_prompt_tokens_counts_content_and_tool_arguments():
+    assert agent.estimate_prompt_tokens(
+        [{"role": "user", "content": "x" * 40}]) == 10
+    assert agent.estimate_prompt_tokens(
+        [{"role": "assistant", "content": "",
+          "tool_calls": [{"function": {"arguments": "y" * 40}}]}]) == 10
+    assert agent.estimate_prompt_tokens([]) == 0
+
+
+def test_ceilings_read_the_environment_then_flags():
+    with mock.patch.dict(os.environ, {"TAMIAS_MAX_PROMPT_TOKENS": "500",
+                                      "TAMIAS_MAX_TASK_COST_USD": "0.5"}):
+        agent.apply_ceilings()
+        assert agent.MAX_PROMPT_TOKENS == 500
+        assert agent.MAX_TASK_COST_USD == 0.5
+
+        agent.apply_ceilings(123, 1.25)
+        assert agent.MAX_PROMPT_TOKENS == 123
+        assert agent.MAX_TASK_COST_USD == 1.25
+
+    agent.apply_ceilings(0, 0)  # back to "no ceiling" for the rest of the run
+
+
+def test_prompt_ceiling_refuses_before_the_call_is_sent():
+    client = FakeClient([response("should never be called")])
+    reset(client)
+    agent.history.append({"role": "user", "content": "x" * 4000})
+
+    saved = agent.MAX_PROMPT_TOKENS
+    agent.MAX_PROMPT_TOKENS = 100
+    try:
+        outcome = agent.run_turn("do a thing", 25, agent.new_stats())
+    finally:
+        agent.MAX_PROMPT_TOKENS = saved
+
+    assert outcome == "ceiling"
+    assert client.calls == []       # nothing was billed
+    # the turn is rolled back exactly like the step cap; what was there before
+    # the turn is kept
+    assert len(agent.history) == 1
+    assert "do a thing" not in agent.history[0]["content"]
+
+
+def test_cost_ceiling_stops_before_the_next_step():
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 cost=0.05),
+        response("unreached"),
+    ])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        outcome = agent.run_turn("look around", 25, agent.new_stats())
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+    assert outcome == "spent"
+    assert len(client.calls) == 1   # the second call was refused
+
+
+def test_a_finished_answer_is_still_delivered_at_the_ceiling():
+    # the ceiling stops the next call; an answer already produced is not lost
+    client = FakeClient([response("here is your answer", cost=0.99)])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        outcome = agent.run_turn("quick one", 25, agent.new_stats())
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+    assert outcome == "done"
+    assert any("here is your answer" in line for line in PRINTED)
+
+
+def test_run_task_exits_nonzero_when_a_ceiling_trips():
+    client = FakeClient([
+        response(None, [tool_call("c1", "list_directory", '{"path": "."}')],
+                 cost=0.05),
+        response("unreached"),
+    ])
+    reset(client)
+
+    saved = agent.MAX_TASK_COST_USD
+    agent.MAX_TASK_COST_USD = 0.01
+    try:
+        assert agent.run_task("do it", 25) == 1
+    finally:
+        agent.MAX_TASK_COST_USD = saved
+
+
+# ---------- D13: the brief compiler ----------
+
+def test_a_terse_brief_is_high_ambiguity_with_assumptions():
+    compiled = brief.compile_brief("fix it")
+
+    assert compiled.risk_band == "high"
+    assert compiled.needs_clarification is True
+    assert compiled.assumptions                      # it states what it assumes
+    assert compiled.questions                        # and what only the user knows
+    assert "fix it" in compiled.elaborated           # the verbatim ask survives
+
+
+def test_a_specific_brief_is_low_ambiguity():
+    compiled = brief.compile_brief(
+        "add a --json flag to agent.py so a run prints a summary; "
+        "run pytest test_agent.py to verify"
+    )
+
+    assert compiled.ambiguity_score == 0.0
+    assert compiled.risk_band == "low"
+    assert compiled.needs_clarification is False
+    assert compiled.assumptions == []                # nothing to assume
+
+
+def test_the_compiler_never_invents_a_citation():
+    compiled = brief.compile_brief("rewrite everything")
+
+    assert compiled.citations == []
+    assert "none retrieved yet" in compiled.elaborated
+
+
+def test_the_compiler_keeps_caller_citations():
+    compiled = brief.compile_brief("fix agent.py", citations=["agent.py:10", ""])
+
+    assert compiled.citations == ["agent.py:10"]     # blank dropped, real kept
+    assert "agent.py:10" in compiled.elaborated
+
+
+def test_a_high_ambiguity_brief_prints_its_open_questions():
+    rendered = brief.format_brief(brief.compile_brief("clean this up"))
+
+    assert "OPEN QUESTIONS" in rendered
+    assert "risk high" in rendered
+
+
+def test_key_terms_skips_stopwords_and_short_words():
+    terms = brief.key_terms("fix the select_model escalation in agent.py")
+
+    assert "select_model" in terms
+    assert "the" not in terms
+    assert "fix" not in terms          # a stopword: too common to cite
+    assert terms[0] == "select_model"  # most specific first
+
+
+def test_retrieve_citations_finds_a_real_file_and_line():
+    with tempfile.TemporaryDirectory() as root:
+        with open(os.path.join(root, "widget_router.py"), "w") as handle:
+            handle.write("def resolve_widget_router():\n    return 1\n")
+        with open(os.path.join(root, "notes.md"), "w") as handle:
+            handle.write("the widget_router is documented here\n")
+
+        found = brief.retrieve_citations("resolve the widget_router problem",
+                                         root=root)
+
+    assert any(hit.startswith("widget_router.py") for hit in found)  # symbol/name
+    assert any("widget_router" in hit for hit in found)
+
+
+def test_retrieve_citations_cites_nothing_when_nothing_matches():
+    with tempfile.TemporaryDirectory() as root:
+        with open(os.path.join(root, "a.py"), "w") as handle:
+            handle.write("print('nothing to see')\n")
+
+        assert brief.retrieve_citations("zzzzz qqqqq wvvvv", root=root) == []
+
+
+def test_retrieve_citations_skips_vcs_and_cache_dirs():
+    with tempfile.TemporaryDirectory() as root:
+        for skipped in (".git", "__pycache__", ".venv"):
+            folder = os.path.join(root, skipped)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "needle_target.py"), "w") as handle:
+                handle.write("needle_target\n")
+
+        assert brief.retrieve_citations("needle_target", root=root) == []
+
+
+# ---------- D14: searchable context index with mandatory citations ----------
+
+def _index_fixture(root):
+    with open(os.path.join(root, "widget_router.py"), "w") as handle:
+        handle.write(
+            "class WidgetRouter:\n"
+            "    pass\n\n"
+            "def resolve_widget_router(path):\n"
+            "    return path\n"
+        )
+    with open(os.path.join(root, "app.js"), "w") as handle:
+        handle.write("function mountWidget(id) {\n  return id;\n}\n")
+    with open(os.path.join(root, "main.go"), "w") as handle:
+        handle.write("func HandleRequest(w, r) {\n}\n")
+    with open(os.path.join(root, "lib.rs"), "w") as handle:
+        handle.write("pub fn resolve_widget() -> u8 { 1 }\n")
+    with open(os.path.join(root, "notes.md"), "w") as handle:
+        handle.write("# notes\n\nthe widget_router is documented here\n")
+
+
+def test_index_extracts_symbols_across_languages():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+    assert index.find_symbol("WidgetRouter")[0].kind == "class"
+    assert index.find_symbol("resolve_widget_router")[0].kind == "function"
+    assert index.find_symbol("mountWidget")[0].kind == "function"
+    assert index.find_symbol("HandleRequest")[0].kind == "function"
+    assert index.find_symbol("resolve_widget")[0].kind == "function"
+
+
+def test_index_ranks_an_exact_symbol_first_and_cites_its_definition():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+        hits = index.search("resolve_widget_router")
+
+    assert hits[0].citation.startswith("widget_router.py:")
+    assert hits[0].symbol == "resolve_widget_router"
+
+
+def test_index_prefix_matches_a_symbol():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        # "mount" has no exact symbol, so the prefix branch is what answers
+        names = {hit.symbol for hit in index.find_symbol("mount")}
+
+    assert "mountWidget" in names
+
+
+def test_index_content_pass_cites_a_real_line():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+        hits = index.grep("documented")
+
+    assert hits, "the content pass should find the line"
+    assert hits[0].path == "notes.md"
+    assert hits[0].line == 3
+
+
+def test_every_hit_carries_a_non_empty_citation():
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        for hit in index.search("widget_router"):
+            assert hit.citation and ":" in hit.citation
+
+
+def test_index_returns_nothing_rather_than_guessing():
+    # mandatory citations: no real match means no result, never an invented one
+    with tempfile.TemporaryDirectory() as root:
+        _index_fixture(root)
+        index = context_index.ContextIndex(root).build()
+
+        assert index.search("zzzzq wvvvv qqqqz") == []
+        assert index.find_symbol("") == []
+        assert index.find_files("") == []
+
+
+def test_index_skips_vcs_and_cache_directories():
+    with tempfile.TemporaryDirectory() as root:
+        for skipped in (".git", "__pycache__", ".venv"):
+            folder = os.path.join(root, skipped)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "needle_target.py"), "w") as handle:
+                handle.write("def needle_target():\n    return 1\n")
+
+        index = context_index.ContextIndex(root).build()
+
+        assert index.search("needle_target") == []
+
+
+def test_index_uses_ripgrep_when_it_is_present():
+    with tempfile.TemporaryDirectory() as root:
+        index = context_index.ContextIndex(root)
+
+        fake = SimpleNamespace(stdout="./src/thing.py:12:a documented match\n",
+                               returncode=0)
+
+        with mock.patch.object(context_index.shutil, "which",
+                               return_value="/usr/bin/rg"), \
+                mock.patch.object(context_index.subprocess, "run",
+                                  return_value=fake) as run:
+            hits = index.grep("documented")
+
+    assert [hit.citation for hit in hits] == ["src/thing.py:12"]
+    assert run.call_args[0][0][0] == "rg"
+
+
+def test_citations_for_is_empty_for_an_empty_query():
+    with tempfile.TemporaryDirectory() as root:
+        assert context_index.citations_for("", root) == []
+        assert context_index.citations_for("   ", root) == []
+
+
+# ---------- D17: the benchmark harness ----------
+
+def _paired_fixture(base_cost, base_pass, cand_cost, cand_pass, n=10):
+    results = []
+    for i in range(n):
+        results.append(bench.TaskResult(f"t{i}", "baseline", i < base_pass,
+                                        base_cost))
+        results.append(bench.TaskResult(f"t{i}", "candidate", i < cand_pass,
+                                        cand_cost))
+    return results
+
+
+def test_cost_per_success_divides_by_successes_not_runs():
+    results = [
+        bench.TaskResult("t1", "a", True, 1.0),
+        bench.TaskResult("t2", "a", False, 1.0),
+        bench.TaskResult("t3", "a", True, 1.0),
+        bench.TaskResult("t4", "a", False, 1.0),
+    ]
+    summary = bench.summarize(results)[0]
+
+    assert summary.passed == 2
+    assert summary.total_usd == 4.0
+    assert summary.cost_per_success == 2.0   # 4 USD / 2 successes, not 4 / 4
+
+
+def test_an_arm_that_passes_nothing_has_infinite_cost_per_success():
+    results = [bench.TaskResult("t1", "a", False, 0.5)]
+    summary = bench.summarize(results)[0]
+
+    assert summary.cost_per_success == float("inf")
+
+
+def test_paired_bootstrap_sees_a_real_saving():
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.5, cand_pass=10)
+
+    ci = bench.paired_bootstrap(results, "baseline", "candidate",
+                                iterations=300, seed=0)
+
+    assert round(ci["improvement"], 3) == 0.5   # half the price, same output
+    assert ci["improvement_ci"][0] > 0
+    assert ci["pass_drop"] == 0.0
+
+
+def test_the_gate_promotes_a_clear_saving_at_equal_quality():
+    results = _paired_fixture(1.0, 10, 0.5, 10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is True
+    assert decision.improvement >= bench.GATE_MIN_IMPROVEMENT
+
+
+def test_the_gate_refuses_a_saving_bought_with_accuracy():
+    # 40% cheaper, but it drops 20 points of pass rate - not a win
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.6, cand_pass=8)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+    assert "pass-rate" in decision.reason
+
+
+def test_the_gate_refuses_a_saving_too_small_to_matter():
+    results = _paired_fixture(base_cost=1.0, base_pass=10,
+                              cand_cost=0.95, cand_pass=10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+    assert decision.improvement < bench.GATE_MIN_IMPROVEMENT
+
+
+def test_the_gate_refuses_when_no_saving_is_established():
+    # identical arms: the point estimate is 0 and the interval straddles 0
+    results = _paired_fixture(1.0, 10, 1.0, 10)
+    summaries = {s.arm: s for s in bench.summarize(results)}
+    ci = bench.paired_bootstrap(results, "baseline", "candidate", iterations=300)
+
+    decision = bench.decide(summaries["baseline"], summaries["candidate"], ci)
+
+    assert decision.promote is False
+
+
+def test_run_benchmark_randomizes_arm_order_but_runs_every_pair():
+    tasks = [bench.Task(f"t{i}", "do it") for i in range(4)]
+    arms = [bench.Arm("a", "m"), bench.Arm("b", "m"), bench.Arm("c", "m")]
+
+    calls = []
+
+    def runner(arm, task):
+        calls.append((task.id, arm.name))
+        return bench.TaskResult(task.id, arm.name, True, 1.0)
+
+    results = bench.run_benchmark(tasks, arms, runner, seed=7)
+
+    assert len(results) == 12                       # 3 arms x 4 tasks
+    per_task = {}
+    for task_id, arm_name in calls:
+        per_task.setdefault(task_id, []).append(arm_name)
+    for names in per_task.values():
+        assert sorted(names) == ["a", "b", "c"]     # every arm ran
+        assert len(names) == len(set(names))        # exactly once
+    # and the order is seeded, so it is reproducible
+    again = []
+    bench.run_benchmark(tasks, arms,
+                        lambda arm, task: (again.append((task.id, arm.name))
+                                           or bench.TaskResult(task.id, arm.name,
+                                                               True, 1.0)),
+                        seed=7)
+    assert again == calls
+
+
+def test_parse_cost_reads_the_runs_summary_line():
+    output = ("some noise\n"
+              "steps: 3 · prompt tokens: 10 · completion tokens: 4 · "
+              "compactions: 0 · spent: $0.0123\n")
+
+    assert bench.LiveRunner.parse_cost(output) == 0.0123
+    assert bench.LiveRunner.parse_cost("no summary here") == 0.0
+
+
+def test_the_external_arm_is_reported_as_not_run_not_as_a_failure():
+    runner = bench.LiveRunner()
+    result = runner(bench.Arm("external-codex", "external:codex"),
+                    bench.Task("t1", "do it"))
+
+    assert result.passed is False
+    assert "not wired" in result.note
+
+
+def test_summarize_orders_arms_as_given():
+    arms = [bench.Arm("first", "m"), bench.Arm("second", "m")]
+    results = [bench.TaskResult("t1", "second", True, 1.0),
+               bench.TaskResult("t1", "first", True, 1.0)]
+
+    assert [s.arm for s in bench.summarize(results, arms)] == ["first", "second"]
+
+
+def test_live_runner_env_carries_the_arm_configuration():
+    runner = bench.LiveRunner()
+    arm = bench.Arm("tamias-full", "base/model", "auto", True,
+                    tiers=("free/m", "mid/m", "prem/m"))
+
+    env = runner._env_for(arm)
+
+    assert env["AGENT_MODEL"] == "base/model"
+    assert env["AGENT_EFFORT_POLICY"] == "auto"
+    assert env["AGENT_BRIEF"] == "1"
+    assert env["AGENT_MODEL_FREE"] == "free/m"
+    assert env["AGENT_MODEL_MID"] == "mid/m"
+    assert env["AGENT_MODEL_PREMIUM"] == "prem/m"
+
+    # a static arm sets no tiers and no brief
+    plain = runner._env_for(bench.Arm("plain", "m", "static", False))
+    assert "AGENT_BRIEF" not in plain
+    assert "AGENT_MODEL_FREE" not in plain
 
 
 def _run_all():

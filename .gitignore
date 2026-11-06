@@ -1,0 +1,24 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+venv/
+build/
+dist/
+*.egg-info/
+live_check.db
+*.db
+*.db-journal
+demo/runs/
+# policy audit trails: per-action records, never committed
+policies/*.audit.jsonl
+sbom.json
+licenses.csv
+
+# local-only scratch and reference material - kept on disk, never published
+scratch.py
+todo.txt
+claude-code-system-prompts/

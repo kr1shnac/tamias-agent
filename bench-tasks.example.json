@@ -1,0 +1,17 @@
+[
+  {
+    "id": "off-by-one",
+    "prompt": "fix the off-by-one in the range of helper.range_of; run the tests to verify",
+    "check": "python -m pytest -q"
+  },
+  {
+    "id": "add-flag",
+    "prompt": "add a --dry-run flag to the runner in runner.py and run the tests",
+    "check": "python -m pytest -q"
+  },
+  {
+    "id": "lint-fix",
+    "prompt": "the linter reports an unused import in util.py; remove it and run the lint check",
+    "check": "python -m ruff check ."
+  }
+]

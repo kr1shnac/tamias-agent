@@ -1,0 +1,13 @@
+# Router Modes Diagram (Mermaid)
+
+```mermaid
+stateDiagram-v2
+    [*] --> shadow: default mode
+    shadow --> shadow: record decision, forward unchanged
+    shadow --> active: opt-in via --router-mode active
+    active --> active: rewrite to --cheap-model; fail-closed gate
+    active --> shadow: --router-mode shadow
+    off --> off: forward unchanged, record no decision
+    off --> shadow: --router-mode shadow
+```
+```

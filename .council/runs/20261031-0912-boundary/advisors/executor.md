@@ -1,0 +1,25 @@
+# Advisor: executor — Answer C
+
+## Executor verdict on the boundary review
+
+**Trust model — stated as it actually is.** The only hard boundary in this repo is the local Python process (`agent.py`) checking its own inputs; there is no kernel, container, or signed-layer enforcement anywhere [FACT: `docs/RELEASE-STATUS.md` "What is blocked" — OS sandbox not built, client-pinned manifest not built]. So: local user = root of trust (can edit `agent.py`, dropping every gate); local process = enforcement point and trusted; remote model = fully untrusted, correctly treated so; gateway = trusted, but the agent never verifies the manifest signature itself (`BOUNDED-AGENT.md` §"Managed mode"; `fetch_policy`, agent.py:2698–2723, trusts whatever JSON arrives). Confidence: High.
+
+**Enforcement per layer.** Tool allowlist, shell family rules, allow_write/deny_read globs, ask-fail-closed, realpath containment — all real and per-action, gated at the top of `dispatch_tool` (agent.py:2984–3024); deny wins; headless ask denies [FACT: code cited]. Investigation tools are correctly inside `READ_TOOLS`/`PATH_ARG` (agent.py:2477–2494) [FACT]. Confidence: High.
+
+**Bypasses I can name concretely:**
+
+1. **Composite shell commands defeat the substring allowlist.** `shell_allow` matching is `any(pattern in command)` (agent.py:2807) and the path guard only scans whitespace tokens for absolute/`..`/`~` escapes (agent.py:1172–1200). So `python3 -m pytest -q && python3 -c "print(open('company/work/todoinc/hr/salaries.csv').read())"` passes the allow family, passes the path guard (relative path inside cwd), and executes arbitrary Python under the company cwd [INFERENCE from code, unverified by running it — but the repo itself concedes this: `BOUNDED-AGENT.md` "Honest limits": "a determined prompt-injected command can still find unguarded operators"]. Arbitrary Python then reaches the network — there is **no egress layer at all** (no `[network]` handling exists in the loader, agent.py:2517–2574, versus the design's promise in `BOUNDED-AGENT.md` §3)."— wait, `[design's promise🗂 in §4 example]. Confidence: High on the gap; the exact payload is "plausible, unverified."`
+2. **Audit is appendable, not integral.** The audit file (`policies/todoinc-todo.audit.jsonl`) is not in `PROTECTED_PATHS` (only the policy file is protected at agent.py:4699), and an allowed composite command can append forged rows [INFERENCE]. Confidence: Medium.
+3. **Plan gate is file-list only for writes; shell is signature-gated but not path-scoped** — the framed-question itself states this; code confirms (`plan_write_block` agent.py:2306 only checks `WRITE_TOOLS`). Confidence: High.
+4. **`--unbounded` / running from a checkout**: enforcement is opt-in via flags and default-path deployment policy (agent.py:4710–4738) — good default, but whoever runs `--unbounded` has no fence [FACT].
+5. **`demo/check_boundary.py` wires the fences by hand rather than through `main()`** (lines 51–58) — an honest probe, but it tests the setup the demo assumes, not the production startup path [MATERIALS].
+
+**Company vs product vs task.** The fence is company+product (company/workspace + allow_write globs). It is **not task-scoped**: nothing marks "this run's task," and the plan contract is the only task scoping, and it doesn't cover shell paths. Divergence point: product scope is granted, task scope is only advisory. Confidence: High.
+
+**Test evidence.** 374 passing tests and offline probes are real [MATERIALS], but they prove the gates deny the *canonical* probes. They do not prove: composite-command safety (no such probe), network restriction (none exists), or live-model behavior (latest live run 0/2, rate-limited — `RELEASE-STATUS.md`). Demo-blocking: none — the honest posture is fine for a demo. Production-blocking: shell escape (1), egress (none), agent-signature gap / bring-your-own-gateway (option C territory).
+
+**Monday morning, one working day:** add three composite-command probes to `demo/check_boundary.py` (pytest+`python3 -c`, pytest+`&&` redirect into the audit file, `git status` + redirect) and confirm they are denied; where not, tighten `run_shell` to reject any command containing a second shell operator (`;`, `&&`, `|`, backticks, `>`) — one regex in `shell_escapes_company`, offline-testable.
+
+**Two-week sequence:** (1) day 1 probes + operator filter; (2) days 2–4: implement the `[network]` egress stub fail-closed in managed mode via gateway-side key scoping; (3) week 2: run the two-consecutive-passes live gate after the changes, and add audit-path `protect_path`. **Deliberately not yet:** OS/container isolation (option B) and the client-pinned manifest (option C) — real work, but they don't block the offline demo and would be built on an unfixed shell layer.
+
+One-line verdict: The in-process fence is real and per-action but shell composite commands and the absent egress layer let the product/company boundary be exceeded, so tighten `run_shell` first and label the rest honestly rather than claim a company guarantee today.

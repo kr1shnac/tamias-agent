@@ -1,0 +1,24 @@
+{
+  "run": "20261031-0912-boundary",
+  "question": "Review the boundary model and decide what should change before it is presented as a company guarantee.",
+  "advisor_models": {
+    "contrarian": "council-advisor-a (retried to emit full output)",
+    "first_principles": "council-advisor-b (retried to emit full output)",
+    "expansionist": "council-advisor (generic, after council-advisor-c failed with model unavailable)",
+    "outsider": "council-advisor-d (retried to emit full output)",
+    "executor": "council-advisor (generic, after council-advisor-e failed with model unavailable)"
+  },
+  "anonymous_labels": {
+    "A": "expansionist",
+    "B": "first_principles",
+    "C": "executor",
+    "D": "outsider",
+    "E": "contrarian"
+  },
+  "label_seed": "python random.SystemRandom() shuffle",
+  "run_notes": [
+    "No simulated roles; every advisor, reviewer and the chairman ran in a fresh isolated context.",
+    "Two original advisor sessions failed once with 'Model unavailable'; they were re-run through the generic council-advisor agent with the identical persona and rules.",
+    "Reviewer outputs were not in the skill's exact 'FINAL RANKING:' format; rankings were parsed by hand from the reviewer's stated order. This fallback is recorded here and in aggregate.md."
+  ]
+}

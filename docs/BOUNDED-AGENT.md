@@ -1,0 +1,241 @@
+# Bounded Agent — making tamias-agent company-safe
+
+**Research date:** 2026-10-13 · **Scope:** agent.py + its local enforcement model
+(the model runs remotely over OpenRouter; the *fence* is local, in this repo).
+
+This document answers: *how does a company deploy an agent like tamias-agent so
+it can only be used for specific use cases, against local repositories, without
+trusting the model to behave?*
+
+---
+
+## 1. The core principle (research consensus)
+
+Every 2026 enterprise survey said the same thing, so it is the anchor:
+
+> **Prompts do not bound an agent. Enforcement happens at runtime, at the tool
+> boundary**, evaluated per action — allow, deny, or escalate. See
+> *Tool-Scoped Guardrails* (source [1]), *AI Agent Policy Enforcement* (source
+> [2]), *AI Agent Sandboxing & Progressive Enforcement* (source [3]).
+
+Three consequences follow:
+
+1. **The policy file is a configuration, not a wish.** `permissions.allow /
+   deny / ask` pattern rules (Claude Code `settings.json`, [4][5]), managed
+   settings that the agent itself cannot edit ([6]), and MDM-deployed enterprise
+   policy ([7]).
+2. **Identity + least privilege.** Treat the agent as a software principal:
+   its own identity, its own token scoped to the task, and permissions limited
+   to the intersection of "what the agent may do" and "what the user may do"
+   ([8][9]).
+3. **Defence in depth.** Instruction files (`AGENTS.md`) are *read by the model,
+   not enforced* ([7]); the real layers are: tool allowlist → filesystem scope →
+   network scope → secret control → shell sandbox → audit log ([1][3][10]).
+
+---
+
+## 2. What tamias-agent already has (the foundation)
+
+Verified in `agent.py` (demoed live, test suite green):
+
+| Layer | Mechanism | Where |
+|---|---|---|
+| Workspace fence | `resolve_in_workspace()` — realpath, symlink-safe | `agent.py:703` |
+| Company fence | `resolve_in_company_workspace()` — `company/work/<id>/` | `agent.py:721` |
+| Use-case gate | `--company-id <id>` activates the active fence | `bridge.py:108`, `agent.py:1677` |
+| Secret control | `refuse_secret()` / `is_sensitive_path()` | `agent.py:400` |
+| Shell hardening | cwd = company box, escape guard, scrubbed env, `TAMIAS_ALLOW_SHELL=0` | `agent.py:447-499` |
+| Assignment | `--task-id` / `--assignee` recorded into the prompt and the task board | `build_system_prompt`, `run_tui` |
+| Visibility | blocked calls surface (boundary state / violation) | UI |
+
+So the *spatial* boundary (what directories an agent may touch) is done and
+tested. What companies also need is the *capability* boundary: **which tools,
+which command families, which network hosts, which files**, per agreed use case
+— plus an audit trail and a policy file the agent cannot rewrite.
+
+---
+
+## 3. The gap & the target model
+
+| Capability | Industry pattern | tamias-agent today |
+|---|---|---|
+| Per-use-case tool allowlist | `allow/deny/ask` tool patterns ([4][5][10]) | ✗ all 8 tools always on |
+| Command/arg pattern rules | `Bash(git status)` style ([4][10]) | ~ best-effort path guard only |
+| Filesystem scope per use case | write only to task dirs ([10]) | only path containment |
+| Network host allowlist | permitted hosts/ports ([10]) | ✗ none |
+| Read-only mode | plan/review mode ([4][11]) | ✗ none |
+| Ask/escalation | human approval for risky calls ([2][10]) | ✗ none |
+| Audit log (per action) | agent identity → session → action ([9][12]) | events exist, no policy log |
+| Admin-locked policy | policy file the agent can't edit ([6][7]) | ✗ policy would be a plain file |
+
+---
+
+## 4. The proposed design — a per-company policy profile
+
+A single TOML policy file, loaded once at startup, that a company admin stores
+(outside the agent's fence, e.g. `~/.config/tamias/policies/<company>.toml`),
+and that the agent reads but never writes:
+
+```toml
+# ~/.config/tamias/policies/acme.toml  — owned by the company admin (chmod 600)
+version = "1"
+
+[use_case]
+name        = "code-fix-bot"          # "this agent is only for these cases"
+root        = "company/work/acme/bots/codefix"
+read_only   = false                   # true → plan/review agent
+models      = ["nvidia/nemotron-3.5-lightning:free"]
+
+[tools]                                # allowlist: absent = tool disabled
+allow = ["read_file", "search_in_files", "edit_file", "write_file", "run_shell", "update_plan"]
+deny  = ["run_shell"]                  # policy wins over allow (hard deny)
+ask   = ["write_file"]                 # needs a human yes/no (headless = no)
+
+[run_shell]                            # command-family scope (pattern rules)
+allow = ["git status", "git diff", "git add", "python3 -m pytest", "grep "]
+deny  = ["rm ", "curl ", "wget ", "git push ", "chmod "]
+timeout = 30
+
+[network]                              # egress allowlist (exfiltration path)
+allow_hosts = ["pypi.org", "files.pythonhosted.org"]
+block_egress = true
+
+[paths]                                # finer filesystem scope on top of the fence
+allow_write = ["company/work/acme/bots/codefix/**"]
+deny_read   = ["company/work/acme/hr/**", "**/*.pem"]
+```
+
+### Using it
+
+```bash
+# company admin keeps the policy outside the fence, agent reads it at startup
+.venv/bin/python agent.py \
+  --company-id acme \
+  --policy ~/.config/tamias/policies/acme.toml \
+  --task "fix the failing test in codefix"
+```
+
+`TAMIAS_POLICY` env var works too. A missing or malformed policy **refuses to
+start** (exit 1) rather than silently running unbounded. Every gate decision is
+in `agent.POLICY_AUDIT` and, when `[audit] path` is set, appended as JSONL.
+
+### Managed mode — the policy the employee cannot edit
+
+A local policy file is only as trustworthy as the file. In a company deployment
+the employee holds a **gateway token** (`vk-…`) and never the provider key, so a
+run cannot reach a model except through the Tamias gateway. Managed mode makes
+that explicit and fail-closed:
+
+```bash
+TAMIAS_BASE_URL=http://gateway.internal:8000/v1 \
+TAMIAS_API_KEY=vk-… \
+.venv/bin/python agent.py --require-proxy --company-id acme --task "…"
+```
+
+The agent then fetches its policy from the gateway (`GET /policy`) instead of
+reading a local file. It **refuses to start** unless all of these hold, so a
+managed run can never silently degrade to an unmanaged one:
+
+- a gateway token is present (`vk-…`; a provider key is refused);
+- `TAMIAS_BASE_URL` is an explicit gateway, not the direct provider default;
+- the gateway serves a policy, and it parses.
+
+`--require-proxy` and `--policy` together are refused: the served policy must be
+the only one. `TAMIAS_REQUIRE_PROXY=1` is the env-var form.
+
+The gateway verifies the manifest's Ed25519 signature before serving it
+(`tamias admin manifest`, [`docs/MANIFEST.md`](../../tamias/docs/MANIFEST.md));
+the agent trusts the authenticated gateway response over its (loopback or TLS)
+hop. The agent does not itself check the signature — that is the gateway's job.
+
+### How the agent enforces it (each maps to code)
+
+Implemented in `agent.py` (2026-10-13, committed):
+
+1. ✅ **Tool dispatch gate** — lives at the top of `dispatch_tool`, so every
+   tool call from the model passes it before anything runs. `hard deny`
+   (tool-level) → `Error: policy deny …` and never runs; deny wins over allow.
+2. ✅ **`run_shell` pattern allow/deny** — a second pass over `allow`/`deny`
+   command substrings, after `shell_escapes_company`; deny wins.
+3. ✅ **Filesystem scope** — `resolve_*` returns the fence; the policy
+   `allow_write`/`deny_read` glob set is checked in the same gate, next to
+   `refuse_secret`.
+4. ✅ **Read-only mode** — when `read_only = true`, every write/edit/create and
+   the shell return the policy error. One flag, high value (plan-agent).
+5. ✅ **Escalation (ask)** — a policy `[tools] ask = [...]` list names calls that
+   need a human yes/no rather than a blanket allow or deny. Deny still wins: an
+   ask-listed call that is also denied stays denied. When a call asks, the
+   dispatcher emits a `ToolAsk` event; the interactive TUI shows a confirm
+   (`tui.bridge.AskGate` blocks the worker until the human answers), and a
+   **headless run denies** — with no one to ask, the answer is no (`ASK_HANDLER`
+   unset → fail closed). Every outcome is audited as `ask-allowed` /
+   `ask-denied`.
+6. ✅ **Audit trail** — every gate decision (allowed / denied) appended to
+   `POLICY_AUDIT`; a `[audit] path =` JSONL writer is wired in `policy_audit`.
+   Each row: `ts, use_case, tool, decision, reason, args` — the SIEM-ready
+   record companies ask for ([9][12]).
+7. ✅ **Policy can't be edited by the agent** — a policy path is added to a
+   process-wide denylist (`protect_path` → `PROTECTED_PATHS`) that
+   `is_sensitive_path` consults, so the same rules that protect `.env` also
+   protect the policy file that bounds the run. Pinned by a test.
+8. ✅ **Managed mode** (`--require-proxy`) — the policy is fetched from the
+   gateway (`GET /policy`) and a run refuses to start without one (see above).
+9. ✅ **Model allowlist** — a policy `models = [...]` list (or `[models] allow`)
+   narrows the TUI model picker and `/model` to exactly those ids, so routing is
+   fenced the way tools are. An absent list means any model. The gateway still
+   enforces its own per-key allowlist; this stops the agent from offering a
+   choice the company would refuse, and the picker now marks each entry
+   `free`/`paid` so the choice is never a blind one.
+
+### Honest limits
+
+- `run_shell` is the sharp edge: without an OS sandbox (microVM/gVisor, [13])
+  a determined prompt-injected command can still find unguarded operators. For a
+  local TUI demo, the *policy allowlist + disabled-shell option* is the
+  honest posture; OS-level sandboxes are the follow-on, not a claim we make.
+- Free-tier models being 429 is orthogonal to bounding — bounding is fully local
+  and testable offline.
+
+---
+
+## 5. Suggested build order (all offline-testable)
+
+Status as of 2026-10-15: steps 1–8 are **done and committed**. The
+`--policy FILE` flag (and `TAMIAS_POLICY`) loads a profile in `main()`; the gate
+runs inside `dispatch_tool`, so every path into every tool passes it. Step 5's
+`ask` escalation (below) closed the last open item.
+
+1. ✅ `PolicyProfile` dataclass + TOML loader (`tui`-free, pure `agent.py`).
+2. ✅ Dispatch gate: tool allow / hard deny + `read_only` flag (first tests).
+3. ✅ `run_shell` command-family allow/deny patterns.
+4. ✅ Filesystem glob scope (`allow_write` / `deny_read`) beside `refuse_secret`.
+5. ✅ `ask` escalation + JSONL audit trail — the *in-memory* gate audit
+   (`POLICY_AUDIT`) and the `[audit] path =` JSONL writer are done, and the
+   `[tools] ask` list now escalates a call to the interactive confirm (headless
+   denies, fail-closed).
+6. ✅ Policy-file self-protection test (agent cannot read/edit its own policy).
+7. Demo: `--company-id acme` + a policy whose `deny` blocks `rm`/`curl` — show a
+   command getting refused *and* the audit row being written.
+8. ✅ Managed mode (`--require-proxy`): fetch the signed policy from the gateway
+   (`GET /policy`) and refuse to start without one.
+
+Everything is testable with no network and no API key, so a company can evaluate
+"our agent only for *our* use case" before any live run.
+
+---
+
+## Sources
+
+[1] Tool-Scoped Guardrails — Agent safety must live next to the action (2026)
+[2] AI Agent Policy Enforcement: A Complete 2026 Guide, Sweet Security
+[3] AI Agent Sandboxing & Progressive Enforcement — ARMO (Mar 2026)
+[4] Claude Code permissions: settings.json allow/deny/ask — Developers Digest
+[5] Managed Settings for Claude & Codex — PromptArmor
+[6] Claude Code: permission precedence & admin-protected settings — petefreitag.com
+[7] Coding agent security guides — Arcjet (hooks + AGENTS.md not being enforced)
+[8] WorkOS: the AI agent permissions checklist for SaaS apps (2026)
+[9] Orchid: AI agent security best practices (service identity + scoped tokens)
+[10] ayautomate: 8 controls for production AI agents (filesystem/network scope)
+[11] hidekazu-konishi: Claude Code defaultMode (plan / acceptEdits / bypass)
+[12] Northflank: enterprise AI coding agent deployment (audit, PR gates, sandbox)
+[13] Modal: best code-execution sandboxes for AI agents 2026 (microVM/gVisor)

