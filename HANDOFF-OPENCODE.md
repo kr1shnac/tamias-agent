@@ -233,8 +233,9 @@ consecutive passes before any live claim changes.
 
 - Run the commands in §8.
 - Read the council verification.
-- Create `demo/attack_boundary.py` and publish literal failures.
-- Update `docs/RELEASE-STATUS.md` with the failures, not with reassurance.
+- `demo/attack_boundary.py` already exists; run it and publish any new literal
+  failures in `docs/RELEASE-STATUS.md`.
+- Do not remove known failure rows to make the report look cleaner.
 
 ### Day 2
 
@@ -260,3 +261,32 @@ The current branch is `feature/liquid-glass-tui`. This file is intended to be
 committed with the council artifacts, the boundary status update, and the other
 currently uncommitted project work. Push only when the owner has explicitly
 requested it. Do not rewrite history or force-push.
+
+## 12. Finalization state
+
+Verified local state at finalization:
+
+- Full suite: **381 passed**
+- Offline gate: **13 passed · 0 failed · 1 skipped**
+- `demo/attack_boundary.py`: **6 PASS · 4 GAP · 2 NOTE**, exit `3`
+- Boundary probes: `check_boundary` 17/17, `showcase` 18/18
+- No live run claimed
+
+Known-unfinished security work that must **not** be marked complete from this
+file alone:
+
+- Shell product-scope and capability reduction
+- No-policy fail-closed behavior
+- Company-held audit anchor
+- Managed-policy signature/pinned manifest
+- OS sandbox and egress control
+
+The branch is ready for handoff, but not ready for public security guarantees.
+
+Because `opencode.json` denies `git push`, the owner must run:
+
+```bash
+git push -u github-https feature/liquid-glass-tui
+```
+
+After push, the incoming maintainer should start with `OPENCODE-AGENT-BRIEF.md`.
