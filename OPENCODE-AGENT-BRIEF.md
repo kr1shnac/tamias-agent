@@ -1,272 +1,730 @@
-# OPENCODE-AGENT-BRIEF.md — project status for OpenCode
+# OPENCODE-AGENT-BRIEF.md — complete project status
 
 Date: **2026-11-06**
 Branch: **`feature/liquid-glass-tui`**
 Version: **`0.1.0a7`**
-Purpose: this file is the fast, self-contained status and task brief for an
-OpenCode agent. It says what is completed, what is broken or missing, what is
-planned, and what must happen next. For the long-form handoff, read
-`HANDOFF-OPENCODE.md`.
+Repo: `/home/krish/Desktop/tamias-agent`
 
-If you are prompting OpenCode, use this:
+This is the complete short-form project brief for an OpenCode agent. It includes
+what is done, what is verified, what is broken or missing, what is planned, what
+is pending, how to run the project, and what the next task is.
+
+For a prompt, use exactly this:
 
 ```text
-Read OPENCODE-AGENT-BRIEF.md and follow only its "Next task" section. Do not
-start OS sandbox, MCP, release, or publish work. Do not claim a company
-boundary guarantee. Preserve offline evidence for every claim.
+Read OPENCODE-AGENT-BRIEF.md first. Follow only its "Next task" section. Do not
+start OS sandbox, MCP, packaging, publish, or long-term product work. Preserve
+offline evidence for every claim. Do not claim a company boundary guarantee.
 ```
 
 ---
 
-## 1. The one-paragraph status
+## 1. One-line status
 
-The demo/agent slice is built and offline-verified: **381 tests pass**, and the
-offline gate is **13 passed, 0 failed, 1 skipped**. The boundary is a real,
-per-action policy fence for canonical inputs, but it is **not** an unbypassable
-company guarantee. Directory-walker `deny_read` was hardened on 2026-11-06. The
-remaining hard gaps are shell capability, no-policy fail-closed behavior,
-company-held audit, managed-policy trust, OS sandbox, and egress control.
+The demo/agent slice is built and offline-verified; the boundary is a real
+policy fence for canonical inputs, but it is **not** an unbypassable company
+guarantee yet.
+
+## 2. Complete current verdict
+
+- Full offline suite: **381 passed**
+- Offline gate: **13 passed · 0 failed · 1 skipped**
+- Boundary probes: **17/17** and **18/18**
+- Mock model: correct ask-gating and refusals
+- Adversarial harness: **6 PASS · 4 GAP · 2 NOTE**, exit code `3`
+- Live model path: **not re-verified after latest prompt/boundary changes**
+- Live claim: **not made**
+- PyPI package: **not published**
+- OS sandbox: **not built**
+- Network egress control: **not built**
+- Client-pinned manifest: **not built**
+
+Do not write “unbypassable”, “company guarantee”, “network is controlled”, or
+“live verified today” until the P0 work is closed and two live passes succeed.
 
 ---
 
-## 2. Verified completed state
+## 3. How to use this repo
 
-Run from repo root:
+Run every command from the repo root.
 
 ```bash
 cd /home/krish/Desktop/tamias-agent
+```
+
+Primary verification commands:
+
+```bash
 .venv/bin/python -m pytest -q
 ./demo/check_all.sh
+.venv/bin/python demo/check_boundary.py
+.venv/bin/python demo/showcase.py
 .venv/bin/python demo/attack_boundary.py
 ```
 
-Verified 2026-11-06:
+Live commands require explicit owner approval and two consecutive passes:
 
-| Item | Result |
+```bash
+./demo/check_all.sh --live
+./demo/live_show.sh
+```
+
+Direct agent run:
+
+```bash
+.venv/bin/python agent.py \
+  --company-id todoinc \
+  --policy policies/todoinc-todo.toml \
+  --task "build a todo app with add() and complete()"
+```
+
+Demo instructions are in `demo/PRESENT.md`.
+
+---
+
+## 4. Repository map
+
+| Path | Role |
 |---|---|
-| Full offline suite | **381 passed** |
-| Offline gate | **13 passed · 0 failed · 1 skipped** |
-| Live rehearsal | **skipped** |
-| Boundary probes | `check_boundary` 17/17, `showcase` 18/18 |
-| Mock model | in-scope write ask-gated, out-of-scope refused |
-| Adversarial harness | **6 PASS · 4 GAP · 2 NOTE**, exit code `3` |
-| PyPI publish | **not published** |
-
-Completed functionality:
-
-- Agent core: tool dispatch, scope gate, path fence, deny-read guard, secret
-  path protection, plan gate, dossier gate, ask/fail-closed behavior.
-- TUI: boundary card/modals, receipt, decision card, plan modal, checkpoint
-  preview/restore, frozen diff review, model picker and credits.
-- Offline demos and mock provider.
-- Time Travel v1, checkpoint/diff lifecycle.
-- Benchmark harness, brief compiler, context index.
-- Documentation and code-truth ledger.
-- Boundary council review with verification and corrections.
-
-Boundary work completed on 2026-11-06:
-
-- `deny_read`/secret checks now apply to every path returned by
-  `list_directory`, `search_in_files`, `analyze_structure`, and
-  `investigate_target`.
-- `test_boundary_walkers.py` covers parent-directory denial plus legitimate
-  in-product control hits.
-- `demo/attack_boundary.py` records the remaining failures honestly.
-- `demo/check_all.sh` now runs the full offline suite.
+| `agent.py` | Agent core: tool dispatch, scope/policy gate, shell guard, plan/dossier gates, managed mode, audit |
+| `checkpoints.py` | Time Travel v1: pre-write snapshots and frozen diffs |
+| `bench.py` | Cost-per-success benchmark harness |
+| `brief.py` | Offline brief compiler |
+| `context_index.py` | Offline symbol/name/content index |
+| `model_catalog.py`, `providers.py` | Model roster and provider/rate reporting |
+| `policies/` | Company/use-case boundary TOML files |
+| `tui/` | Textual TUI: boundary card, modals, receipt, plan, checkpoint, diff, credits |
+| `demo/` | Offline demos, boundary probes, mock provider, live gate, present script |
+| `tests/`, `test_*.py` | Offline tests and doc/model-catalog integrity tests |
+| `docs/` | Release status, routes, pricing, frontend reference, audit evidence, research |
+| `.council/` | Five-advisor boundary council and verification |
+| `README.md` | User-facing overview and handoff pointers |
+| `AGENTS.md` | Repo rules |
+| `AGENTIC-PART.md` | Declared single source of truth |
+| `HANDOFF-OPENCODE.md` | Long-form maintainer handoff |
+| `OPENCODE-AGENT-BRIEF.md` | This file |
+| `opencode.json` | OpenCode permission contract |
 
 ---
 
-## 3. Known issues and open boundary gaps
+## 5. Completed work
 
-| ID | Severity | Issue | Current status | Required outcome |
+### 5.1 Agent core and boundary engine
+
+- Tool dispatch through a per-action policy gate.
+- Directory tool path fences:
+  - `list_directory`
+  - `search_in_files`
+  - `analyze_structure`
+  - `investigate_target`
+  - `trace_feature` already checked followed files
+- Company fence for `company/work/<company_id>/`.
+- Product write scope for `company/work/todoinc/apps/todo/**`.
+- Read denylist for denied projects and HR.
+- Secret/password/key file guard.
+- Policy-file protection.
+- Shell guard:
+  - cwd inside company work area
+  - token scan for `~`, `..`, and absolute escapes
+  - allowed/denied shell command families
+  - timeout
+  - environment scrubbing
+- Ask-gated writes:
+  - `write_file`
+  - `edit_file`
+  - `create_directory`
+- Headless ask fails closed.
+- Domain gate before model spend.
+- Plan contract:
+  - signed plan required before writes
+  - writes outside declared file list are refused
+- Dossier gate:
+  - first mutating call needs investigation evidence
+- Managed mode:
+  - requires gateway token
+  - refuses direct provider URL
+  - fetches policy from gateway
+- Audit rows for gate decisions.
+
+### 5.2 Completed boundary hardening on 2026-11-06
+
+- Added `read_path_refusal()` in `agent.py`.
+- Applied it to every path returned by directory walkers:
+  - `list_directory`
+  - `search_in_files`
+  - `analyze_structure`
+  - `investigate_target`
+- Added `test_boundary_walkers.py`:
+  - 7 composition tests
+  - denied nested paths skipped
+  - legitimate in-product paths still visible
+- Added `demo/attack_boundary.py`:
+  - offline report-only composition probes
+  - no shell execution
+  - publishes known failures instead of hiding them
+- Changed `demo/check_all.sh` to run the full offline suite.
+
+### 5.3 TUI and frontend
+
+- Boundary card and boundary modal.
+- Receipt card and copy/export behavior.
+- Decision cards.
+- Plan contract modal and plan status line.
+- Investigation dossier gate.
+- Checkpoint preview/restore.
+- Frozen diff review with `V` and `/diff`.
+- Model picker and credits dashboard.
+- Task board and assignment display.
+
+### 5.4 Documentation and evidence
+
+- `docs/RELEASE-STATUS.md`
+- `docs/FRONTEND_REFERENCE.md`
+- `docs/audit/claims.md`
+- `docs/audit/2026-11-06-boundary-hardening.md`
+- `.council/runs/20261031-0912-boundary/` council artifacts
+- `demo/PRESENT.md` runbook
+- `HANDOFF-OPENCODE.md`
+- `OPENCODE-AGENT-BRIEF.md`
+
+---
+
+## 6. Verified test breakdown
+
+Verified on 2026-11-06.
+
+| Suite | Count | Status |
+|---|---:|---|
+| `test_agent.py` | 246 | passed |
+| `test_tui_features.py` | 50 | passed |
+| `test_premium_features.py` | 40 | passed |
+| `test_boundary_walkers.py` | 7 | passed |
+| `tests/` docs + catalog | 34 | passed |
+| Workspace demo tests | 4 | passed |
+| **Full suite** | **381** | **passed** |
+
+Offline gate details:
+
+| Check | Result |
+|---|---|
+| Dependencies import | pass |
+| TUI modules import | pass |
+| Static tool registry / prompt budget | pass |
+| Full offline pytest suite | pass |
+| `check_boundary` | pass |
+| `showcase` boundary table | pass |
+| `todo_show` scope gate | pass |
+| `show` full act | pass |
+| REA lifecycle | pass |
+| Final behavioral showcase | pass |
+| Mock out-of-scope write | pass |
+| Mock in-scope write | pass |
+| Live rehearsal | skipped |
+
+---
+
+## 7. Architecture and trust model
+
+The current design treats:
+
+- Remote model: **untrusted**
+  - every tool call goes through the local gate before execution
+- Local Python process: **enforcement point and trusted**
+- Local user/operator: **trusted today**
+  - can edit `agent.py`, policy, or environment
+- Gateway: **trusted in managed mode**
+  - the agent currently does not verify the manifest signature
+- OS/kernel: **not a containment layer yet**
+  - no OS sandbox or network egress control exists
+
+Dispatch order for a tool call:
+
+1. Plan gate
+2. Dossier gate
+3. Policy gate: allow/deny, read-only, shell families, path globs
+4. Ask gate: fail closed with no handler
+5. Checkpoint capture
+6. Execute tool
+
+Important consequence: the local process is defending against a bad model, not
+against a determined local operator. Saying “people cannot bypass” is only true
+if the boundary is enforced below the process, which is not built yet.
+
+---
+
+## 8. Boundary contract currently implemented
+
+Policy file: `policies/todoinc-todo.toml`
+
+### Active product
+
+- Company: `todoinc`
+- Company work area: `company/work/todoinc/`
+- Product root: `company/work/todoinc/apps/todo`
+- Write scope: `company/work/todoinc/apps/todo/**`
+
+### Topic/use-case gate
+
+Allowed examples:
+
+- `build a todo app with add() and complete()`
+- `sort tasks by due date`
+- `refactor the task list`
+
+Refused examples:
+
+- `build a chatbot`
+- `crypto`
+- `trading bot`
+- `clone linkedin`
+- `weather`
+- `hi`
+
+The domain gate is lexical. It is a scope guard for spend and UX, not a security
+boundary.
+
+### Path denial
+
+Denied or protected:
+
+- `company/work/todoinc/hr/`
+- `company/work/todoinc/apps/chatbot/`
+- `**/*.pem`
+- `.env`
+- policy file
+- repository root as a project path
+- paths outside the company work area
+
+### Tools
+
+Write tools:
+
+- `write_file`
+- `edit_file`
+- `create_directory`
+
+Ask-gated in policy:
+
+- `write_file`
+- `edit_file`
+- `create_directory`
+
+Read tools:
+
+- `read_file`
+- `search_in_files`
+- `list_directory`
+- `investigate_target`
+- `trace_feature`
+- `analyze_structure`
+- `build_similar`
+
+### Shell policy
+
+Current allowed families:
+
+- `python3 -m pytest`
+- `git status`
+- `git diff`
+- `git log`
+
+Current denied families:
+
+- `rm `
+- `mv `
+- `curl `
+- `wget `
+- `git push`
+- `chmod `
+- `cat `
+- `ssh `
+
+This is a substring gate and is **not sufficient**.
+
+### Boundary query set the team focused on
+
+1. In-scope todo/task work must run.
+2. Off-topic/personal requests must be refused before model spend.
+3. Out-of-product paths must be denied.
+4. In-product writes must be allowed but ask-gated.
+5. Headless in-product writes must fail closed.
+6. Invalid company IDs must be refused.
+7. `.env`, keys, and policy files must be protected.
+8. Shell path escapes must be refused.
+9. Plan/dossier gates must gate mutations.
+10. Managed mode must refuse direct provider URLs.
+11. Audit must record gate decisions.
+12. `.` must not silently bypass the product fence.
+
+---
+
+## 9. Known issues
+
+| ID | Severity | Issue | Evidence/Status | Required fix |
 |---|---|---|---|---|
-| BND-02 | Critical | Shell uses `shell=True`, substring allowlist, and `run_shell` is not ask-gated | Open | Product-root shell enforcement and capability reduction; composite commands denied/ask-denied |
-| BND-03 | High | Shell can resolve a relative path outside the product root | Open | No shell command may act outside the assigned product root |
-| BND-04 | High | No active policy can silently remove the gate | Open | Fail closed or emit unmistakable fence-off audit |
-| BND-05 | High | Audit is local and not company-held | Open | Always-on rows with resolved path, cwd, policy hash, and off-host anchor |
-| BND-06 | High | `fetch_policy` trusts gateway JSON without agent-side signature verification | Open | Pin and verify signed manifest, or state that the gateway is the trust root |
-| BND-07 | Medium | Domain gate is lexical and can under-block or over-block | Open | Add proportionality/false-positive probes; keep security claims separate |
-| BND-08 | Medium | Plan contract is local approval, not cryptographic signing | Documented | Do not describe it as externally signed |
-| BND-09 | Medium | `fetch_url` demo probe proves unknown tools are rejected, not egress control | Documented | Fix demo wording if reused |
-| BND-01 | High | OS sandbox and network egress are not built | Open | Container/egress control generated from policy |
+| BND-02 | Critical | Shell `shell=True` with substring allowlist | `demo/attack_boundary.py` GAP: composite shell gate | Product-root shell enforcement, capability reduction, or ask-gate |
+| BND-03 | High | Cross-project shell path passes gate | `demo/attack_boundary.py` GAP: cross-project shell path | Shell command paths must be bound to product root |
+| BND-04 | High | No active policy can leave gate off | `policy_check` returns `None`; `demo/attack_boundary.py` GAP | Fail closed or emit undeniable fence-off audit |
+| BND-05 | High | Audit is local and not company-held | Audit rows lack resolved path, cwd, policy hash; disappear with no policy | Always-on anchored audit or gateway sink |
+| BND-06 | High | Managed policy trust is asserted, not verified | `fetch_policy` parses gateway JSON; no agent-side signature | Client-pinned signed manifest or explicit gateway trust statement |
+| BND-07 | Medium | Domain gate is lexical and can under-block/over-block | `domain_check` self-describes as “scope guard, not security boundary” | Add proportionality probes and separate scope from security |
+| BND-08 | Medium | Plan contract is local approval, not cryptographic signing | `contract_line = "signed by user"` | Stop calling it signed without key material, or add signing |
+| BND-09 | Medium | `fetch_url` probe proves unknown tools rejected, not egress control | `demo/showcase.py` probe | Fix demo wording and separate unknown tools from egress |
+| BND-01 | High | OS sandbox and egress not built | `docs/RELEASE-STATUS.md` blocked row | Container/egress control generated from policy |
+| OPS-01 | Medium | Free-tier live quota can 429 | Latest live retry 0/2 rate-limited | Only claim live after two consecutive passes |
+| OPS-02 | Medium | PyPI package not published | `pip install tamias` 404s | Keep checkout install or publish deliberately |
 
-Current `demo/attack_boundary.py` GAP rows:
+### Attack harness current rows
 
-1. `composite shell gate`
-2. `cross-project shell path`
-3. `no-policy run gate`
-4. `no-policy audit row`
+| Row | Status |
+|---|---|
+| Search from company root | PASS |
+| Analyze from company root | PASS |
+| Investigate from company root | PASS |
+| List apps tree | PASS |
+| Direct read of denied app | PASS |
+| Direct search of denied app | PASS |
+| Composite shell gate | GAP |
+| Cross-project shell path | GAP |
+| No-policy run gate | GAP |
+| No-policy audit row | GAP |
+| Managed policy signature | NOTE |
+| OS sandbox and egress | NOTE |
 
-Do not delete these rows to make the demo look clean.
-
----
-
-## 4. Missing / not built
-
-- OS/container sandbox.
-- Network egress allowlist.
-- MCP boundary server.
-- Client-pinned manifest verification.
-- Admin-owned policy file outside the repo.
-- Company-held audit sink.
-- Session store + resume.
-- Durable Time Travel / Flight Recorder export.
-- Streaming/cancel.
-- Live benchmark results.
-- PyPI publish/packaging decision.
-
-Not verified:
-
-- Live model behavior after the latest prompt and boundary changes.
-- Cost savings. All dollar figures are hypothetical.
-- OS-level containment. It does not exist yet.
+`demo/attack_boundary.py` correctly exits `3` while gaps remain.
 
 ---
 
-## 5. Plan and priorities
+## 10. Missing / not built
 
-### Phase 1 — finish boundary hardening: P0
+- OS/container sandbox
+- Network egress allowlist
+- MCP boundary server
+- Client-pinned manifest verification
+- Admin-owned policy file outside repo
+- Company-held audit anchor
+- Session store + resume
+- Durable Time Travel
+- Flight Recorder / audit export
+- Streaming/cancel
+- Live benchmark
+- PyPI publication
+- Multi-agent concurrency story
+- Offline time-machine session resume
 
-1. **Shell capability reduction**
-   - Enforce the policy root for shell cwd and relative paths.
-   - Ask-gate `run_shell`, or remove broad interpreter execution from the shell
-     allowlist.
-   - Add legitimate-flight tests, not only hostile tests.
-   - Do not rely on a lexical denylist for `;`, `&&`, `|`, `>`, backticks.
+---
 
-2. **Policy omission must be visible or impossible**
-   - Either fail closed when no policy is active, or emit an obvious
-     “fence off” audit row with resolved policy/company state.
+## 11. Plan
 
-3. **Audit must be checkable by the company**
-   - Always-on audit rows, resolved path, cwd, policy hash, plan/session binding.
-   - Add an off-host or gateway anchor. Local hash chains alone are insufficient.
+### Phase 1 — finish P0 boundary hardening
 
-4. **Managed policy trust**
-   - Verify a client-pinned signed manifest, or state plainly that the gateway is
-     the trust root.
+1. Shell capability reduction
+2. Policy omission fail-closed / fence-off audit
+3. Company-held audit
+4. Managed policy verification
 
-### Phase 2 — production hardening: P1
+### Phase 2 — production hardening
 
-5. OS/container sandbox plus egress allowlist.
-6. MCP boundary server.
-7. Admin-owned, shell-protected policy/audit paths.
-8. Proportionality/false-positive probes.
+5. OS/container sandbox and egress allowlist
+6. MCP boundary server
+7. Admin-owned, shell-protected policy/audit paths
+8. Proportionality/false-positive probes
 
-### Phase 3 — product depth: P2
+### Phase 3 — product depth
 
-9. Session store + resume.
-10. Durable Time Travel and Flight Recorder export.
-11. Streaming/cancel and live benchmark.
+9. Session store + resume
+10. Durable Time Travel
+11. Flight Recorder export
+12. Streaming/cancel
+13. Live benchmark with two passes
 
 ### Phase 4 — release
 
-12. Decide and document PyPI publish vs checkout-only.
-
-### Product/design questions to settle
-
-- Is the fence against the remote model, or also against the local operator?
-- Governed local agent or trusted-proxy companion?
-- Container-first or native sandbox?
-- What is the smallest credible alpha claim?
-- Does the plan contract need real cryptographic signing?
+14. Decide PyPI publish vs checkout-only
+15. Reconcile README/packaging claims
 
 ---
 
-## 6. Next task for the next OpenCode agent
+## 12. Pending task list
 
-Start here. Do not skip ahead.
+### Done on 2026-11-06
 
-**Task: implement P0 #3, shell product scope and capability reduction.**
+- `deny_read` on returned walker paths
+- `test_boundary_walkers.py`
+- `demo/attack_boundary.py`
+- Full offline suite in `demo/check_all.sh`
+- Council verification follow-up
+- Documentation/status update
 
-Scope:
+### Open P0
 
-- Keep read/search/list behavior intact.
-- Make shell commands unable to reach outside the assigned product root.
-- Prefer capability reduction over another lexical denylist.
-- Ask-gate `run_shell` if it can mutate the product or read outside it.
-- Add tests for both hostile and legitimate commands.
-- Run:
-  ```bash
-  .venv/bin/python -m pytest -q
-  ./demo/check_all.sh
-  .venv/bin/python demo/attack_boundary.py
-  ```
-- Update `HANDOFF-OPENCODE.md`, `docs/RELEASE-STATUS.md`, and add an evidence
-  file under `docs/audit/`.
-- Done when:
-  - composite and cross-project shell GAP rows become PASS,
-  - legitimate product test commands still work,
-  - the full suite has no weakened tests,
-  - no text claims “unbypassable” or “company guarantee”.
+| Task | Done when |
+|---|---|
+| Shell product scope and capability reduction | Composite and cross-project shell GAP rows become PASS; legitimate product pytest still works |
+| Policy omission fail-closed or audited | No run can silently lose the gate |
+| Company-held audit | Rows contain resolved path, cwd, policy hash, and are received off-device |
+| Managed policy verification | Downgraded/BYO gateway policy cannot start a bounded run |
 
-Do not start OS sandbox, MCP, publishing, session resume, or P2 product depth
-until this task is committed and evidence is written.
+### Open P1
 
----
+| Task | Done when |
+|---|---|
+| OS/container sandbox | In-container attack harness cannot escape policy |
+| Egress allowlist | Allowed commands cannot make arbitrary network calls |
+| MCP boundary server | Remote MCP client cannot exceed local boundary |
+| Admin-owned policy/audit outside agent reach | Agent cannot rewrite its own boundary/trail |
+| False-positive probes | `pytest -k "confirm parser"` is not refused because it contains `rm ` |
 
-## 7. OpenCode-specific rules for this workspace
+### Open P2
 
-The repo has an `opencode.json` permission contract. Obey it; do not try to
-bypass it.
-
-Important effects:
-
-- `.env`, `.env.*`, `.pypirc`, and `.ssh/**` are denied for reading and editing.
-- `sudo`, destructive `rm -rf`, npm, pip installs, curl, wget, `env`, and
-  `printenv` are denied.
-- `git push`, `git remote`, `git reset`, `git clean`, `git tag`, `git switch`,
-  `git checkout`, `git merge`, `git rebase`, `git stash`, `git branch`, and
-  `git worktree` are denied.
-- `git add -A`, `git add --all`, and `git add .` are denied.
-- External directory writes are denied except `/tmp/**`.
-
-Therefore:
-
-- When you need to stage files, stage explicit paths only:
-  ```bash
-  git add path/to/file path/to/other/file
-  ```
-- Do not ask the user for permission if a tool call is denied; stop, report the
-  denied command, and propose the user-run command.
-- If a push is needed, report this command and let the user run it:
-  ```bash
-  git push -u github-https feature/liquid-glass-tui
-  ```
-- Skills and tool names change across OpenCode versions. Do not assume a
-  historical skill ID still exists; list or query available skills first.
+| Task | Done when |
+|---|---|
+| Session store + resume | Assignment and evidence survive restart |
+| Durable Time Travel | Checkpoints persist across sessions |
+| Flight Recorder export | Company receives verifiable evidence |
+| Streaming/cancel | Turn can stop safely without losing evidence |
+| Live benchmark | Two consecutive live passes recorded |
+| PyPI decision | README matches reality |
 
 ---
 
-## 8. Hard rules from the repo
+## 13. Next task
 
-- Use the project venv: `.venv/bin/python`.
-- Never print, read, commit, or log `.env`.
-- Never weaken tests to force a boundary pass.
+**Task: implement P0 shell product scope and capability reduction.**
+
+Requirements:
+
+1. Keep legitimate in-product commands working.
+2. Prevent any shell command from reading or mutating outside
+   `company/work/todoinc/apps/todo` unless the policy explicitly allows it.
+3. Do not rely only on rejecting `;`, `&&`, `|`, backticks, or `>`; those are
+   lexical guards and already demonstrably insufficient.
+4. Prefer:
+   - narrower shell command prefixes,
+   - ask-gating `run_shell` when it can mutate,
+   - executing only inside the product cwd,
+   - resolving shell paths against the product root,
+   - blocking interpreter families that can execute arbitrary code.
+5. Add tests for both hostile and legitimate command forms.
+6. Rerun:
+   ```bash
+   .venv/bin/python -m pytest -q
+   ./demo/check_all.sh
+   .venv/bin/python demo/attack_boundary.py
+   ```
+7. Update:
+   - `HANDOFF-OPENCODE.md`
+   - `OPENCODE-AGENT-BRIEF.md`
+   - `docs/RELEASE-STATUS.md`
+   - add `docs/audit/2026-MM-DD-shell-boundary.md`
+
+Acceptance:
+
+- Full suite remains at or above 381 passes.
+- No tests are weakened.
+- `demo/attack_boundary.py` shell GAP rows become PASS.
+- Legitimate `pytest` commands still work or produce an explicit ask flow.
+- No boundary guarantee wording is added.
+
+---
+
+## 14. OpenCode-specific rules
+
+The repo has `opencode.json`. Do not try to bypass it.
+
+Important permission rules:
+
+- Deny read/edit:
+  - `.env`
+  - `.env.*`
+  - `.pypirc`
+  - `.ssh/**`
+- Deny bash:
+  - `sudo *`
+  - `rm -rf *`
+  - `rm -fr *`
+  - `git push*`
+  - `git remote*`
+  - `git reset*`
+  - `git clean*`
+  - `git tag*`
+  - `git switch*`
+  - `git checkout*`
+  - `git merge*`
+  - `git rebase*`
+  - `git stash*`
+  - `git branch*`
+  - `git worktree*`
+  - `git add -A*`
+  - `git add --all*`
+  - `git add .`
+  - `*pip install*`
+  - `*pip3 install*`
+  - `npm *`
+  - `twine *`
+  - `curl *`
+  - `wget *`
+  - `env`
+  - `printenv*`
+
+Therefore the agent must:
+
+- Stage files explicitly:
+  ```bash
+  git add path/to/file
+  ```
+- Stop and report if a command is denied.
+- Let the user run push commands.
+- Not ask permission questions; write the proposed command in the final report.
+- Not assume old skill IDs remain available.
+
+---
+
+## 15. Hard repo rules
+
+- Use `.venv/bin/python`.
+- Never read, print, commit, or log `.env`.
+- Never weaken tests to make a demo pass.
 - Never use `git add -A`.
+- Never force-push, retag, reset, or clean without explicit owner instruction.
 - Never present offline/mock runs as live.
-- Live runs require owner approval and two consecutive passes.
-- Free models are default; paid models require explicit opt-in.
-- Every substantive claim needs a command and saved evidence.
+- Live runs need owner approval and two consecutive passes.
+- Free models are default. Paid models require `--allow-paid` or
+  `AGENT_ALLOW_PAID=1`.
+- Every material claim needs a command and saved evidence file.
+- Keep the boundary honest: label limits instead of hiding them.
 
 ---
 
-## 9. Evidence artifacts to read before changing code
+## 16. Allowed claims
 
-Read these in order:
+Current truthful claims:
+
+- “Offline policy fence with per-action gate.”
+- “Canonical boundary probes refuse denied paths.”
+- “Directory walkers now enforce deny_read on returned paths.”
+- “Headless writes are fail-closed.”
+- “Full offline suite passes: 381.”
+- “Adversarial harness names remaining failures.”
+
+Current forbidden claims:
+
+- “Unbypassable.”
+- “Company guarantee.”
+- “Network is controlled.”
+- “OS sandboxed.”
+- “Plan contract is cryptographically signed.”
+- “Live path verified today.”
+- “Measured cost savings.”
+
+---
+
+## 17. Evidence files
+
+Read these before changing boundary code:
 
 1. `HANDOFF-OPENCODE.md`
 2. `docs/RELEASE-STATUS.md`
 3. `docs/audit/2026-11-06-boundary-hardening.md`
 4. `.council/runs/20261031-0912-boundary/verification.md`
-5. `.council/runs/20261031-0912-boundary/report.html`
-6. `test_boundary_walkers.py`
-7. `demo/attack_boundary.py`
+5. `.council/runs/20261031-0912-boundary/transcript.md`
+6. `.council/runs/20261031-0912-boundary/report.html`
+7. `test_boundary_walkers.py`
+8. `demo/attack_boundary.py`
+9. `docs/BOUNDED-AGENT.md`
+10. `docs/FRONTEND_REFERENCE.md`
+11. `demo/PRESENT.md`
 
 ---
 
-## 10. Git status at time of writing
+## 18. Demo instructions
 
-Branch `feature/liquid-glass-tui` contained local work that had not been pushed
-because OpenCode denies `git push`. Do not rely on stale commit hashes; run
-`git log -6 --oneline` and report the actual state before pushing.
+Offline full verification:
+
+```bash
+./demo/check_all.sh
+```
+
+Boundary-only:
+
+```bash
+.venv/bin/python demo/check_boundary.py
+.venv/bin/python demo/showcase.py
+```
+
+Boundary attack report:
+
+```bash
+.venv/bin/python demo/attack_boundary.py
+```
+
+Live TUI only with approval:
+
+```bash
+./demo/live_show.sh
+```
+
+TUI keys:
+
+- `Y` approves an ask-gated write
+- `N` refuses an ask-gated write
+- `Esc` leaves nav mode before action keys
+- `V` opens the frozen diff
+- `Z` previews a checkpoint
+- `R` opens the receipt
+
+Demo negative probe:
+
+```text
+create todo in desktop
+```
+
+That must be blocked as an out-of-project path, not quietly rewritten into the
+product root.
+
+---
+
+## 19. Product design questions still open
+
+1. Is the boundary against the remote model only, or also against the local
+   operator?
+2. Is the product a governed local agent or a trusted-proxy companion?
+3. Container-first or native sandbox?
+4. What is the smallest credible alpha claim?
+5. Does the plan contract need real cryptographic signing?
+6. What evidence must reach the company rather than the endpoint?
+7. Should model spend show hypothetical, provider-billed, and measured costs as
+   separate labels?
+8. Is MCP boundary depth required for the first release or a later phase?
+
+---
+
+## 20. Git state
+
+Branch: `feature/liquid-glass-tui`
+
+Use commands, not assumptions:
+
+```bash
+git status -sb
+git log -6 --oneline
+git diff --check
+```
+
+The OpenCode config denies `git push`, so if a push is required, report:
+
+```bash
+git push -u github-https feature/liquid-glass-tui
+```
+
+and let the user execute it.
+
+Before commit:
+
+```bash
+.venv/bin/python -m pytest -q
+./demo/check_all.sh
+git diff --check
+```
+
+Stage explicit paths only. Commit message must include the verification result.
