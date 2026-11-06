@@ -40,6 +40,7 @@ What is built, what is published, and what is blocked.
 | OS sandbox | ❌ Not built | Best-effort shell guard only |
 | Client-pinned manifest | ❌ Not built | "Bring your own gateway" bypass possible |
 | Company boundary guarantee | ⚠️ Partially hardened, still not a guarantee | Directory-walker `deny_read` is now enforced per returned path (`test_boundary_walkers.py`). Shell, no-policy fail-closed, company-held audit, and managed-policy trust remain open. Evidence: `.council/runs/20261031-0912-boundary/verification.md`, `demo/attack_boundary.py` |
+| Performance baseline | ⚠️ Partially measured | Full suite and offline gate timings are recorded in `docs/audit/2026-11-06-boundary-hardening.md`; TUI, large-tree policy checks, and live latency are unmeasured. Plan is in `OPENCODE-AGENT-BRIEF.md` §20 |
 
 ## Test gate
 

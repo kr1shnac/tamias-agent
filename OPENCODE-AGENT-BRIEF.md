@@ -699,7 +699,269 @@ product root.
 
 ---
 
-## 20. Git state
+## 20. Future plans: lag, performance, and pending sequence
+
+This section is the roadmap the next maintainer should follow. Security P0 work
+comes before performance work because a fast bypass is still a bypass. Do not
+micro-optimize before measuring.
+
+### 20.1 Current measured performance baseline
+
+Measured on 2026-11-06 on this machine:
+
+| Operation | Measured time | Status |
+|---|---:|---|
+| Full pytest suite | about `15.85s` | pass |
+| Offline gate `check_all.sh` | about `31s` | pass |
+| `demo/attack_boundary.py` | `522ms`, exit `3` | report-only, gaps remain |
+| `demo/check_boundary.py` | `771ms` | pass |
+
+Not measured yet:
+
+- TUI startup and first render
+- TUI turn latency while modal is open
+- Policy gate cost on a large tree
+- Live model latency and free-tier 429 frequency
+- Shell timeout frequency
+- Multi-file search/investigate cost on 10k+ files
+
+Do not quote a performance improvement until a before/after file exists in
+`docs/audit/`.
+
+### 20.2 Lag risk areas
+
+These are suspects, not confirmed bottlenecks:
+
+1. **Policy checks on every returned path**
+   - After the 2026-11-06 hardening, `read_path_refusal()` calls
+     `policy_check()` for each path returned by directory walkers.
+   - `_glob_any()` currently computes `realpath` and runs `fnmatch` repeatedly.
+   - On a large tree this can become the dominant tool-dispatch cost.
+2. **Repeated directory walks**
+   - `search_in_files`, `analyze_structure`, and `investigate_target` walk the
+     same tree again on each call.
+3. **TUI refresh frequency**
+   - The app has a spinner interval, credit refresh, task-board refresh, and
+     transcript updates. Large tool output can make redraws expensive.
+4. **Large evidence rendering**
+   - The frozen diff, checkpoint, and receipt cards need explicit size caps and
+     truncation-level warnings.
+5. **Blocking shell execution**
+   - `run_shell` can block up to 60 seconds. The TUI should make that visible.
+6. **Model provider latency and quota**
+   - Free tier can return HTTP 429. This is external latency, not local lag.
+7. **Verification time**
+   - The suite is currently acceptable, but new tests should not let it grow
+     past a stated budget without a reason.
+
+### 20.3 Performance work plan
+
+#### Perf-1: Build a performance baseline harness
+
+Task:
+
+- Add `demo/perf_boundary.py`.
+- Keep it offline and deterministic.
+- Create synthetic trees only under `/tmp` using `tempfile`; never mutate the
+  demo company fixture.
+- Measure at least:
+  - policy gate for allowed and denied paths
+  - `search_in_files` on in-scope and denied subtrees
+  - `analyze_structure` on in-scope and denied subtrees
+  - checkpoint capture
+  - diff generation
+  - full offline pytest time
+- Support a check mode:
+  ```bash
+  .venv/bin/python demo/perf_boundary.py --check
+  ```
+- Save output as JSON under `demo/runs/` or a documented evidence path.
+
+Initial budget placeholders to confirm, not final truth:
+
+| Metric | Initial budget target |
+|---|---:|
+| `policy_check(allowed path)` | under `1ms` median after warmup |
+| Parent-directory search on 1k files | under `500ms` |
+| Parent-directory analyze on 1k files | under `500ms` |
+| Checkpoint + diff for small file | under `250ms` |
+| Full pytest suite | under `25s` |
+
+#### Perf-2: Instrument before optimizing
+
+Task:
+
+- Reuse the existing `time.perf_counter()` timing already present in agent turns.
+- Add optional per-tool timing events where missing.
+- Record policy gate time separately from tool execution time.
+- Include a “policy gate ms” field in receipts or audit events.
+
+Done when:
+
+- A single controlled run can show where time went:
+  model wait, policy gate, tool execution, TUI queue.
+
+#### Perf-3: Optimize policy-path checks
+
+Priority: high, because 2026-11-06 added per-path checks.
+
+Task:
+
+- Precompile policy globs when the policy is loaded.
+- Avoid repeated `realpath` calls for unchanged paths where safe.
+- Cache decisions by process, real path, and policy identity.
+- Invalidate cache when `set_active_policy()` runs.
+- Add tests proving denial does not become stale after:
+  - policy replacement
+  - symlink change
+  - workspace change
+- Do not cache across processes without a documented cache key and policy hash.
+
+Done when:
+
+- `demo/perf_boundary.py` shows a measured improvement or proves no change is
+  needed.
+- `test_boundary_walkers.py` and all 381 tests still pass.
+
+#### Perf-4: Reduce output redraw cost
+
+Task:
+
+- Cap search/analyze/investigate output more aggressively for parent
+  directories.
+- Prefer a summary plus explicit drill-down over dumping every nested file.
+- Add a `truncated` marker and a count of omitted denied/allowed entries.
+- Ensure TUI never renders an uncapped giant document.
+
+Done when:
+
+- A large directory result returns in bounded time and bounded memory.
+
+#### Perf-5: TUI responsiveness
+
+Task:
+
+- Measure TUI mount and first prompt render.
+- Debounce or batch:
+  - credits refresh
+  - task-board refresh
+  - status line updates
+- Avoid full transcript rebuild for each chunk.
+- Move shell execution feedback into a visibly throttled status event.
+
+Done when:
+
+- No visible stall over `250ms` during typing, scrolling, or receipt open in
+  the recorded manual test.
+
+#### Perf-6: Provider and quota resilience
+
+Task:
+
+- Continue using free models by default.
+- Handle HTTP 429 as a distinct, honest state.
+- Do not silently rotate into paid models.
+- Add a retry/backoff ceiling and report it clearly.
+- Never hide a 429 as a model answer.
+
+Done when:
+
+- A mock 429 test proves the user sees “rate-limited; no run claimed” instead of
+  a false success.
+
+### 20.4 Full future pending sequence
+
+Follow this order.
+
+#### Now: P0 security completion
+
+1. Shell product-scope and capability reduction.
+2. No-policy run must fail closed or emit an undeniable fence-off audit row.
+3. Audit must include:
+   - resolved path
+   - cwd
+   - policy hash
+   - plan/session binding
+   - always-on mode
+4. Managed policy must be verified with a pinned manifest, or docs must state
+   the gateway is the trust root.
+
+#### Next: performance and lag remediation
+
+5. `demo/perf_boundary.py` baseline.
+6. Policy-path optimization after profiling.
+7. Output size limits and truncation markers.
+8. TUI batching/debounce.
+9. Provider 429 resilience and honest quota handling.
+
+#### Then: production hardening
+
+10. OS/container sandbox.
+11. Network egress allowlist.
+12. MCP boundary server.
+13. Admin-owned, shell-protected policy/audit files.
+14. False-positive/proportionality probes.
+
+#### Then: product depth
+
+15. Session store + resume.
+16. Durable Time Travel.
+17. Flight Recorder export.
+18. Streaming/cancel.
+19. Live benchmark with two consecutive passes.
+
+#### Finally: release
+
+20. Decide and document PyPI publish vs checkout-only.
+21. Reconcile README/packaging claims with actual install behavior.
+22. Add public performance/security status that is generated from evidence.
+
+### 20.5 What to do next from Monday
+
+Day 1:
+
+- Read this file and `HANDOFF-OPENCODE.md`.
+- Run:
+  ```bash
+  .venv/bin/python -m pytest -q
+  ./demo/check_all.sh
+  .venv/bin/python demo/attack_boundary.py
+  ```
+- Build `demo/perf_boundary.py` if shell work is already complete.
+
+Day 2:
+
+- Implement shell product-scope/capability reduction.
+- Add hostile and legitimate tests.
+
+Day 3:
+
+- Rerun all offline evidence.
+- Update `docs/RELEASE-STATUS.md` with before/after times.
+- If shell is complete, start no-policy fail-closed.
+
+Day 4:
+
+- Audit rows and managed-policy trust decision.
+- No “company guarantee” wording.
+
+Day 5:
+
+- Performance baseline and one measured optimization.
+- Write evidence in `docs/audit/YYYY-MM-DD-performance.md`.
+
+### 20.6 Performance change rules
+
+- No optimization without a measured before/after.
+- Never optimize by deleting a boundary check.
+- Never cache a deny decision across a policy change without invalidation.
+- Never make denial stale to make performance look better.
+- Keep every budget number labeled as measured or placeholder.
+- If a budget cannot be measured yet, write `unverified`.
+
+---
+
+## 21. Git state
 
 Branch: `feature/liquid-glass-tui`
 

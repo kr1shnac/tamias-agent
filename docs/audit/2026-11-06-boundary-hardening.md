@@ -17,8 +17,9 @@ cd /home/krish/Desktop/tamias-agent
 - Full suite: **381 passed in 16.10s**.
 - Offline gate: **13 passed · 0 failed · 1 skipped · 31s**. The skip is
   `live rehearsal`.
-- Adversarial boundary harness: **6 PASS · 4 GAP · 2 NOTE**, exit code `3`.
-- `check_boundary`: 17/17 probes still pass.
+- Adversarial boundary harness: **6 PASS · 4 GAP · 2 NOTE**, exit code `3`,
+  measured `522ms`.
+- `check_boundary`: 17/17 probes still pass, measured `771ms`.
 - `showcase`: 18/18 to-do boundary probes still pass.
 - Mock model: in-scope write still ask-gated, out-of-scope write refused.
 - No live model run was claimed.
