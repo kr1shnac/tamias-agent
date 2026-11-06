@@ -147,3 +147,19 @@ exceeded. The wording must be narrowed:
 - Unverified by execution: the exact network/execution effect of the permitted
   composite shell commands. Running them was deliberately not part of this
   verification.
+
+## 8. Post-council fix on 2026-11-06
+
+The first two day-one recommendations were completed after this council run.
+
+- Added `read_path_refusal(path)` and applied it to the paths directory walkers
+  return: `list_directory`, `search_in_files`, `analyze_structure`, and
+  `investigate_target`. `trace_feature` already checked each followed file.
+- Added `test_boundary_walkers.py`: 7 tests. They assert denied nested paths are
+  skipped and legitimate in-product work remains visible.
+- Added `demo/attack_boundary.py`: an offline, report-only composition harness.
+  It does not execute shell commands. Current output is **6 PASS · 4 GAP ·
+  2 NOTE**, exit code `3`.
+- Remaining named gaps, not fixed in that batch: composite shell gate,
+  cross-project shell path, no-policy gate fail-closed, and no-policy audit rows.
+- Evidence: `docs/audit/2026-11-06-boundary-hardening.md`.

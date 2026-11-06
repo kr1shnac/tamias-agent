@@ -39,7 +39,7 @@ What is built, what is published, and what is blocked.
 | MCP boundary server | ❌ Not built | Integration depth 2 missing |
 | OS sandbox | ❌ Not built | Best-effort shell guard only |
 | Client-pinned manifest | ❌ Not built | "Bring your own gateway" bypass possible |
-| Company boundary guarantee | ⚠️ Not proven | The policy engine blocks the canonical probes, but the 2026-10-31 council review found real gaps: directory `deny_read` is per-argument rather than per-file, `run_shell` is substring-gated and not ask-gated, there is no OS sandbox or egress control, no-policy runs produce no audit row, and the audit trail is local. Evidence: `.council/runs/20261031-0912-boundary/verification.md` |
+| Company boundary guarantee | ⚠️ Partially hardened, still not a guarantee | Directory-walker `deny_read` is now enforced per returned path (`test_boundary_walkers.py`). Shell, no-policy fail-closed, company-held audit, and managed-policy trust remain open. Evidence: `.council/runs/20261031-0912-boundary/verification.md`, `demo/attack_boundary.py` |
 
 ## Test gate
 
@@ -49,15 +49,18 @@ What is built, what is published, and what is blocked.
 | `test_tui_features.py` | 50 | ✅ Passed (shared process) |
 | `test_premium_features.py` | 40 | ✅ Passed (receipt, boundary, plan contract, dossier, decision card, checkpoint, frozen diff) |
 | `tests/` (docs + catalog) | 34 | ✅ Passed |
+| `test_boundary_walkers.py` | 7 | ✅ Passed (parent-directory deny_read composition) |
 | Workspace demo tests | 4 | ✅ Passed |
-| **Full suite** | **374** | ✅ All passing |
-| **Offline gate pytest check** | **351** | ✅ Passed |
+| **Full suite** | **381** | ✅ All passing |
+| **Offline gate pytest check** | **381** | ✅ Passed |
 
 Evidence: `docs/audit/2026-10-28-work-surfaces.md` (plan/dossier views),
 `docs/audit/2026-10-28-premium-slice.md` (boundary/receipt/decision),
 `docs/audit/2026-10-28-plan-contract.md` (signature, drift, dossier gate),
-`docs/audit/2026-10-28-time-travel.md` (file checkpoint preview/restore) and
-`docs/audit/2026-10-29-diff-capture.md` (frozen diff review).
+`docs/audit/2026-10-28-time-travel.md` (file checkpoint preview/restore),
+`docs/audit/2026-10-29-diff-capture.md` (frozen diff review) and
+`docs/audit/2026-11-06-boundary-hardening.md` (deny_read walkers + attack
+harness).
 
 ---
 

@@ -83,7 +83,7 @@ def test_version_agreement() -> None:
 def test_test_count_agreement() -> None:
     """Test counts must agree across documents."""
     # The gate count is the canonical source
-    gate_count = "351"
+    gate_count = "381"
     for name in ["README.md", "AGENTIC-PART.md", "docs/audit/claims.md",
                  "docs/RELEASE-STATUS.md"]:
         text = _read(name)

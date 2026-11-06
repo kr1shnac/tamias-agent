@@ -40,7 +40,7 @@ for every claim).
 
 ```bash
 cd /home/krish/Desktop/tamias-agent
-.venv/bin/python -m pytest test_agent.py test_tui_features.py -q   # 239 tests
+.venv/bin/python -m pytest -q   # 381 tests
 .venv/bin/python agent.py --task "..."                             # non-interactive
 ```
 

@@ -40,8 +40,8 @@ cd /home/krish/Desktop/tamias-agent
 
 Results:
 
-- **Full suite:** `374 passed in 16.74s`.
-- **Offline gate:** `13 passed · 0 failed · 1 skipped · 32s`.
+- **Full suite:** `381 passed in 16.10s`.
+- **Offline gate:** `13 passed · 0 failed · 1 skipped · 31s`.
   The skip is `live rehearsal`.
 - Static check: 18 tools, prompt within budget, policies loaded.
 - Boundary probes: `check_boundary` 17/17, `showcase` 18/18.
@@ -90,12 +90,15 @@ The council verdict, after verification:
 
 Verified findings:
 
-- `deny_read` is checked against the tool **argument**, not against every file a
-  directory tool later returns. Example: `search_in_files("def ",
-  "company/work/todoinc")` passes the gate and returns
-  `apps/chatbot/src/bot.py`, although that path is in `deny_read`.
-  Correction: it did not return the `.csv` salary file, because `search_in_files`
-  does not scan `.csv`; it did return the nested denied `.py`.
+- **Directory-walker deny_read is now enforced per returned path.** The original
+  parent-search bypass is fixed in `list_directory`, `search_in_files`,
+  `analyze_structure`, and `investigate_target`; `trace_feature` already
+  checked followed files. Regressions are covered by
+  `test_boundary_walkers.py`.
+- Offline adversarial harness: `demo/attack_boundary.py` currently reports
+  **6 PASS · 4 GAP · 2 NOTE** and exits `3`. The remaining gaps are shell
+  composition, cross-project shell, no-policy fail-closed mode, and no-policy
+  audit rows.
 - `run_shell` uses `shell=True`, the shell allowlist is substring-based, and
   `run_shell` is not ask-gated in `policies/todoinc-todo.toml`.
 - There is no OS sandbox, container, or network egress control.
@@ -124,8 +127,8 @@ Therefore, until P0 work is complete, say:
 
 | # | Task | Done when |
 |---|---|---|
-| 1 | Add `demo/attack_boundary.py`: offline, read-only composition probes. Cover parent-directory search/analyze, cross-project `git log`, composite shell, no-policy run, audit-off run. Print literal pass/fail. | The file exits 0 only when the probes fail the way the report says. |
-| 2 | Make `deny_read`/secret checks apply to every **returned** path from directory, search, investigate, analyze, and list tools. | A parent-directory search returns zero denied paths and at least one in-product hit. |
+| 1 | Add `demo/attack_boundary.py`: offline, report-only composition probes. | **Done 2026-11-06.** Report-only harness exits `3` with known gaps instead of pretending the boundary is complete. |
+| 2 | Make `deny_read`/secret checks apply to every **returned** path from directory, search, investigate, analyze, and list tools. | **Done 2026-11-06.** `test_boundary_walkers.py` covers parent-directory searches, analysis, listing, and investigation with in-product control hits. |
 | 3 | Reduce shell capability: enforce the policy root for shell cwd/relative paths; ask-gate `run_shell`, or restrict to an explicit non-interpreter prefix. | A composite command is denied/ask-denied headless; no model-written code path is silently executable. |
 | 4 | Make policy omission fail closed, or emit an unmistakable “fence off” audit row with resolved policy/company state. | No run can execute with the gate silently absent. |
 | 5 | Make the audit useful and company-held: always-on rows, resolved path, policy hash, cwd, plan/session binding, off-host anchor or gateway sink. | The company can detect downgrade, stop, or missing rows independent of the endpoint. |
@@ -233,9 +236,13 @@ consecutive passes before any live claim changes.
 
 ### Day 2
 
-- Implement P0 #2 and #3.
-- Add composition tests that include a legitimate hit (avoid over-blocking).
-- Rerun full suite, offline gate, and the new attack harness.
+- ~~Implement P0 #2 and #3.~~ P0 #2 is complete:
+  `test_boundary_walkers.py` passes.
+- Next: implement P0 #3 only (shell product scope / capability reduction), with
+  composition tests that include a legitimate hit. Do not replace it with a
+  fragile lexical denylist.
+- Rerun full suite, offline gate, and `demo/attack_boundary.py`; the shell GAP
+  rows should become PASS, not disappear from the report.
 
 ### Day 3
 

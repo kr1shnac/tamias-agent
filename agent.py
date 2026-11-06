@@ -1091,6 +1091,21 @@ def refuse_secret(path):
     return None
 
 
+def read_path_refusal(path):
+    """A refusal reason when *this path* is off-limits to a read, else None.
+
+    The directory walkers do not get an exception from a parent directory:
+    ``deny_read`` is per-file, so every file and subdirectory a walker visits is
+    checked here. Secret names stay ahead of the policy, and the policy path is
+    included because it is a protected path.
+    """
+    if is_sensitive_path(path):
+        return (f"Error: '{path}' is a protected secret file and must not be "
+                "read, written, or searched")
+
+    return policy_check("read_file", {"file_path": path})
+
+
 # Refusals the agent made on purpose, not failures for the model to fix. The
 # policy gate and the secret denylist say no deliberately, so a "failed tool"
 # counter that counts them would escalate to a bigger model for a retry that
@@ -1401,8 +1416,8 @@ def list_directory(path) :
         for item in sorted(items):
             full = os.path.join(resolved, item)
 
-            if is_sensitive_path(full):
-                #never even name a secret file in output
+            if read_path_refusal(full):
+                #never even name a denied file or directory in output
                 continue
 
             tag = "[DIR] " if os.path.isdir(full) else "[FILE]"
@@ -1540,6 +1555,7 @@ def search_in_files(pattern, directory):
             dirs[:] = [
                 d for d in dirs
                 if not d.startswith(".") and d != "__pycache__"
+                and not read_path_refusal(os.path.join(root, d))
             ]
 
             for file in files:
@@ -1549,8 +1565,8 @@ def search_in_files(pattern, directory):
                 ):
                     file_path = os.path.join(root, file)
 
-                    if is_sensitive_path(file_path):
-                        #a secret file is never a search result
+                    if read_path_refusal(file_path):
+                        #a denied path is never a search result
                         continue
 
                     scanned += 1
@@ -1674,12 +1690,16 @@ def investigate_target(target: str, feature: str, depth: str = "medium") -> str:
 
             try:
                 items = sorted(os.listdir(resolved_target))
+                visible_items = []
                 for item in items[:20]:
                     full = os.path.join(resolved_target, item)
+                    if read_path_refusal(full):
+                        continue
+                    visible_items.append(item)
                     tag = "[DIR]" if os.path.isdir(full) else "[FILE]"
                     findings.append(f"  {tag} {item}")
-                if len(items) > 20:
-                    findings.append(f"  ... and {len(items) - 20} more items")
+                if len(visible_items) > 20:
+                    findings.append(f"  ... and {len(visible_items) - 20} more items")
             except OSError as e:
                 limitations.append(f"Could not list directory: {str(e)}")
 
@@ -1687,11 +1707,15 @@ def investigate_target(target: str, feature: str, depth: str = "medium") -> str:
             findings.append(f"\nFeature traces for '{feature}':")
             trace_count = 0
             for root, dirs, files in os.walk(resolved_target):
-                dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d != "__pycache__"
+                    and not read_path_refusal(os.path.join(root, d))
+                ]
                 for file in files:
                     if file.endswith((".py", ".txt", ".md", ".json", ".js", ".ts", ".html", ".css")):
                         file_path = os.path.join(root, file)
-                        if is_sensitive_path(file_path):
+                        if read_path_refusal(file_path):
                             continue
                         try:
                             with open(file_path, "r", encoding="utf-8") as f:
@@ -1862,10 +1886,16 @@ def analyze_structure(directory: str, focus: str = "all") -> str:
 
     try:
         for root, dirs, files_list in os.walk(resolved_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".") and d != "__pycache__"
+                and not read_path_refusal(os.path.join(root, d))
+            ]
             for file in files_list:
                 if file.endswith((".py", ".js", ".ts")):
                     file_path = os.path.join(root, file)
+                    if read_path_refusal(file_path):
+                        continue
                     rel = os.path.relpath(file_path, resolved_dir)
                     files.append(rel)
 

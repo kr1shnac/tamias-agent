@@ -169,8 +169,8 @@ fi
 head1 "2. test gate - the one number that must not regress"
 
 if [ -f test_agent.py ] && [ -f test_tui_features.py ] && [ -f test_premium_features.py ]; then
-    run_check "pytest: agent + TUI + premium surfaces + docs integrity" zero "passed" \
-        "$PY" -m pytest test_agent.py test_tui_features.py test_premium_features.py tests/test_docs_integrity.py -q
+    run_check "pytest: full offline suite (incl. boundary walkers)" zero "passed" \
+        "$PY" -m pytest -q
 else
     fail "test files missing"
 fi

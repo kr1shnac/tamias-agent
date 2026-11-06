@@ -1,7 +1,7 @@
 # Code-Truth Ledger
 
 This document is the **code-truth ledger** for Tamias. It outranks the SSOT for
-behaviour: what the code actually does. Verified against the gate (351 passed,
+behaviour: what the code actually does. Verified against the gate (381 passed,
 0 warnings).
 
 ---
@@ -10,13 +10,14 @@ behaviour: what the code actually does. Verified against the gate (351 passed,
 
 | Source | Count | Verified |
 |---|---|---|
-| **Gate (current)** | **351** | ✅ this run |
+| **Gate (current)** | **381** | ✅ this run |
 | `test_agent.py` | 246 | ✅ passed |
 | `test_tui_features.py` | 50 | ✅ shared process |
 | `test_premium_features.py` | 40 | ✅ shared process |
+| `test_boundary_walkers.py` | 7 | ✅ passed (parent-directory deny_read composition) |
 | `tests/` (docs + catalog) | 34 | ✅ passed |
 | Workspace demo tests | 4 | ✅ passed |
-| **Full suite** | **374** | ✅ passed |
+| **Full suite** | **381** | ✅ passed |
 
 > **Note:** `test_tui_features.py` requires the real `rich` package and is run in
 > a separate process from `test_agent.py`. The `_real_rich` fixture allows the
@@ -75,7 +76,7 @@ mechanically asserts every authoritative claim resolves and versions agree.
 
 ## Version
 
-**Current gate count:** 351 passed, 0 warnings (verified this run)
+**Current gate count:** 381 passed, 0 warnings (verified this run)
 
 **Python:** >=3.11
 

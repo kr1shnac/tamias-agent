@@ -136,7 +136,7 @@ hierarchy:
    blocked.
 
 > **Never** cite a dollar savings figure as a measurement — all dollar figures
-> in this project are hypothetical (no measured savings exist; verified: 351-passed
+> in this project are hypothetical (no measured savings exist; verified: 381-passed
 > gate, PyPI package 404s, savings frozen as a claim n=0).
 
 ---
@@ -181,5 +181,5 @@ authoritative Design Spec, read `TAMIAS-SSOT.md`. For the code-truth ledger, rea
 
 ---
 
-*Council run: 20261020-1900-tamias-public-shape. Current gate: 351 passed.
+*Council run: 20261020-1900-tamias-public-shape. Current gate: 381 passed.
 Verdict: Option D minus C. No files deleted. Durable fix: doc-integrity test.*

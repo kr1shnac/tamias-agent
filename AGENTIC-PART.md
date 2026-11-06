@@ -11,6 +11,10 @@ CLI flags, or configuration changes.
 passed, wheel installs, tamias --version = 0.1.0a7. Council verdict:
 Option D minus C (restructure README + reconcile docs, delete nothing).*
 
+*Updated 2026-11-06: current offline suite is 381 passed. Boundary hardening is
+in progress; see `HANDOFF-OPENCODE.md` and
+`docs/audit/2026-11-06-boundary-hardening.md` before making a boundary claim.*
+
 ---
 
 ## Council Plan & Verified Defects
@@ -180,7 +184,7 @@ hierarchy:
    blocked.
 
 > **Never** cite a dollar savings figure as a measurement — all dollar figures
-> in this project are hypothetical (no measured savings exist; verified: 351-passed
+> in this project are hypothetical (no measured savings exist; verified: 381-passed
 > gate, PyPI package 404s, savings frozen as a claim n=0).
 
 ---
@@ -226,4 +230,5 @@ authoritative Design Spec, read `TAMIAS-SSOT.md`. For the code-truth ledger, rea
 ---
 
 *Council run: 20261020-1900-tamias-public-shape. Verified: 351 passed.
-Verdict: Option D minus C. No files deleted. Durable fix: doc-integrity test.*
+Updated 2026-11-06: 381 passed. Verdict: Option D minus C. No files deleted.
+Durable fix: doc-integrity test.*
